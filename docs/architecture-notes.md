@@ -1,0 +1,89 @@
+# Architecture Notes
+
+Running commentary on the design of specific components: what they are,
+known trade-offs, and things considered but not (yet) done. Less formal
+than `docs/adr/` -- nothing here is a settled, accepted decision the way an
+ADR is, some of it is closer to "here's the shape of an open question."
+Promote a note to a proper ADR once its answer actually firms up. For the
+narrative of *how* a bug was chased down and fixed, see
+`docs/debugging-notes.md` instead -- this file is for the standing shape
+of the thing once the dust settles, not the investigation itself.
+
+## `interfaces.rs`: static interface lookup coverage
+
+`src/interfaces.rs` maps a Wayland interface name string (as seen on the
+wire, e.g. in `wl_registry.bind`) to its statically-generated `Interface`
+description (requests/events and their argument signatures). We don't
+parse any protocol XML ourselves -- this data already exists, generated at
+build time via `wayland-scanner`, inside four upstream crates:
+
+- `wayland-client`: the rest of core `wayland.xml` beyond the three
+  interfaces `wayland-backend` ships directly (`wl_display`, `wl_registry`,
+  `wl_callback`).
+- `wayland-protocols`: freedesktop's official extensions (`xdg-shell`,
+  `linux-dmabuf`, `presentation-time`, ...), gated behind `stable` (always
+  on), `staging`, and `unstable` cargo features.
+- `wayland-protocols-wlr`: wlroots' own extensions (`layer-shell`,
+  `screencopy`, `gamma-control`, ...). Every wlroots-based compositor
+  (labwc, sway, ...) advertises these, but they never went through
+  freedesktop's official extension process, hence a separate crate from
+  `wayland-protocols` rather than a feature flag on it.
+- `wayland-protocols-plasma` / `wayland-protocols-misc`: KDE's
+  `org_kde_kwin_*` extensions, plus a handful of orphaned-but-widely-used
+  ones that fit neither official bucket (`zwp_input_method_manager_v2`,
+  `zwp_virtual_keyboard_manager_v1`).
+
+What we actually hand-write is just the `match` statement dispatching name
+-> struct. That's the piece that can drift out of date, and it fails in
+two distinct ways:
+
+- **Gap 1 -- already generated upstream, just not wired into our match.**
+  Cheap and bounded: find the module, add a `use ... as` alias, add a match
+  arm. This was the state of most of coverage before 2026-07-30 (only 7
+  interfaces wired up: core + xdg-shell) -- see that date's entry in
+  `docs/debugging-notes.md` for the bug that made closing it urgent, not
+  optional.
+- **Gap 2 -- not generated in any dependency we carry at all.** Open-ended
+  by nature: any compositor can expose arbitrary custom protocol
+  extensions, so no static table, however complete, closes this
+  permanently. Known members as of 2026-07-30: `cosmic-protocols`
+  (COSMIC/System76's `zcosmic_*`, e.g. `zcosmic_workspace_manager_v1`,
+  which labwc does advertise) and `wl_drm` (a legacy pre-standardization
+  Mesa/EGL protocol with no maintained Rust binding we know of).
+  Deliberately left alone for now -- revisit if a real client actually
+  tries to use one of these and hits the drop-caused new_id-gap bug again
+  (see `docs/debugging-notes.md`, 2026-07-30) for a *specific* uncovered
+  interface, rather than trying to chase this preemptively.
+
+Only interfaces that can be the *target* of a `wl_registry.bind` call (a
+real top-level global) need an entry here at all. Child objects created by
+a typed request (e.g. `zwp_linux_dmabuf_v1.get_default_feedback` ->
+`zwp_linux_dmabuf_feedback_v1`) resolve automatically through that
+request's static `MessageDesc::child_interface` -- a pointer baked in at
+codegen time -- without ever consulting this table (`resolve_child_interface`
+in `lib.rs`). This is why the table doesn't need to (and shouldn't) include
+every interface these four crates define, just the ones a compositor might
+actually hand out as a global.
+
+**Considered, not done:**
+
+- *Macro to cut the alias boilerplate.* The lookup function currently has
+  ~35 `use crate::deeply::nested::module::__interfaces as short_name;`
+  lines, one per leaf protocol module, purely so the match arms themselves
+  stay short. A small local macro taking `"name" => full::path::CONST`
+  pairs directly would remove the alias section entirely, at the cost of
+  longer per-line paths in the match itself. A legibility trade, not a
+  correctness one -- worth doing if the alias list keeps growing and
+  becomes the more annoying half to maintain, but not urgent.
+
+**Explicitly rejected:**
+
+- *Auto-generating match arms for every interface these four crates
+  define*, not just real top-level globals. Would silently register
+  child-only interface types that can never legitimately be a
+  `wl_registry.bind` target, trading a curated table for one that looks
+  more complete without actually being more correct. The coverage test
+  (`interfaces::tests::resolves_every_global_observed_from_real_labwc`)
+  asserts against an independent, human-curated snapshot of what a *real*
+  compositor advertised for exactly this reason -- it can't be derived
+  from our own match arms without testing nothing.

@@ -19,7 +19,10 @@ use wayland_backend::protocol::{ArgumentType, Interface, MessageDesc};
 
 pub mod fdsocket;
 pub mod interfaces;
+pub mod recorder;
 pub mod wire;
+
+use recorder::recorder;
 
 use interfaces::lookup_interface;
 
@@ -82,18 +85,26 @@ impl Conn {
         }
     }
 
-    /// Writes one message plus its fds, retrying on EWOULDBLOCK.
-    /// Attaches fds only to the first `sendmsg` call for this message: a
-    /// `SOCK_STREAM` unix socket can do a *partial* write under
-    /// backpressure (a real, not theoretical, concern here -- e.g. GTK's
-    /// startup burst of 20+ back-to-back `wl_registry.bind` calls can fill
-    /// the socket buffer). Silently treating a partial write as complete
-    /// truncates a message and desyncs the receiver's parser for every
-    /// message after it on the connection -- confirmed empirically: this
-    /// exact bug produced "invalid arguments for wl_registry#2.bind"
-    /// (and, in a different run, "for wl_display#1.sync") from a real
-    /// compositor, which then reset the connection. Uses `try_io` for the
-    /// same reason `fill` does -- see its comment.
+    /// Writes a single message's bytes plus its fds, retrying on
+    /// EWOULDBLOCK. Tried batching every ready message into one buffer and
+    /// issuing a single `write_message` call per `relay_ready_messages`
+    /// pass, to match how a real libwayland client's `wl_display_flush()`
+    /// coalesces writes -- verified byte-correct via `strace`, but it made
+    /// the intermittent real-compositor rejection (see below) 100%
+    /// deterministic instead of fixing it, so it was reverted; messages are
+    /// sent one `write_message` call each (see the 2026-07-30 entries in
+    /// docs/debugging-notes.md). Attaches fds only to the first `sendmsg`
+    /// call: a `SOCK_STREAM` unix socket can do a *partial* write under
+    /// backpressure (a real, not
+    /// theoretical, concern here -- e.g. GTK's startup burst of 20+
+    /// back-to-back `wl_registry.bind` calls can fill the socket buffer).
+    /// Silently treating a partial write as complete truncates the buffer
+    /// and desyncs the receiver's parser for everything after it on the
+    /// connection -- confirmed empirically: this exact bug produced
+    /// "invalid arguments for wl_registry#2.bind" (and, in a different
+    /// run, "for wl_display#1.sync") from a real compositor, which then
+    /// reset the connection. Uses `try_io` for the same reason `fill`
+    /// does -- see its comment.
     async fn write_message(&mut self, msg: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
         let raw_fd = self.stream.as_raw_fd();
         let mut sent = 0;
@@ -214,7 +225,8 @@ type ObjectTable = HashMap<u32, &'static Interface>;
 /// Relays every complete message currently buffered in `src` onward to
 /// `dst` (or drops it silently if `dst` is `None`, i.e. we're frozen -- see
 /// `run_connection`), tracking newly-created objects in `objects` as it
-/// goes.
+/// goes. One `write_message` call per message (not batched -- see
+/// `Conn::write_message`'s doc comment for why that was tried and reverted).
 async fn relay_ready_messages(
     src: &mut Conn,
     mut dst: Option<&mut Conn>,
@@ -251,6 +263,18 @@ async fn relay_ready_messages(
                 "unknown object {} opcode {} ({:?}) -- dropping",
                 header.sender_id, header.opcode, direction
             );
+            if let Some(rec) = recorder() {
+                rec.record(
+                    &format!("{direction:?}"),
+                    "DROPPED_UNKNOWN",
+                    "?",
+                    "?",
+                    header.sender_id,
+                    header.opcode,
+                    0,
+                    &src.read_buf[..consumed],
+                );
+            }
             src.read_buf.drain(..consumed);
             continue;
         };
@@ -315,11 +339,36 @@ async fn relay_ready_messages(
                         "relay {:?} {}.{} sender={} opcode={} len={} fds={} bytes={:02x?}",
                         direction, interface.name, desc.name, header.sender_id, header.opcode, consumed, raw_fds.len(), msg
                     );
+                    if let Some(rec) = recorder() {
+                        rec.record(
+                            &format!("{direction:?}"), "RELAYED", interface.name, desc.name,
+                            header.sender_id, header.opcode, raw_fds.len(), &msg,
+                        );
+                    }
+                    // Per-message write, NOT batched: batching everything
+                    // into one combined write was tried and made the real
+                    // compositor's intermittent rejection fully
+                    // deterministic (worse), so per-message sends are
+                    // deliberately kept -- see the 2026-07-30 entries in
+                    // docs/debugging-notes.md for the full experiment and
+                    // why the "batch like a real client's flush()" theory
+                    // didn't hold up.
                     if let Err(e) = dst.write_message(&msg, &raw_fds).await {
                         error!("failed to relay {}.{}: {e}", interface.name, desc.name);
                     }
                     // fds are dup'd onto the wire by sendmsg; our copies
                     // are closed when `fds` drops at the end of this scope.
+                } else if let Some(rec) = recorder() {
+                    // Frozen: would have relayed this, but the compositor
+                    // connection is dead, so it's silently dropped instead
+                    // (see run_connection). Recorded distinctly from
+                    // DROPPED_UNKNOWN since we DO understand this message.
+                    // `fds` (OwnedFd) closes when it drops at the end of
+                    // this scope, un-forwarded -- correct, not a leak.
+                    rec.record(
+                        &format!("{direction:?}"), "DROPPED_FROZEN", interface.name, desc.name,
+                        header.sender_id, header.opcode, walk.fd_count, &msg,
+                    );
                 }
             }
             Err(e) => {
@@ -329,11 +378,18 @@ async fn relay_ready_messages(
                 // case. Drop rather than forward something we don't
                 // understand the shape of.
                 warn!("failed to parse {}.{}: {e} -- dropping", interface.name, desc.name);
+                if let Some(rec) = recorder() {
+                    rec.record(
+                        &format!("{direction:?}"), "DROPPED_PARSE_ERROR", interface.name, desc.name,
+                        header.sender_id, header.opcode, 0, &msg,
+                    );
+                }
             }
         }
 
         src.read_buf.drain(..consumed);
     }
+
     Ok(())
 }
 

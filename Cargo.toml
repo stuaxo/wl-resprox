@@ -19,9 +19,24 @@ wayland-backend = { version = "0.3.7", features = ["server_system", "client_syst
 wayland-client = "0.31.2"
 wayland-server = "0.31.2"
 
-# xdg-shell interface tables (needed for GTK toplevel windows -- not part of
-# core wayland.xml, so not covered by wayland-client/wayland-server above).
-wayland-protocols = { version = "0.32", features = ["client", "server"] }
+# Interface tables for protocol extensions beyond core wayland.xml --
+# freedesktop's official extensions (xdg-shell, linux-dmabuf,
+# presentation-time, etc. -- "staging"/"unstable" unlock the trees those
+# names imply, "stable" ones are always compiled in), plus the two other
+# extension families every real wlroots-based compositor (labwc, sway, ...)
+# advertises in practice: wlroots' own zwlr_* protocols, and KDE's
+# org_kde_kwin_* ones. See the 2026-07-30 entries in
+# docs/debugging-notes.md for why silently not recognizing a real
+# compositor's global is a correctness bug, not just a coverage gap.
+wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client", "server"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client", "server"] }
+# zwp_virtual_keyboard_manager_v1 / zwp_input_method_manager_v2: neither ships
+# in wayland-protocols proper (never went through freedesktop's official
+# extension process) nor in the wlr crate (not wlroots-specific despite the
+# zwp_ prefix) -- this is the smithay/wayland-rs family's catch-all crate for
+# extensions that don't fit either of those buckets.
+wayland-protocols-misc = { version = "0.3", features = ["client", "server"] }
 
 # Bidirectional maps for Object ID translation
 bimap = "0.6.3"
