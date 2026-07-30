@@ -63,6 +63,14 @@ echo "== Building proxy =="
 ( cd "$PROJECT_DIR" && cargo build --quiet ) || fail "cargo build failed"
 
 echo "== Starting headless compositor =="
+# Snapshot sockets that already exist before starting, and only accept a
+# name that's genuinely new -- $RUNTIME_DIR is shared with the host and
+# any other running compositor (see scripts/setup-env.sh), so it can
+# already hold several wayland-N entries, including stale ones a crashed
+# compositor never unlinked. Scanning for "any non-proxy socket" (the
+# previous approach) picked up exactly one of those live, and the proxy
+# then failed with "Connection refused" trying to reach a dead socket.
+existing_sockets="$(ls "$RUNTIME_DIR"/wayland-*[0-9] 2>/dev/null || true)"
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 labwc -C /dev/null > "$COMPOSITOR_LOG" 2>&1 &
 COMPOSITOR_PID=$!
 
@@ -71,7 +79,7 @@ for _ in $(seq 1 20); do
     for sock in "$RUNTIME_DIR"/wayland-*[0-9]; do
         [[ -e "$sock" ]] || continue
         name="$(basename "$sock")"
-        if [[ "$name" != "$PROXY_DISPLAY" ]]; then
+        if [[ "$name" != "$PROXY_DISPLAY" ]] && ! grep -qxF "$sock" <<< "$existing_sockets"; then
             COMPOSITOR_DISPLAY="$name"
         fi
     done
