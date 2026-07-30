@@ -21,12 +21,13 @@
 ## Phase 3: The "Pass-Through" Prototype
 
 - [x] Pipe raw bytes between the Client (GTK) and the Server (`labwc`).
-      Superseded 2026-07-30 -- replaced by the `wayland-backend` message
-      relay below rather than staying a raw byte pipe. The *outcome*
-      (gtk4-demo renders through the proxy) still holds; the mechanism doesn't
-      literally exist in the code anymore.
+      Superseded twice over, both 2026-07-30: raw pipe -> a `wayland-backend`
+      `ObjectData`/`GlobalHandler` message relay -> (same day) the current
+      hand-rolled wire-parser relay (see Phase 3.5). The *outcome* (gtk4-demo
+      renders through the proxy) has held across all three; neither
+      intermediate mechanism literally exists in the code anymore.
 - [x] Test: Launch `WAYLAND_DISPLAY=wayland-2 gtk4-demo` and ensure it appears in the `labwc` window.
-      Verified with both the old raw pipe and the new relay.
+      Verified against all three mechanisms above.
 
 ## Phase 3.5: Raw Wire Protocol Parsing (The Architecture Pivot)
 
@@ -37,12 +38,18 @@ codegen interface tables, treating object IDs as plain `u32`s. See
 docs/architecture-context.md section 4 for the full reasoning. Pivoting to
 match.
 
-- [ ] Remove `wayland-backend` (and `wayland-client`/`wayland-server`/
-      `wayland-protocols`) dependency, and rewrite `main.rs`'s relay to use
-      `src/wire.rs` instead. Not done yet -- `main.rs` still relays via
-      wayland-backend; doing this requires rewriting the relay itself, not
-      just adding the new module, so it's deliberately a separate step
-      from the two below (keeps the build green in between).
+- [x] Remove `wayland-backend`'s (and `wayland-client`/`wayland-server`/
+      `wayland-protocols`) *runtime* (the `Backend`/`ObjectData`/
+      `GlobalHandler` dispatch model), and rewrite the relay to use
+      `src/wire.rs` instead. Done 2026-07-30: the relay was extracted from
+      `main.rs` into `src/lib.rs` (`run_connection`/`relay_ready_messages`)
+      and now hand-parses every message via `src/wire.rs` + a generic
+      signature walker (`walk_signature`), tracking objects in a plain
+      `HashMap<u32, &'static Interface>`. The four `wayland-*` crates are
+      kept as dependencies but strictly as a static protocol-signature
+      dictionary now (`src/interfaces.rs`'s `lookup_interface`) -- no
+      `Backend`/`ObjectData`/`GlobalHandler` types appear anywhere in the
+      relay code anymore.
 - [x] Implement 8-byte Wayland header parser (`src/wire.rs`) to read
       `[Sender ID: u32][Opcode: u16][Length: u16]`.
       Done 2026-07-30: `MessageHeader::parse`/`take_message`. Not yet
@@ -78,10 +85,18 @@ match.
       `map_id`, rather than the identity-bridge `HashMap` scaffolding this
       note used to describe.
 - [x] Intercept `wl_registry` requests to map globals.
-      Basic form done via wayland-backend's `GlobalHandler`/`create_global`
-      mechanism -- globals are mirrored 1:1, not yet remapped. Will need
-      re-doing against the hand-rolled wire parser once Phase 3.5's
-      removal item lands.
+      Re-done against the hand-rolled wire parser (Phase 3.5's removal
+      item landed 2026-07-30): `relay_ready_messages` inspects every
+      `wl_registry.bind`/typed-new_id request directly off the wire and
+      tracks the resulting object's interface. Globals are still mirrored
+      1:1, not yet remapped -- that's the Shadow Table item below.
+      `src/interfaces.rs` covers 46 real-world interfaces now (core +
+      xdg-shell + freedesktop staging/unstable + wlroots + KDE + misc --
+      see docs/architecture-notes.md), up from 7, after a real bug
+      (silently dropping a request on an unrecognized interface desyncs
+      the client's new_id sequence and gets an unrelated later message
+      rejected by the compositor -- see docs/debugging-notes.md's
+      2026-07-30 entry) made closing that gap urgent rather than optional.
 - [ ] Rewrite Object IDs on-the-fly for all traversing messages.
       Deliberately deferred -- explicitly out of scope for the 2026-07-30 work.
 
