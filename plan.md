@@ -49,12 +49,20 @@
 
 ## Phase 5: Crash Recovery Mechanics
 
-- [ ] Detect Server socket drop (`ECONNRESET`).
-- [ ] Pause proxying; keep Client socket open and suspend frame callbacks.
-      **Current behavior actively contradicts this**: on a dropped server
-      connection the proxy tears down both sides and ends the session,
-      rather than freezing the client socket. Needs fixing before anything
-      else in this phase, not just adding to.
+- [x] Detect Server socket drop (`ECONNRESET`).
+- [x] Pause proxying; keep Client socket open and suspend frame callbacks.
+      Fixed 2026-07-30. `Bridge.client_backend` is now `Mutex<Option<...>>`;
+      on a dropped compositor connection the proxy calls `Bridge::freeze()`
+      instead of tearing the whole session down. GTK-facing requests are
+      silently dropped rather than relayed or errored back. Verified live:
+      killed a real headless compositor mid-session, confirmed via proxy
+      logs the freeze path was taken (not "GTK client disconnected"), and
+      that `gtk4-demo` and the proxy both stayed up with the proxy sitting
+      idle (no busy-loop) afterward. "Suspend frame callbacks" falls out of
+      this for free -- any `wl_surface.frame()` callback just never gets a
+      `done` event, so GTK naturally stops rendering. No reconnect logic
+      exists yet (see below), so a frozen connection currently stays frozen
+      forever -- there's no way back from this state yet.
 - [ ] Detect new Server socket (when `labwc` is restarted).
 - [ ] Re-request `wl_registry` globals from the new Server.
 - [ ] Re-create `wl_surface` and `xdg_toplevel` objects on the new Server based on tracked state.

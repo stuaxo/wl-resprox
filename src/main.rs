@@ -36,12 +36,35 @@ impl AsRawFd for BorrowedRawFd {
 /// connection like this, their protocol_id numbers happen to line up.
 struct Bridge {
     server_handle: server::Handle,
-    client_backend: client::Backend,
+    // `None` means the compositor connection has died and we're frozen
+    // (Phase 5's "on server disconnect" rules): keep the GTK-facing side
+    // open, but stop forwarding anything to a peer that no longer exists.
+    // There's no reconnect logic yet (Phase 5 items 3-6) -- once frozen, a
+    // connection stays frozen for good.
+    client_backend: Mutex<Option<client::Backend>>,
     client_id: server::ClientId,
     // client-side object's protocol_id -> mirrored server-side ObjectId
     c2s: Mutex<HashMap<u32, server::ObjectId>>,
     // server-side object's protocol_id -> mirrored client-side ObjectId
     s2c: Mutex<HashMap<u32, client::ObjectId>>,
+}
+
+impl Bridge {
+    /// A cheap clone of the live compositor connection, or `None` if frozen.
+    /// `client::Backend` is a thin, `Clone`-able handle to the underlying
+    /// connection (see wayland-backend's own docs), so cloning it out from
+    /// under the lock rather than holding the lock for the whole call is
+    /// fine and avoids holding it across a socket write.
+    fn client(&self) -> Option<client::Backend> {
+        self.client_backend.lock().unwrap().clone()
+    }
+
+    /// Freezes the bridge: drops our handle to the dead compositor
+    /// connection so nothing tries to use it again. Deliberately doesn't
+    /// touch the GTK-facing side at all -- that's the point.
+    fn freeze(&self) {
+        *self.client_backend.lock().unwrap() = None;
+    }
 }
 
 /// Resolves the child interface (and version) for a message that creates a
@@ -330,6 +353,25 @@ impl server::ObjectData<()> for ServerObjectProxy {
             None
         };
 
+        // Frozen (compositor connection dropped): per
+        // implementation-constraints.md, "buffer or drop outgoing client
+        // requests -- do NOT forward them anywhere" and "do NOT forward a
+        // connection error to the client." So: silently swallow this
+        // request rather than relaying it or erroring back. If it was
+        // creating a new object (e.g. wl_surface.frame()'s callback), the
+        // backend already allocated that object's id on the wire
+        // regardless of what we do here, so we still have to return valid
+        // object data for it -- otherwise the *next* message to that
+        // orphaned object panics. It'll just sit there forever swallowing
+        // whatever comes its way, which is exactly "suspend frame
+        // callbacks": GTK waits on a callback that will never fire.
+        let Some(client_backend) = bridge.client() else {
+            if has_new_id {
+                return Some(Arc::new(ServerObjectProxy { bridge: bridge.clone() }));
+            }
+            return None;
+        };
+
         let client_sender = {
             let map = bridge.s2c.lock().unwrap();
             match map.get(&src_protocol_id).cloned() {
@@ -359,51 +401,45 @@ impl server::ObjectData<()> for ServerObjectProxy {
             args: args.into(),
         };
 
-        let new_client_id = if let Some((iface, version)) = child {
+        if let Some((iface, version)) = child {
             let data: Arc<dyn client::ObjectData> =
                 Arc::new(ClientObjectProxy { bridge: bridge.clone() });
-            match bridge
-                .client_backend
-                .send_request(out_msg, Some(data), Some((iface, version)))
-            {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    error!("failed to relay request creating new object: {e}");
-                    return None;
+            match client_backend.send_request(out_msg, Some(data), Some((iface, version))) {
+                Ok(new_client_id) => {
+                    // The matching server-side object id was already
+                    // allocated by the backend (it's in msg.args, since GTK
+                    // picked it on the wire); find it and record the
+                    // mirror both ways.
+                    let new_server_id = msg
+                        .args
+                        .iter()
+                        .find_map(|a| match a {
+                            Argument::NewId(id) => Some(id.clone()),
+                            _ => None,
+                        })
+                        .expect("request with NewId must carry one");
+                    bridge
+                        .s2c
+                        .lock()
+                        .unwrap()
+                        .insert(new_server_id.protocol_id(), new_client_id.clone());
+                    bridge
+                        .c2s
+                        .lock()
+                        .unwrap()
+                        .insert(new_client_id.protocol_id(), new_server_id);
                 }
+                Err(e) => error!("failed to relay request creating new object: {e}"),
             }
-        } else {
-            if let Err(e) = bridge.client_backend.send_request(out_msg, None, None) {
-                error!("failed to relay request to compositor: {e}");
-            }
-            None
-        };
-
-        if let Some(new_client_id) = new_client_id {
-            // The matching server-side object id was already allocated by
-            // the backend (it's in msg.args, since GTK picked it on the
-            // wire); find it and record the mirror both ways.
-            let new_server_id = msg
-                .args
-                .iter()
-                .find_map(|a| match a {
-                    Argument::NewId(id) => Some(id.clone()),
-                    _ => None,
-                })
-                .expect("request with NewId must carry one");
-            bridge
-                .s2c
-                .lock()
-                .unwrap()
-                .insert(new_server_id.protocol_id(), new_client_id.clone());
-            bridge
-                .c2s
-                .lock()
-                .unwrap()
-                .insert(new_client_id.protocol_id(), new_server_id);
+            // Always return valid object data for the new server-side
+            // object, even if the relay above failed -- the backend
+            // allocated it on the wire regardless of what we do here.
             return Some(Arc::new(ServerObjectProxy { bridge: bridge.clone() }));
         }
 
+        if let Err(e) = client_backend.send_request(out_msg, None, None) {
+            error!("failed to relay request to compositor: {e}");
+        }
         None
     }
 
@@ -416,7 +452,9 @@ impl server::ObjectData<()> for ServerObjectProxy {
     ) {
         let protocol_id = object_id.protocol_id();
         if let Some(client_id) = self.bridge.s2c.lock().unwrap().remove(&protocol_id) {
-            let _ = self.bridge.client_backend.destroy_object(&client_id);
+            if let Some(client_backend) = self.bridge.client() {
+                let _ = client_backend.destroy_object(&client_id);
+            }
         }
     }
 }
@@ -496,6 +534,18 @@ impl server::GlobalHandler<()> for GlobalHandlerRelay {
         _global_id: server::GlobalId,
         object_id: server::ObjectId,
     ) -> Arc<dyn server::ObjectData<()>> {
+        // Frozen -- can't bind against a dead compositor connection. Still
+        // have to return valid object data (this global's server-side
+        // object was already created before bind() was called), it just
+        // won't ever do anything.
+        let Some(client_backend) = self.bridge.client() else {
+            warn!(
+                "bind() for {} while frozen -- not relaying to a dead compositor connection",
+                self.interface.name
+            );
+            return Arc::new(ServerObjectProxy { bridge: self.bridge.clone() });
+        };
+
         let bind_msg = Message {
             sender_id: self.registry_id.clone(),
             opcode: 0, // wl_registry.bind
@@ -511,7 +561,7 @@ impl server::GlobalHandler<()> for GlobalHandlerRelay {
         };
         let client_obj: Arc<dyn client::ObjectData> =
             Arc::new(ClientObjectProxy { bridge: self.bridge.clone() });
-        match self.bridge.client_backend.send_request(
+        match client_backend.send_request(
             bind_msg,
             Some(client_obj),
             Some((self.interface, self.interface.version)),
@@ -538,9 +588,12 @@ struct DumbClientData;
 impl server::ClientData for DumbClientData {}
 
 /// Drives one proxied connection to completion: relays messages in both
-/// directions until either side disconnects. No ID *translation* and no
-/// crash-recovery logic live here yet -- this is purely the wayland-backend
-/// based plumbing that Phase 4/5 will build on.
+/// directions until the GTK client disconnects. If the compositor
+/// connection drops instead, the connection freezes (Bridge::freeze) rather
+/// than tearing down -- Phase 5's first two rules, "detect server
+/// disconnect" and "keep the client socket open" -- but there's no
+/// reconnect logic yet (Phase 5 items 3-6), so a frozen connection stays
+/// frozen. No ID *translation* happens yet either (Phase 4's Shadow Table).
 async fn run_connection(gtk_stream: UnixStream, compositor_stream: UnixStream) -> Result<()> {
     let gtk_std: StdUnixStream = gtk_stream.into_std()?;
     gtk_std.set_nonblocking(true)?;
@@ -549,6 +602,11 @@ async fn run_connection(gtk_stream: UnixStream, compositor_stream: UnixStream) -
 
     let client_backend =
         client::Backend::connect(compositor_std).context("connecting client backend")?;
+    // Grabbed now, before client_backend potentially gets frozen out of the
+    // bridge -- the fd itself stays valid (and pollable) for the lifetime
+    // of this `client_backend` value regardless of what the bridge's own
+    // clone of it is doing.
+    let client_raw_fd = client_backend.poll_fd().as_raw_fd();
 
     let mut server_backend = server::Backend::<()>::new().context("creating server backend")?;
     let mut server_handle = server_backend.handle();
@@ -558,7 +616,7 @@ async fn run_connection(gtk_stream: UnixStream, compositor_stream: UnixStream) -
 
     let bridge = Arc::new(Bridge {
         server_handle: server_handle.clone(),
-        client_backend: client_backend.clone(),
+        client_backend: Mutex::new(Some(client_backend.clone())),
         client_id: client_id.clone(),
         c2s: Mutex::new(HashMap::new()),
         s2c: Mutex::new(HashMap::new()),
@@ -595,11 +653,16 @@ async fn run_connection(gtk_stream: UnixStream, compositor_stream: UnixStream) -
     client_backend.flush().context("flushing get_registry")?;
 
     let server_async_fd = AsyncFd::new(BorrowedRawFd(server_backend.poll_fd().as_raw_fd()))?;
-    let client_async_fd = AsyncFd::new(BorrowedRawFd(client_backend.poll_fd().as_raw_fd()))?;
+    let client_async_fd = AsyncFd::new(BorrowedRawFd(client_raw_fd))?;
 
     info!("Proxy session established: relaying GTK client <-> compositor");
 
     loop {
+        // Re-checked every iteration: once frozen this disables the client
+        // branch below for good (no reconnect logic exists yet), leaving
+        // this loop only servicing the GTK-facing side -- which is exactly
+        // "keep client socket open" from implementation-constraints.md.
+        let client_alive = bridge.client_backend.lock().unwrap().is_some();
         tokio::select! {
             guard = server_async_fd.readable() => {
                 let mut guard = guard?;
@@ -615,7 +678,7 @@ async fn run_connection(gtk_stream: UnixStream, compositor_stream: UnixStream) -
                     warn!("flush to GTK client failed: {e}");
                 }
             }
-            guard = client_async_fd.readable() => {
+            guard = client_async_fd.readable(), if client_alive => {
                 let mut guard = guard?;
                 let dispatched = (|| -> Result<usize, wayland_backend::client::WaylandError> {
                     match client_backend.prepare_read() {
@@ -624,19 +687,31 @@ async fn run_connection(gtk_stream: UnixStream, compositor_stream: UnixStream) -
                     }
                 })();
                 match dispatched {
-                    Ok(_) => { guard.clear_ready(); }
+                    Ok(_) => {
+                        guard.clear_ready();
+                        if let Err(e) = client_backend.flush() {
+                            warn!("flush to compositor failed: {e}");
+                        }
+                    }
                     Err(wayland_backend::client::WaylandError::Io(ref e))
                         if e.kind() == std::io::ErrorKind::WouldBlock =>
                     {
                         guard.clear_ready();
                     }
                     Err(e) => {
-                        info!("compositor connection lost: {e}");
-                        return Ok(());
+                        // The crash. Per implementation-constraints.md: freeze
+                        // the client socket, don't close it, don't forward
+                        // this error anywhere -- the GTK client must believe
+                        // nothing happened. We don't have reconnect logic
+                        // yet (Phase 5 items 3-6), so this connection stays
+                        // frozen for the rest of its life; the loop keeps
+                        // running to keep servicing (and silently
+                        // swallowing) the GTK-facing side.
+                        info!(
+                            "compositor connection lost ({e}) -- freezing, GTK client stays connected"
+                        );
+                        bridge.freeze();
                     }
-                }
-                if let Err(e) = client_backend.flush() {
-                    warn!("flush to compositor failed: {e}");
                 }
             }
         }
