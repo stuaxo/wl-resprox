@@ -54,7 +54,8 @@ off the Unix socket, mutates the integer IDs in place via a `bimap`-based
 Shadow Table (Phase 4), and forwards the modified byte stream. This
 requires either hardcoding protocol byte-offsets or build-time XML codegen
 to know which bytes in a payload are `object`/`new_id` typed -- not yet
-decided, see plan.md's Phase 3.5/4.
+decided, see `docs/plan/plan-0001-proxy-core-and-crash-recovery.md`'s
+Phase 3.5/4.
 
 ## 5. Prior Art & Inspiration
 
