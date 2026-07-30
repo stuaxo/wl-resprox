@@ -51,3 +51,30 @@ pub fn lookup_interface(name: &str) -> Option<&'static Interface> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_core_interfaces_resolve() {
+        for name in ["wl_display", "wl_registry", "wl_callback", "wl_compositor", "wl_surface", "wl_shm", "wl_seat"] {
+            let iface = lookup_interface(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(iface.name, name);
+        }
+    }
+
+    #[test]
+    fn known_xdg_shell_interfaces_resolve() {
+        for name in ["xdg_wm_base", "xdg_surface", "xdg_toplevel", "xdg_popup", "xdg_positioner"] {
+            let iface = lookup_interface(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(iface.name, name);
+        }
+    }
+
+    #[test]
+    fn unknown_interface_returns_none() {
+        assert!(lookup_interface("not_a_real_interface").is_none());
+        assert!(lookup_interface("zwlr_layer_shell_v1").is_none());
+    }
+}

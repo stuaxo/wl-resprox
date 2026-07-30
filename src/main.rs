@@ -688,3 +688,90 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wayland_backend::protocol::{AllowNull, MessageDesc};
+
+    static FAKE_CHILD_INTERFACE: Interface =
+        Interface { name: "fake_child", version: 3, requests: &[], events: &[], c_ptr: None };
+
+    fn bind_desc(signature: &'static [ArgumentType]) -> MessageDesc {
+        MessageDesc {
+            name: "bind",
+            since: 1,
+            is_destructor: false,
+            signature,
+            child_interface: None,
+            arg_interfaces: &[],
+        }
+    }
+
+    #[test]
+    fn resolves_statically_declared_child_interface() {
+        let desc = MessageDesc {
+            name: "get_thing",
+            since: 1,
+            is_destructor: false,
+            signature: &[ArgumentType::NewId],
+            child_interface: Some(&FAKE_CHILD_INTERFACE),
+            arg_interfaces: &[],
+        };
+        let (iface, version) = resolve_child_interface(&desc, &[]).expect("should resolve");
+        assert_eq!(iface.name, "fake_child");
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn resolves_bind_dynamic_interface_from_name_string() {
+        let desc = bind_desc(&[
+            ArgumentType::Uint,
+            ArgumentType::Str(AllowNull::No),
+            ArgumentType::Uint,
+            ArgumentType::NewId,
+        ]);
+        let args = vec![
+            Argument::Uint(5),
+            Argument::Str(Some(Box::new(std::ffi::CString::new("wl_compositor").unwrap()))),
+            Argument::Uint(4),
+            Argument::NewId(0),
+        ];
+        let (iface, version) =
+            resolve_child_interface(&desc, &args).expect("should resolve wl_compositor");
+        assert_eq!(iface.name, "wl_compositor");
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn bind_with_unknown_interface_name_returns_none() {
+        let desc = bind_desc(&[
+            ArgumentType::Uint,
+            ArgumentType::Str(AllowNull::No),
+            ArgumentType::Uint,
+            ArgumentType::NewId,
+        ]);
+        let args = vec![
+            Argument::Uint(5),
+            Argument::Str(Some(Box::new(
+                std::ffi::CString::new("totally_not_a_real_interface").unwrap(),
+            ))),
+            Argument::Uint(1),
+            Argument::NewId(0),
+        ];
+        assert!(resolve_child_interface(&desc, &args).is_none());
+    }
+
+    #[test]
+    fn bind_missing_version_arg_falls_back_to_interface_default_version() {
+        let desc = bind_desc(&[ArgumentType::Uint, ArgumentType::Str(AllowNull::No), ArgumentType::NewId]);
+        let args = vec![
+            Argument::Uint(5),
+            Argument::Str(Some(Box::new(std::ffi::CString::new("wl_shm").unwrap()))),
+            Argument::NewId(0),
+        ];
+        let (iface, version) = resolve_child_interface(&desc, &args).expect("should resolve wl_shm");
+        assert_eq!(iface.name, "wl_shm");
+        assert_eq!(version, iface.version);
+    }
+}
