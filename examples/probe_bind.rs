@@ -29,47 +29,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use wayland_proxy::wire;
-
-fn put_u32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_ne_bytes());
-}
-
-fn put_str(buf: &mut Vec<u8>, s: &str) {
-    let with_nul_len = s.len() + 1;
-    put_u32(buf, with_nul_len as u32);
-    buf.extend_from_slice(s.as_bytes());
-    buf.push(0);
-    let padded = with_nul_len.div_ceil(4) * 4;
-    for _ in with_nul_len..padded {
-        buf.push(0);
-    }
-}
-
-fn message(sender_id: u32, opcode: u16, payload: &[u8]) -> Vec<u8> {
-    let length = (wire::HEADER_LEN + payload.len()) as u16;
-    let mut msg = Vec::with_capacity(length as usize);
-    put_u32(&mut msg, sender_id);
-    put_u32(&mut msg, ((length as u32) << 16) | opcode as u32);
-    msg.extend_from_slice(payload);
-    msg
-}
-
-fn read_u32(payload: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_ne_bytes(payload.get(offset..offset + 4)?.try_into().ok()?))
-}
-
-/// Reads a wire string starting at `offset`: a u32 length (NUL included),
-/// the bytes themselves, then padding out to the next 4-byte boundary.
-/// Returns the decoded string (NUL trimmed) and the offset just past it.
-fn read_str(payload: &[u8], offset: usize) -> Option<(String, usize)> {
-    let len = read_u32(payload, offset)? as usize;
-    let start = offset + 4;
-    let bytes = payload.get(start..start + len)?;
-    let s = std::str::from_utf8(&bytes[..len.saturating_sub(1)]).ok()?.to_string();
-    let padded = len.div_ceil(4) * 4;
-    Some((s, start + padded))
-}
+use wayland_proxy::wire::{self, put_str, put_u32, read_str, read_u32};
 
 struct Global {
     name: u32,
@@ -99,10 +59,10 @@ fn main() -> ExitCode {
     let mut out = Vec::new();
     let mut get_registry_payload = Vec::new();
     put_u32(&mut get_registry_payload, 2);
-    out.extend(message(1, 1, &get_registry_payload));
+    out.extend(wire::build_message(1, 1, &get_registry_payload));
     let mut sync1_payload = Vec::new();
     put_u32(&mut sync1_payload, 3);
-    out.extend(message(1, 0, &sync1_payload));
+    out.extend(wire::build_message(1, 0, &sync1_payload));
     stream.write_all(&out).expect("sending get_registry+sync");
 
     let mut globals = Vec::new();
@@ -204,7 +164,7 @@ fn main() -> ExitCode {
         put_str(&mut bind_payload, interface);
         put_u32(&mut bind_payload, *version);
         put_u32(&mut bind_payload, next_id);
-        out2.extend(message(2, 0, &bind_payload));
+        out2.extend(wire::build_message(2, 0, &bind_payload));
         let bound_id = next_id;
         next_id += 1;
 
@@ -212,14 +172,14 @@ fn main() -> ExitCode {
             println!("  -> immediately sending {interface}#{bound_id}.<opcode {opcode}>(new_id={next_id})");
             let mut followup_payload = Vec::new();
             put_u32(&mut followup_payload, next_id);
-            out2.extend(message(bound_id, *opcode, &followup_payload));
+            out2.extend(wire::build_message(bound_id, *opcode, &followup_payload));
             next_id += 1;
         }
     }
     let sync_id = next_id;
     let mut sync2_payload = Vec::new();
     put_u32(&mut sync2_payload, sync_id);
-    out2.extend(message(1, 0, &sync2_payload));
+    out2.extend(wire::build_message(1, 0, &sync2_payload));
     stream.write_all(&out2).expect("sending binds+sync");
 
     buf.clear();

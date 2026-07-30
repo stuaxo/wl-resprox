@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
-# Enters the distrobox container (rootful), starts the nested compositor
-# via entrypoint.sh, then drops you into an interactive shell inside the
-# container for testing (gtk4-demo, wayland-info, etc.).
+# Enters the wayland-proxy-dev container (a plain podman container, built
+# and started by scripts/setup-env.sh -- see scripts/Containerfile),
+# starts the nested compositor via entrypoint.sh, then drops you into an
+# interactive shell inside the container for testing (gtk4-demo,
+# wayland-info, etc.).
 #
 # Usage: ./scripts/start-guest.sh [host-wayland-socket]
 #   host-wayland-socket defaults to wayland-0 — match whatever
 #   scripts/start-host.sh printed.
 #
-# Note: the container is rootful, so this shells out to `sudo podman exec`
-# directly instead of `distrobox enter --root` — expect a password prompt
+# Note: this shells out to `sudo podman exec` -- expect a password prompt
 # (cached per your normal sudo timeout, not every call).
 #
-# IMPORTANT: this deliberately does NOT use plain `distrobox enter --root`.
-# That invokes `podman exec --user=stu` under the hood, which — for this
-# container, for reasons not fully root-caused — does not apply stu's
-# video/render group membership, so anything touching /dev/dri (like the
-# nested labwc started by entrypoint.sh) fails with "Permission denied".
-# `--user stu:render` works reliably. See the 2026-07-29 entry in
-# docs/debugging-notes.md for the full investigation.
+# `--user stu:render` (not just `--user stu`) is explicit here even though
+# scripts/setup-env.sh's --group-add plus the matching video/render GIDs
+# baked into the image should already make plain `--user stu` pick up
+# full supplementary groups (unlike the Distrobox-managed container this
+# setup replaced, which never did regardless -- see the 2026-07-29 entry
+# in docs/debugging-notes.md for that investigation). Kept explicit as the
+# known-safe choice rather than re-relying on unverified group resolution.
 set -euo pipefail
 
 CONTAINER_NAME="wayland-proxy-dev"

@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 # Automated crash-recovery test harness. Runs entirely inside the
-# distrobox container (needs a real Wayland session -- GTK/EGL -- so it
-# has the same GPU-access requirement as everything else in scripts/):
+# wayland-proxy-dev container (needs a real Wayland session -- GTK/EGL --
+# so it has the same GPU-access requirement as everything else in scripts/):
 #
 #   sudo podman exec --user stu:render wayland-proxy-dev \
 #     bash /home/stu/projects/mine/wayland-resilliance-proxy/scripts/test-crash.sh
-#
-# (plain `distrobox enter --root` does NOT have GPU access on this setup --
-# see the 2026-07-29 entry in docs/debugging-notes.md.)
 #
 # What it does:
 #   1. Starts a headless compositor (the "server" the proxy fronts).

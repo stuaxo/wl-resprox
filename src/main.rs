@@ -40,7 +40,9 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     match UnixStream::connect(&target_path).await {
                         Ok(compositor_stream) => {
-                            if let Err(e) = run_connection(gtk_stream, compositor_stream).await {
+                            if let Err(e) =
+                                run_connection(gtk_stream, compositor_stream, target_path).await
+                            {
                                 error!("proxy session ended with error: {e:?}");
                             }
                         }

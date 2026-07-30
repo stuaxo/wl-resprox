@@ -1,0 +1,73 @@
+# Wayland proxy dev environment, built directly with `podman build` --
+# replaces the earlier Distrobox + Ansible-provisioning-after-create
+# approach (scripts/playbook.yml, now removed). That approach ran
+# Distrobox's own container-init script (`distrobox-init`, bind-mounted in
+# as `/usr/bin/entrypoint`), which unconditionally attempts an interactive
+# password reset for the container user on every session -- harmless in
+# practice (it fails fast, non-interactively, rather than hanging) but
+# noisy, and was the reason `sudo` never had a working password for `stu`
+# in the first place (see the 2026-07-29/2026-07-30 entries in
+# docs/debugging-notes.md for the full history). Building our own image
+# means we control user/sudoers setup entirely at build time and never run
+# that script at all.
+#
+# Build: podman build -t wayland-proxy-dev -f scripts/Containerfile scripts/
+# Run:   see scripts/setup-env.sh, which also handles the render/video
+#        GID matching and host directory bind mount this image alone
+#        doesn't set up (those are host-specific, not build-time facts).
+
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    sudo \
+    rustc \
+    cargo \
+    libgtk-4-dev \
+    gtk-4-examples \
+    labwc \
+    libwayland-dev \
+    wayland-utils \
+    dbus \
+    wev \
+    && rm -rf /var/lib/apt/lists/*
+
+# GID/UID values are baked in as build args, not hardcoded, since they're
+# host-specific facts (this host: stu=1000, video=44, render=991 --
+# confirmed via `id stu` / `getent group video render` on the host; see
+# scripts/setup-env.sh, which passes the actual host values at build time
+# rather than relying on these defaults matching by luck). `render`
+# doesn't exist in the base image by default; `video` usually does with a
+# different GID, so both are created explicitly at the given GID rather
+# than assumed.
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG VIDEO_GID=44
+ARG RENDER_GID=991
+
+# Ubuntu's own base image ships a default `ubuntu` user/group at
+# UID/GID 1000 (the common case here, since that's stu's host UID/GID
+# too) -- remove it first so it doesn't collide with the group/useradd
+# calls below.
+RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true
+
+RUN groupadd -g "${USER_GID}" stu \
+    && (groupmod -g "${VIDEO_GID}" video 2>/dev/null || groupadd -g "${VIDEO_GID}" video) \
+    && groupadd -g "${RENDER_GID}" render \
+    && useradd -u "${USER_UID}" -g "${USER_GID}" -G video,render,sudo -m -s /bin/bash stu
+
+# Passwordless sudo baked in at build time -- no interactive password flow
+# exists anywhere in this image, so there's nothing that can be caught
+# mid-setup the way distrobox-init's was.
+RUN echo "stu ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/zz-stu-nopasswd \
+    && chmod 0440 /etc/sudoers.d/zz-stu-nopasswd \
+    && visudo -cf /etc/sudoers.d/zz-stu-nopasswd
+
+USER stu
+WORKDIR /home/stu
+
+# scripts/diagnose.sh detects "am I running inside the container" via this
+# -- previously set automatically by Distrobox, now set explicitly since
+# nothing else provides it.
+ENV CONTAINER_ID=wayland-proxy-dev

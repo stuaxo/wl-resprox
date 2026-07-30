@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs INSIDE the distrobox container. Starts the nested labwc compositor
-# and reports the new Wayland socket it creates. Called by start-guest.sh —
-# not meant to be run directly on the host.
+# Runs INSIDE the wayland-proxy-dev container. Starts the nested labwc
+# compositor and reports the new Wayland socket it creates. Called by
+# start-guest.sh — not meant to be run directly on the host.
 set -euo pipefail
 
 echo "Guest sees WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}"

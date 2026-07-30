@@ -97,6 +97,57 @@ pub fn take_message(buf: &[u8]) -> Option<(&[u8], usize)> {
     Some((&buf[..len], len))
 }
 
+/// Builds one complete wire message (header + payload) from scratch.
+/// Together with `put_u32`/`put_str`/`read_u32`/`read_str` below, these are
+/// the primitives for code that needs to speak Wayland as a synthetic
+/// client -- currently `run_connection`'s reconnect state-recovery path
+/// (see recreation.rs) and, standalone, `examples/probe_bind.rs` and
+/// `tests/integration.rs`'s hand-crafted-bytes tests. Consolidated here
+/// rather than left duplicated across those three, which is how this
+/// function used to exist (three near-identical copies).
+pub fn build_message(sender_id: u32, opcode: u16, payload: &[u8]) -> Vec<u8> {
+    let length = (HEADER_LEN + payload.len()) as u16;
+    let mut msg = Vec::with_capacity(length as usize);
+    put_u32(&mut msg, sender_id);
+    put_u32(&mut msg, ((length as u32) << 16) | opcode as u32);
+    msg.extend_from_slice(payload);
+    msg
+}
+
+pub fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_ne_bytes());
+}
+
+/// Appends a wire-encoded string: a u32 length (NUL terminator included),
+/// the bytes themselves, a NUL, then padding out to the next 4-byte
+/// boundary.
+pub fn put_str(buf: &mut Vec<u8>, s: &str) {
+    let with_nul_len = s.len() + 1;
+    put_u32(buf, with_nul_len as u32);
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0);
+    let padded = with_nul_len.next_multiple_of(4);
+    for _ in with_nul_len..padded {
+        buf.push(0);
+    }
+}
+
+pub fn read_u32(payload: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(payload.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+/// Reads a wire string starting at `offset` (see `put_str` for the wire
+/// layout). Returns the decoded string (NUL trimmed) and the offset just
+/// past it (including padding).
+pub fn read_str(payload: &[u8], offset: usize) -> Option<(String, usize)> {
+    let len = read_u32(payload, offset)? as usize;
+    let start = offset + 4;
+    let bytes = payload.get(start..start + len)?;
+    let s = std::str::from_utf8(&bytes[..len.saturating_sub(1)]).ok()?.to_string();
+    let padded = len.next_multiple_of(4);
+    Some((s, start + padded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

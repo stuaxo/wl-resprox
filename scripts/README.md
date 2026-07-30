@@ -1,7 +1,9 @@
 # Wayland Proxy Dev Environment
 
-Sets up an Ubuntu 26.04 Distrobox container with Rust, GTK4, and Wayland dev
-tooling (including `labwc` as a nested compositor) for Wayland proxy testing.
+Builds and runs a plain `podman` container (Ubuntu 26.04, via
+`Containerfile`) with Rust, GTK4, and Wayland dev tooling (including
+`labwc` as a nested compositor) for Wayland proxy testing. No Distrobox --
+see `Containerfile`'s header comment for why.
 
 ## Project layout
 
@@ -15,8 +17,8 @@ your-project/
 │   ├── implementation-constraints.md
 │   └── debugging-notes.md
 └── scripts/
-    ├── setup-env.sh     # provisions the container (run once)
-    ├── playbook.yml      # used by setup-env.sh — must stay alongside it
+    ├── setup-env.sh     # builds the image and starts the container (run once)
+    ├── Containerfile     # used by setup-env.sh — must stay alongside it
     ├── start-host.sh     # starts a headless labwc + wayvnc on the HOST
     ├── entrypoint.sh      # runs INSIDE the container — starts nested labwc
     └── start-guest.sh    # enters the container, runs entrypoint.sh, then
@@ -25,10 +27,10 @@ your-project/
 
 ## Host prerequisites
 
-Everything project-specific (Rust, GTK4, Wayland libs, Ansible itself) is
-installed *inside* the container by the playbook. Your host needs the
-tooling to create/enter the container, plus a Wayland session for the
-nested compositor to attach to:
+Everything project-specific (Rust, GTK4, Wayland libs) is installed
+*inside* the container image at build time. Your host needs the tooling
+to build/run the container, plus a Wayland session for the nested
+compositor to attach to:
 
 1. **A container engine — Podman (recommended) or Docker**
    ```bash
@@ -39,17 +41,7 @@ nested compositor to attach to:
    podman info
    ```
 
-2. **Distrobox itself**
-   ```bash
-   sudo apt install distrobox   # Ubuntu/Debian
-   ```
-   If your distro's version is too old:
-   ```bash
-   curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sh -s -- --prefix ~/.local
-   ```
-   Verify with `distrobox version`.
-
-3. **`labwc` and `wayvnc` on the HOST** (not just inside the container —
+2. **`labwc` and `wayvnc` on the HOST** (not just inside the container —
    these run the outer, headless Wayland session):
    ```bash
    sudo apt install labwc wayvnc   # Ubuntu/Debian
@@ -60,20 +52,21 @@ nested compositor to attach to:
    `start-host.sh` below uses: `WLR_BACKENDS=headless` runs `labwc` without
    real graphics hardware, and `wayvnc` serves it over VNC so you can watch.
 
-No need to pre-install `sudo`, `ansible`, `rustc`, `cargo`, or any GTK/Wayland
-packages on the host — the playbook handles all of that inside the container.
+No need to pre-install `sudo`, `rustc`, `cargo`, or any GTK/Wayland packages
+on the host — the Containerfile handles all of that inside the image.
 
 ## Running it
 
-### 1. Provision the container (once)
+### 1. Build and start the container (once)
 
 ```bash
 cd scripts
 chmod +x *.sh
 ./setup-env.sh
 ```
-Creates the `wayland-proxy-dev` Distrobox container and installs Rust,
-GTK4, and Wayland tooling inside it via Ansible.
+Builds the `wayland-proxy-dev` image (Rust, GTK4, and Wayland tooling,
+with `stu`'s UID/GID and the host's video/render GIDs baked in to match)
+and starts it as a long-running container.
 
 ### 2. Start the host compositor + VNC (Terminal A)
 
@@ -104,28 +97,23 @@ WAYLAND_DISPLAY=<new-socket> gtk4-demo
 
 ## Troubleshooting
 
-- **`distrobox: command not found`** — not on `$PATH` (common with
-  `--prefix ~/.local`; add `export PATH="$HOME/.local/bin:$PATH"` to your
-  shell rc).
 - **Podman permission errors** — configure rootless Podman; see the
   [Podman rootless setup docs](https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md).
+  (This project's own scripts always run Podman via `sudo`, sidestepping
+  rootless setup entirely -- see `Containerfile`'s header comment for why.)
 - **`zsh: command not found: labwc` on the host** — `labwc`/`wayvnc` need
-  installing on the host separately from the container (see prerequisite 3).
-- **`compinit: insecure directories` prompt on `distrobox enter`** — harmless
-  zsh warning about directory permissions; `y` to continue, or run
-  `compaudit` to find and fix the flagged directory permanently.
+  installing on the host separately from the container (see prerequisite 2).
 - **Nested `labwc` fails with `libseat`/`Could not open target tty` /
   `Failed to start a DRM session`** — this means `labwc` never saw the
   host's Wayland socket and tried to become a root compositor talking
-  directly to DRM instead. Fix: `export WAYLAND_DISPLAY=<host-socket>`
-  *before* running `distrobox enter` (this is what `start-guest.sh` does
-  for you).
+  directly to DRM instead. Fix: make sure `WAYLAND_DISPLAY=<host-socket>`
+  is set before it starts (this is what `start-guest.sh` does for you).
 - **`xwayland/sockets.c: /tmp/.X11-unix not owned by root or us`,
   `cannot create xwayland server`** — XWayland (X11 compat) fails to start
-  inside the container due to `/tmp` ownership mismatches with Distrobox's
-  shared mount. This project doesn't use XWayland or any X11 clients, so
-  it's safe to ignore — check for a new native `wayland-N` socket instead
-  of a working XWayland. To silence it, add to `~/.config/labwc/rc.xml`:
+  inside the container due to `/tmp` ownership mismatches with the shared
+  mount. This project doesn't use XWayland or any X11 clients, so it's
+  safe to ignore — check for a new native `wayland-N` socket instead of a
+  working XWayland. To silence it, add to `~/.config/labwc/rc.xml`:
   ```xml
   <labwc_config><core><xwayland>no</xwayland></core></labwc_config>
   ```

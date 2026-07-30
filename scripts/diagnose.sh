@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Reports labwc/Wayland/wayvnc diagnostic state on both host and guest.
 #
-# Detects context via $CONTAINER_ID (set by Distrobox inside the container,
-# unset on the host) and runs the relevant checks. When run on the host, it
-# also re-invokes itself inside the container to pull guest-side diagnostics
-# into the same output.
+# Detects context via $CONTAINER_ID (set by the Containerfile inside the
+# container, unset on the host) and runs the relevant checks. When run on
+# the host, it also re-invokes itself inside the container to pull
+# guest-side diagnostics into the same output.
 #
 # Usage (run on the host): ./scripts/diagnose.sh [container-name]
 set +e  # diagnostics should keep going even if individual checks fail
@@ -86,9 +86,9 @@ print_wayvnc_port() {
   fi
 }
 
-print_distrobox_containers() {
-  section "HOST: distrobox containers"
-  distrobox list 2>/dev/null
+print_containers() {
+  section "HOST: podman containers"
+  sudo podman ps -a --filter "name=${CONTAINER_NAME}" 2>/dev/null
 }
 
 run_guest_checks() {
@@ -105,7 +105,7 @@ run_host_checks() {
   print_labwc_processes "HOST"
   print_wayvnc_processes
   print_wayvnc_port
-  print_distrobox_containers
+  print_containers
 }
 
 pull_guest_diagnostics() {
@@ -113,7 +113,7 @@ pull_guest_diagnostics() {
   echo "############################################"
   echo "# Pulling diagnostics from inside '${CONTAINER_NAME}'..."
   echo "############################################"
-  distrobox enter --root "$CONTAINER_NAME" -- bash "$SCRIPT_PATH"
+  sudo podman exec --user stu "$CONTAINER_NAME" bash "$SCRIPT_PATH"
 }
 
 main() {

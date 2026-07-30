@@ -78,18 +78,27 @@ match.
       library's endpoint-oriented object model (distinct client/server
       `ObjectId` types, `wl_display` not being a normal retrievable
       object) is what motivated moving to hand-rolled wire parsing instead.
-- [ ] Build the Shadow Table (using `bimap`) to track Object IDs as plain `u32` integers.
-      Not built yet. Now that IDs are (going to be) plain `u32`s rather
-      than two distinct wayland-backend types, this can be the real thing
-      -- a `bimap::BiMap<u32, u32>` per connection, matching sommelier-rs's
-      `map_id`, rather than the identity-bridge `HashMap` scaffolding this
-      note used to describe.
+- [x] Build the Shadow Table (using `bimap`) to track Object IDs as plain `u32` integers.
+      Built 2026-07-30 on the `shadow-table-1to1` branch (not yet merged to
+      `main`) -- `src/shadow_table.rs`'s `ShadowTable`: a real
+      `bimap::BiMap<u32, u32>` (guest id <-> host id) plus independent
+      per-side id allocators (host starts at 2, guest-server-side at
+      `0xff000000`, both matching Wayland's own convention), modeled on
+      sommelier-rs's `map_id`/`ShadowTable`. Unit-tested with deliberately
+      mismatched guest/host ids. In live/end-to-end practice the numbers
+      currently still coincide (both allocators start at 2 and increment in
+      lockstep since there's only ever one host connection so far) -- that's
+      expected and was a deliberate scoping choice discussed up front, not
+      a gap; see docs/architecture-notes.md. It's a real independent
+      mechanism, proven by a dedicated test that hand-crafts ids no real
+      allocator would produce next (`shadow_table_translates_new_id_and_delete_id_round_trip`
+      in `tests/integration.rs`), not a coincidence.
 - [x] Intercept `wl_registry` requests to map globals.
       Re-done against the hand-rolled wire parser (Phase 3.5's removal
       item landed 2026-07-30): `relay_ready_messages` inspects every
       `wl_registry.bind`/typed-new_id request directly off the wire and
-      tracks the resulting object's interface. Globals are still mirrored
-      1:1, not yet remapped -- that's the Shadow Table item below.
+      tracks the resulting object's interface. Globals are now remapped
+      through the Shadow Table above, not just mirrored.
       `src/interfaces.rs` covers 46 real-world interfaces now (core +
       xdg-shell + freedesktop staging/unstable + wlroots + KDE + misc --
       see docs/architecture-notes.md), up from 7, after a real bug
@@ -97,10 +106,25 @@ match.
       the client's new_id sequence and gets an unrelated later message
       rejected by the compositor -- see docs/debugging-notes.md's
       2026-07-30 entry) made closing that gap urgent rather than optional.
-- [ ] Rewrite Object IDs on-the-fly for all traversing messages.
-      Deliberately deferred -- explicitly out of scope for the 2026-07-30 work.
+- [x] Rewrite Object IDs on-the-fly for all traversing messages.
+      Done 2026-07-30 on the `shadow-table-1to1` branch, alongside the
+      Shadow Table above: `relay_ready_messages` rewrites the message
+      header's `sender_id` (both directions), every `Object`-typed
+      argument (`walk_signature`'s `object_offsets`), `new_id` allocation,
+      and `delete_id`'s payload -- all through the Shadow Table. A message
+      referencing an id that can't be translated is dropped outright rather
+      than partially rewritten. Live-verified against real labwc:
+      `wayland-info` (10/10 clean) and a full `gtk4-demo` session, both
+      with zero protocol errors.
 
 ## Phase 5: Crash Recovery Mechanics
+
+The four unchecked items below are the direct next step now that Phase
+4's Shadow Table exists (`shadow-table-1to1` branch) -- they're also what
+finally gives it a real workout: reconnecting to a *new* compositor
+process is the first time the guest/host id spaces will actually diverge
+from each other, rather than coinciding as they still do today with only
+one host connection ever in play.
 
 - [x] Detect Server socket drop (`ECONNRESET`).
 - [x] Pause proxying; keep Client socket open and suspend frame callbacks.
@@ -116,15 +140,54 @@ match.
       `done` event, so GTK naturally stops rendering. No reconnect logic
       exists yet (see below), so a frozen connection currently stays frozen
       forever -- there's no way back from this state yet.
-- [ ] Detect new Server socket (when `labwc` is restarted).
-- [ ] Re-request `wl_registry` globals from the new Server.
-- [ ] Re-create `wl_surface` and `xdg_toplevel` objects on the new Server based on tracked state.
-- [ ] Synthesize `xdg_surface.configure` to trigger GTK repaint.
+- [x] Detect new Server socket (when `labwc` is restarted).
+      Done 2026-07-30 on `shadow-table-1to1`: `reconnect_with_backoff`
+      retries connecting to the compositor socket path (fixed 250ms
+      backoff, no attempt limit) while frozen, wired into `run_connection`
+      via a `tokio::select!` branch.
+- [x] Re-request `wl_registry` globals from the new Server.
+      Done 2026-07-30: `recover_state_after_reconnect` acts as its own
+      synthetic client against the fresh host connection (`get_registry`
+      + `sync`), collecting `wl_compositor`/`xdg_wm_base`'s fresh
+      name/version.
+- [x] Re-create `wl_surface` and `xdg_toplevel` objects on the new Server based on tracked state.
+      Done 2026-07-30: `RecreationGraph` (`src/recreation.rs`) records
+      parent-before-child recipes for the recreatable chain
+      (`wl_compositor`/`xdg_wm_base` -> `wl_surface` -> `xdg_surface` ->
+      `xdg_toplevel`) as they're created; replayed against the new host on
+      reconnect with fresh host ids, remapped through the Shadow Table.
+      Went further than originally scoped here, also covering (per
+      `docs/implementation-constraints.md`): grab state (`src/grab_state.rs`
+      synthesizes pointer/keyboard release before resuming traffic) and
+      buffer lifetimes (a `generation` counter on the Shadow Table refuses
+      to translate/forward `wl_buffer.release` for a buffer that predates
+      the reconnect).
+- [x] Synthesize `xdg_surface.configure` to trigger GTK repaint.
+      Done 2026-07-30, including a bug found only in live testing: the
+      invented serial got rejected by the real compositor's own
+      `ack_configure` handling ("wrong configure serial"). Fixed by
+      tracking pending synthetic serials per `xdg_surface` and swallowing
+      the matching client ack instead of forwarding it. See
+      `docs/debugging-notes.md`'s 2026-07-30 entries for the full
+      live-debugging trail (three separate real bugs, all only reproducible
+      against a real compositor, none caught by fake-compositor tests
+      alone).
+
+Live-verified end to end 2026-07-30: crashed a real headless `labwc`,
+started a replacement on the same socket, watched the proxy recreate the
+full surface/toplevel chain and force a repaint, and confirmed `gtk4-demo`
+stayed connected and rendering throughout -- not just that recreation
+messages were sent. All Phase 5 work landed on the `shadow-table-1to1`
+branch (not yet squashed/merged to `main` -- see docs/architecture-notes.md
+for why: it's being kept 1:1 with host/guest ids deliberately until this
+phase proved reconnect+remapping actually work, per an explicit up-front
+decision).
 
 Note: `scripts/test-crash.sh` automates the kill-and-check for this phase,
-but a "SUCCESS" from it today doesn't mean any of the above works -- GTK
+but a "SUCCESS" from it alone doesn't prove any of the above works -- GTK
 apps often don't notice a dead socket immediately just by being idle. It's
-a harness to iterate against, not proof of anything yet.
+a harness to iterate against; the live-verification above is what actually
+proves it.
 
 ## References
 
