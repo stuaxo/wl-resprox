@@ -57,6 +57,10 @@ impl MessageHeader {
 
 /// Reads just the sender_id from a raw message buffer, without parsing the
 /// full header. Returns `None` if `msg` is too short to contain one.
+// Not called from main.rs yet: this milestone is "simple ID reflection"
+// (client id == host id always), not real translation. The real Shadow
+// Table (Phase 4) is what will actually call this.
+#[allow(dead_code)]
 pub fn read_sender_id(msg: &[u8]) -> Option<u32> {
     Some(u32::from_ne_bytes(msg.get(0..4)?.try_into().unwrap()))
 }
@@ -69,6 +73,7 @@ pub fn read_sender_id(msg: &[u8]) -> Option<u32> {
 /// addressed to.
 ///
 /// Returns `Err` if `msg` is too short to contain a sender_id field.
+#[allow(dead_code)] // see read_sender_id above -- same reason
 pub fn write_sender_id(msg: &mut [u8], new_id: u32) -> Result<(), &'static str> {
     let slot = msg
         .get_mut(0..4)
