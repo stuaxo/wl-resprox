@@ -74,8 +74,17 @@ existing_sockets="$(ls "$RUNTIME_DIR"/wayland-*[0-9] 2>/dev/null || true)"
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 labwc -C /dev/null > "$COMPOSITOR_LOG" 2>&1 &
 COMPOSITOR_PID=$!
 
+# 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow
+# start here isn't a hang: labwc walks several theme directories probing
+# for window-decoration icons (all missing, normal fallback behavior) and
+# does real GPU work even in headless mode (DRM_IOCTL_AMDGPU_CS -- it
+# still renders via /dev/dri, just doesn't scan out to a display). On a
+# busy/shared host -- confirmed live: other labwc/Xwayland instances
+# entirely outside this container, competing for the same GPU and
+# XWayland X-display-number slots -- that startup can take longer than
+# 5s, which isn't a fault of anything here, just contention.
 COMPOSITOR_DISPLAY=""
-for _ in $(seq 1 20); do
+for _ in $(seq 1 80); do
     for sock in "$RUNTIME_DIR"/wayland-*[0-9]; do
         [[ -e "$sock" ]] || continue
         name="$(basename "$sock")"

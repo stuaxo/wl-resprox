@@ -28,6 +28,11 @@ FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# psmisc (fuser) and iproute2 (ss): not needed by the proxy or labwc
+# themselves, but scripts/diagnose.sh depends on both for live/stale
+# socket detection and XWayland-slot ownership -- confirmed missing live
+# (diagnose.sh silently reported everything as "stale" inside the
+# container until these were added).
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
     rustc \
@@ -39,6 +44,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     wayland-utils \
     dbus \
     wev \
+    psmisc \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # GID/UID values are baked in as build args, not hardcoded -- host-specific
