@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Pre-commit hook: runs the Rust unit test suite before allowing a commit.
+#
+# Runs inside the wayland-proxy-dev distrobox container rather than on the
+# host directly -- the host lacks libwayland-dev, so `cargo test` can't
+# link wayland-backend's system-backend features here (see
+# docs/debugging-notes.md). Needs the container running and passwordless
+# (or already-cached) host sudo for `podman exec`; see the 2026-07-29
+# entries in docs/debugging-notes.md for why NOPASSWD sudo was set up on
+# this host in the first place. If that ever gets removed, this hook will
+# start prompting for a password mid-`git commit` instead of failing
+# outright -- not silently broken, just less smooth.
+#
+# Installed via: git config core.hooksPath .githooks
+set -euo pipefail
+
+CONTAINER_NAME="wayland-proxy-dev"
+PROJECT_DIR="$(git rev-parse --show-toplevel)"
+
+if ! sudo -n podman ps --filter "name=^${CONTAINER_NAME}\$" --filter "status=running" --format '{{.Names}}' 2>/dev/null \
+    | grep -qx "${CONTAINER_NAME}"; then
+    echo "pre-commit: '${CONTAINER_NAME}' container isn't running -- start it before committing (see scripts/README.md)." >&2
+    exit 1
+fi
+
+echo "pre-commit: running cargo test in ${CONTAINER_NAME}..."
+if ! sudo podman exec --user stu -w "$PROJECT_DIR" "$CONTAINER_NAME" cargo test --quiet; then
+    echo "pre-commit: cargo test failed -- commit aborted." >&2
+    exit 1
+fi
