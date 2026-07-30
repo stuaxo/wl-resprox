@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Automated crash-recovery test harness. Runs entirely inside the
 # wayland-proxy-dev container (needs a real Wayland session -- GTK/EGL --
-# so it has the same GPU-access requirement as everything else in scripts/):
+# so it has the same GPU-access requirement as everything else in scripts/).
+# From an interactive shell there (scripts/start-guest.sh drops you into
+# one already at the project root):
 #
-#   sudo podman exec --user stu:render wayland-proxy-dev \
-#     bash /home/stu/projects/mine/wayland-resilliance-proxy/scripts/test-crash.sh
+#   bash scripts/test-crash.sh
 #
 # What it does:
 #   1. Starts a headless compositor (the "server" the proxy fronts).

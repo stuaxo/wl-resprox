@@ -12,9 +12,9 @@
 # Note: this shells out to `sudo podman exec` -- expect a password prompt
 # (cached per your normal sudo timeout, not every call).
 #
-# `--user stu:render` (not just `--user stu`) is explicit here even though
+# `--user dev:render` (not just `--user dev`) is explicit here even though
 # scripts/setup-env.sh's --group-add plus the matching video/render GIDs
-# baked into the image should already make plain `--user stu` pick up
+# baked into the image should already make plain `--user dev` pick up
 # full supplementary groups (unlike the Distrobox-managed container this
 # setup replaced, which never did regardless -- see the 2026-07-29 entry
 # in docs/debugging-notes.md for that investigation). Kept explicit as the
@@ -23,17 +23,21 @@ set -euo pipefail
 
 CONTAINER_NAME="wayland-proxy-dev"
 HOST_DISPLAY="${1:-wayland-0}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Fixed, not derived from this script's own host-side location -- the
+# container only ever mounts the project directory at /workspace (see
+# setup-env.sh), not a host-mirrored path.
+CONTAINER_PROJECT_ROOT="/workspace"
 
 echo "Starting nested compositor in '${CONTAINER_NAME}' (host display: ${HOST_DISPLAY})..."
-sudo podman exec --user stu:render \
+sudo podman exec --user dev:render \
   -e WAYLAND_DISPLAY="$HOST_DISPLAY" \
   -e XDG_RUNTIME_DIR="/run/user/1000" \
-  "$CONTAINER_NAME" bash "$SCRIPT_DIR/entrypoint.sh"
+  "$CONTAINER_NAME" bash "${CONTAINER_PROJECT_ROOT}/scripts/entrypoint.sh"
 
 echo ""
 echo "Entering '${CONTAINER_NAME}' interactively for testing..."
-sudo podman exec -it --user stu:render \
+sudo podman exec -it --user dev:render \
   -e WAYLAND_DISPLAY="$HOST_DISPLAY" \
   -e XDG_RUNTIME_DIR="/run/user/1000" \
+  -w "${CONTAINER_PROJECT_ROOT}" \
   "$CONTAINER_NAME" bash

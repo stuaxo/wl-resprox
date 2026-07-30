@@ -13,6 +13,8 @@ set -euo pipefail
 CONTAINER_NAME="wayland-proxy-dev"
 IMAGE_TAG="wayland-proxy-dev:latest"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+CONTAINER_PROJECT_ROOT="/workspace"
 
 # UID/GID values are host-specific facts, not hardcoded -- read live
 # rather than assumed, so this works on a host with different values
@@ -59,11 +61,16 @@ echo "Starting ${CONTAINER_NAME}..."
 # groups through to `podman exec --user=<name>` (no `:group` override
 # needed), unlike the Distrobox-managed container this replaces, which
 # never did regardless of this flag for reasons never fully root-caused.
-# -v "$HOME:$HOME": shares the whole project tree (and everything else in
-# $HOME) between host and container, matching what Distrobox did
-# automatically -- this is what lets every `podman exec` in this
-# project's scripts just cd into the same absolute project path on both
-# sides.
+# -v "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT": only the project directory,
+# at a fixed generic path -- deliberately NOT the whole $HOME the way
+# Distrobox shared it. A whole-$HOME mount means anything the container
+# writes under $HOME lands in the host's real home directory, and on any
+# host where the container's (now-fixed, generic) user happens to share a
+# name with the host account, it also silently shadows the image's own
+# home-directory dotfiles with the host's (confirmed live: a ~/.bashrc
+# customization baked into the image never took effect on this dev host,
+# because both happened to be named the same). Every script references
+# the fixed container-side path directly now, not a host-mirrored one.
 # -v /dev:/dev: full device passthrough, matching Distrobox's default --
 # makes the device *nodes* visible, but Podman's device cgroup ACL still
 # blocks actually opening them regardless of Unix file permissions/group
@@ -84,13 +91,13 @@ sudo podman run -d --name "${CONTAINER_NAME}" \
   --network host \
   --group-add "${HOST_VIDEO_GID}" --group-add "${HOST_RENDER_GID}" \
   --device /dev/dri \
-  -v "${HOME}:${HOME}" \
+  -v "${PROJECT_ROOT}:${CONTAINER_PROJECT_ROOT}" \
   -v /dev:/dev \
   -v "${HOST_RUNTIME_DIR}:${HOST_RUNTIME_DIR}" \
   "${IMAGE_TAG}" sleep infinity
 
 echo "Verifying passwordless sudo and render group membership..."
-sudo podman exec --user stu "${CONTAINER_NAME}" bash -c '
+sudo podman exec --user dev "${CONTAINER_NAME}" bash -c '
   set -e
   sudo -n true
   echo "sudo: passwordless OK"

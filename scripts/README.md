@@ -56,7 +56,10 @@ needs:
 ./scripts/setup-env.sh
 ```
 Builds the `wayland-proxy-dev` image and starts it as a long-running
-container. Matches `stu`'s UID/GID and the host's video/render GIDs.
+container. Matches the container's `dev` user's UID/GID and the host's
+video/render GIDs — but `dev` is a fixed, generic login name, not tied
+to your host account. Only the project directory is shared with the
+container, mounted at `/workspace` — not your whole home directory.
 
 ### 2. Start the host compositor + VNC (Terminal A)
 
@@ -91,9 +94,9 @@ WAYLAND_DISPLAY=<new-socket> gtk4-demo
 
 ### 4. Automated crash-recovery check (optional)
 
-Run from the shell step 3 leaves you in:
+Run from the shell step 3 leaves you in (already at the project root):
 ```bash
-bash /home/stu/projects/mine/wayland-resilliance-proxy/scripts/test-crash.sh
+bash scripts/test-crash.sh
 ```
 Starts its own compositor, proxy, and `gtk4-demo`. Crashes the
 compositor. Checks the client process survives — nothing more.

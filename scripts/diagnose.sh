@@ -10,7 +10,12 @@
 set +e  # diagnostics should keep going even if individual checks fail
 
 CONTAINER_NAME="${1:-wayland-proxy-dev}"
-SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# Fixed, not derived from this script's own host-side location -- the
+# container only ever mounts the project directory at /workspace (see
+# setup-env.sh), not a host-mirrored path, so this is the one path that's
+# guaranteed to be correct regardless of where the project lives on the
+# host.
+CONTAINER_SCRIPT_PATH="/workspace/scripts/diagnose.sh"
 
 is_inside_container() {
   [[ -n "${CONTAINER_ID:-}" ]]
@@ -113,7 +118,7 @@ pull_guest_diagnostics() {
   echo "############################################"
   echo "# Pulling diagnostics from inside '${CONTAINER_NAME}'..."
   echo "############################################"
-  sudo podman exec --user stu "$CONTAINER_NAME" bash "$SCRIPT_PATH"
+  sudo podman exec --user dev "$CONTAINER_NAME" bash "$CONTAINER_SCRIPT_PATH"
 }
 
 main() {
