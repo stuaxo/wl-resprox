@@ -65,6 +65,26 @@ One `Containerfile` per WM, proxy package installed, added in risk order:
       `interfaces.rs` gaps (expected when a new compositor family shows
       up, not a bug — see architecture-notes.md Gap 1/Gap 2).
 
+### Cross-compositor swap (limited pairs, not the full matrix)
+
+Same-compositor restart (above) and swapping to a *different* compositor
+are separate claims — recreation only touches standardized xdg-shell
+interfaces, so it should generalize, but every live test so far has been
+labwc-to-labwc. Untested risk: protocol-strictness differences between
+implementations (the class of bug that hit `ack_configure` serials on
+labwc — a different compositor could differ in ways we have no data on).
+
+Not every pairing — just enough to sample same-family vs. cross-family,
+chained onto Phase 9's build order so each test only needs containers
+that already exist:
+
+- [ ] labwc → sway (same family, cheapest smoke test of the swap itself)
+- [ ] sway → kwin (cross-family — the actual risk case)
+- [ ] kwin → mutter (cross-family, closest to the real target)
+
+Same L1 pass criteria as above. Add more pairs only if one of these
+surfaces something, not preemptively.
+
 ## Phase 10: Automated matrix runner
 
 - [ ] One entry point: build harness once, spin each Phase 9 container,

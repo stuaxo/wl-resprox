@@ -14,6 +14,7 @@ compositor. No Distrobox — see `Containerfile`'s header for why.
 │   └── ...                # design notes, ADRs, debugging log
 └── scripts/
     ├── setup-env.sh     # builds the image and starts the container (run once)
+    ├── teardown-env.sh  # stops and removes the container (reverses setup-env.sh)
     ├── Containerfile    # used by setup-env.sh — must stay alongside it
     ├── start-host.sh    # starts a headless labwc + wayvnc on the HOST
     ├── entrypoint.sh    # runs INSIDE the container — starts nested labwc
@@ -66,11 +67,16 @@ Prints the host's Wayland socket name (e.g. `wayland-0`) and starts
 `wayvnc` listening on `127.0.0.1:5900`. Leave this running in the
 foreground.
 
-To watch from another machine:
+**Already SSH'd into the host (remote dev)?** Steps 1-4 all run fine
+over your existing SSH session — nothing here needs a local display.
+Only VNC viewing needs a second connection, and it's from your **local
+machine**, not from within the session you're already in:
 ```bash
 ssh -L 5900:localhost:5900 <user>@<host>
 ```
-Then point a VNC client at `localhost:5900`.
+Run that from your own machine, then point a VNC client at
+`localhost:5900`. Skip it entirely if you don't need to see the screen —
+`test-crash.sh` (step 4) and the proxy logs don't need VNC at all.
 
 ### 3. Start the nested compositor and enter the container (Terminal B)
 
@@ -93,6 +99,13 @@ Starts its own compositor, proxy, and `gtk4-demo`. Crashes the
 compositor. Checks the client process survives — nothing more.
 Self-contained; doesn't use step 3's nested `labwc`. See
 `plan-test-harness.md` for the fuller testing-levels picture.
+
+### 5. Tear down
+
+```bash
+./scripts/teardown-env.sh          # remove the container
+./scripts/teardown-env.sh --image  # also remove the built image
+```
 
 ## Troubleshooting
 

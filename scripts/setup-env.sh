@@ -26,6 +26,11 @@ if [[ -z "$HOST_VIDEO_GID" || -z "$HOST_RENDER_GID" ]]; then
   echo "ERROR: couldn't resolve the host's video/render group GIDs (getent group video render)." >&2
   exit 1
 fi
+HOST_RUNTIME_DIR="/run/user/${HOST_UID}"
+if [[ ! -d "$HOST_RUNTIME_DIR" ]]; then
+  echo "ERROR: ${HOST_RUNTIME_DIR} doesn't exist. Needs a real login session (systemd-logind/PAM) on this host." >&2
+  exit 1
+fi
 
 echo "Building ${IMAGE_TAG} (uid=${HOST_UID} gid=${HOST_GID} video=${HOST_VIDEO_GID} render=${HOST_RENDER_GID})..."
 # --network host for the same reason the container run below uses it:
@@ -67,27 +72,22 @@ echo "Starting ${CONTAINER_NAME}..."
 # "Permission denied" -- the tell that this is a cgroup restriction, not a
 # permissions one). --device grants the actual cgroup access; Distrobox
 # was evidently already doing the equivalent under the hood.
+# -v "$HOST_RUNTIME_DIR:$HOST_RUNTIME_DIR": shares XDG_RUNTIME_DIR with the
+# host, same path both sides -- this is what lets a nested compositor
+# inside the container (entrypoint.sh) see the HOST compositor's Wayland
+# socket (scripts/start-host.sh's), and is exactly what Distrobox did
+# automatically that this replacement setup was missing (confirmed live:
+# without this, entrypoint.sh's nested labwc fails with "Could not connect
+# to remote display: No such file or directory" -- it never saw the host
+# socket at all).
 sudo podman run -d --name "${CONTAINER_NAME}" \
   --network host \
   --group-add "${HOST_VIDEO_GID}" --group-add "${HOST_RENDER_GID}" \
   --device /dev/dri \
   -v "${HOME}:${HOME}" \
   -v /dev:/dev \
+  -v "${HOST_RUNTIME_DIR}:${HOST_RUNTIME_DIR}" \
   "${IMAGE_TAG}" sleep infinity
-
-# /run/user/<uid> (XDG_RUNTIME_DIR, where every Wayland socket in this
-# project lives) is normally created by a login session manager
-# (systemd-logind, PAM) or, previously, by Distrobox's own init --
-# nothing does that here, so /run/user/1000 doesn't exist yet and `stu`
-# can't create it directly (/run itself is root:root 0755). One-time fix,
-# as root, right after start; persists for the container's lifetime since
-# it's a long-running `sleep infinity` container, not restarted per-command.
-echo "Creating XDG_RUNTIME_DIR (/run/user/${HOST_UID})..."
-# --user root: the image's own default exec user is stu (see the
-# Containerfile's `USER stu`), which can't create anything directly under
-# root:root 0755 /run -- this one step needs root.
-sudo podman exec --user root "${CONTAINER_NAME}" \
-  bash -c "mkdir -p /run/user/${HOST_UID} && chown ${HOST_UID}:${HOST_GID} /run/user/${HOST_UID} && chmod 700 /run/user/${HOST_UID}"
 
 echo "Verifying passwordless sudo and render group membership..."
 sudo podman exec --user stu "${CONTAINER_NAME}" bash -c '
