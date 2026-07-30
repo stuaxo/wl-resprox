@@ -28,22 +28,60 @@
 - [x] Test: Launch `WAYLAND_DISPLAY=wayland-2 gtk4-demo` and ensure it appears in the `labwc` window.
       Verified with both the old raw pipe and the new relay.
 
+## Phase 3.5: Raw Wire Protocol Parsing (The Architecture Pivot)
+
+Comparing our `wayland-backend`-based relay against actual prior art
+(sommelier-rs, waypipe -- see the review item below) showed neither uses a
+backend/endpoint library at all; both hand-parse the wire format and
+codegen interface tables, treating object IDs as plain `u32`s. See
+docs/architecture-context.md section 4 for the full reasoning. Pivoting to
+match.
+
+- [ ] Remove `wayland-backend` (and `wayland-client`/`wayland-server`/
+      `wayland-protocols`) dependency, and rewrite `main.rs`'s relay to use
+      `src/wire.rs` instead. Not done yet -- `main.rs` still relays via
+      wayland-backend; doing this requires rewriting the relay itself, not
+      just adding the new module, so it's deliberately a separate step
+      from the two below (keeps the build green in between).
+- [x] Implement 8-byte Wayland header parser (`src/wire.rs`) to read
+      `[Sender ID: u32][Opcode: u16][Length: u16]`.
+      Done 2026-07-30: `MessageHeader::parse`/`take_message`. Not yet
+      called from anywhere in `main.rs` -- see above.
+- [x] Implement basic payload mutation to rewrite `sender_id` on the fly.
+      Done 2026-07-30: `wire::write_sender_id`. Same caveat -- not wired
+      into the relay yet.
+
 ## Phase 4: State Tracking & ID Translation
 
-- [ ] Review [sommelier-rs](https://github.com/google/sommelier-rs)'s Shadow Table and codegen approach, and [waypipe](https://github.com/deepin-community/waypipe)'s ID-remap handling, before implementing — both solve this exact problem.
+- [x] Review [sommelier-rs](https://github.com/google/sommelier-rs)'s Shadow Table and codegen approach, and [waypipe](https://github.com/deepin-community/waypipe)'s ID-remap handling, before implementing — both solve this exact problem.
+      Done 2026-07-30 (cloned into `reference/`, gitignored). Findings:
+      sommelier-rs's shadow table is a literal `u32 <-> u32` bimap
+      (`map_id(host_id, guest_id)`) plus per-id interface tracking -- this
+      is the direct analog for our problem (two independently-numbered
+      sessions needing reconciling). Waypipe's "ID-remap handling" turned
+      out to not be ID remapping at all -- it's a transport optimizer
+      where IDs pass through unchanged; what it actually has
+      (`WpObject`/`WpExtra` in `tracking.rs`) is per-object *semantic
+      state* tracking (buffer scale/transform, damage, viewport), which is
+      the more relevant prior art for Phase 5's "recreate objects from
+      tracked state" than for this phase.
 - [x] Implement `wayland-backend` parsing to deserialize the byte stream into typed Wayland messages.
-      Done 2026-07-30. Covers core wayland.xml (via wayland-client's
-      generated tables) + xdg-shell (via a new wayland-protocols
-      dependency); anything else is logged and skipped, not relayed.
-- [ ] Build the Shadow Table (using `bimap`) to track Object IDs.
-      **Not actually built yet.** What exists (`Bridge` in src/main.rs) is a
-      1:1 identity bridge using plain `HashMap`s, needed only to satisfy
-      Rust's type system (`client::ObjectId`/`server::ObjectId` are distinct
-      types) -- not `bimap`, and it doesn't handle divergence or survive a
-      reconnect. Scaffolding *for* this item, not this item.
+      Done 2026-07-30, then superseded the same day by the pivot above --
+      see Phase 3.5. Worked and was verified live, but fighting the
+      library's endpoint-oriented object model (distinct client/server
+      `ObjectId` types, `wl_display` not being a normal retrievable
+      object) is what motivated moving to hand-rolled wire parsing instead.
+- [ ] Build the Shadow Table (using `bimap`) to track Object IDs as plain `u32` integers.
+      Not built yet. Now that IDs are (going to be) plain `u32`s rather
+      than two distinct wayland-backend types, this can be the real thing
+      -- a `bimap::BiMap<u32, u32>` per connection, matching sommelier-rs's
+      `map_id`, rather than the identity-bridge `HashMap` scaffolding this
+      note used to describe.
 - [x] Intercept `wl_registry` requests to map globals.
       Basic form done via wayland-backend's `GlobalHandler`/`create_global`
-      mechanism -- globals are mirrored 1:1, not yet remapped.
+      mechanism -- globals are mirrored 1:1, not yet remapped. Will need
+      re-doing against the hand-rolled wire parser once Phase 3.5's
+      removal item lands.
 - [ ] Rewrite Object IDs on-the-fly for all traversing messages.
       Deliberately deferred -- explicitly out of scope for the 2026-07-30 work.
 

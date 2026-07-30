@@ -22,7 +22,41 @@ To make this work seamlessly, the proxy must perform three critical tasks:
 2. **Triggering Repaints (`xdg_surface.configure`):** To get GTK to draw onto the new compositor, the proxy must synthesize/forward a configure event. GTK will naturally respond by repainting its widgets and attaching the memory buffer to the new surface.
 3. **Faking State (Handling the Edge Cases):** To satisfy the GTK state machine, the proxy may need to synthesize events during a crash (e.g., sending a `wl_pointer.leave` or fake button release) to ensure GTK doesn't get permanently stuck in a grab state if the crash happened mid-click.
 
-## 4. Prior Art & Inspiration
+## 4. Architectural Pivot: The "Byte Munger" vs "Endpoint" Model
+
+We initially built the proxy on `wayland-backend` (the low-level crate behind
+`wayland-client`/`wayland-server`), using its `ObjectData`/`GlobalHandler`
+dispatch model. That worked (verified live against a real compositor and
+`gtk4-demo`), but comparing it against actual prior art -- ChromeOS's
+sommelier-rs and freedesktop's waypipe (see `reference/`, gitignored local
+checkouts) -- surfaced a real problem: **neither of them uses a backend
+library at all.** Both hand-parse the wire format directly and dispatch
+through a codegen'd interface table, treating object IDs as plain `u32`s
+the whole way through.
+
+The reason: libraries like `wayland-backend`/`libwayland` are built for
+**endpoints** -- a pure client or a pure server, not both stitched
+together. They abstract object IDs into opaque handles and manage
+allocation internally (servers allocate from `0xff000000`, clients from
+`1`, per the wire protocol's own convention). A proxy needs the opposite:
+direct manipulation of raw `u32` IDs across two *independent* sessions,
+rewriting them as messages cross from one to the other. Endpoint
+abstractions actively fight that -- this is exactly what produced the
+friction we hit (the `wl_display` bootstrap failing with `InvalidId`
+since it isn't retrievable as a normal object; needing two distinct
+`ObjectId` types with a bridge between them just to satisfy the type
+system).
+
+Going forward, like sommelier-rs and waypipe, the proxy is a **"Byte
+Munger"**: it hand-parses the 8-byte Wayland header
+(`[Sender ID: u32][Opcode: u16][Length: u16]`, see `src/wire.rs`) directly
+off the Unix socket, mutates the integer IDs in place via a `bimap`-based
+Shadow Table (Phase 4), and forwards the modified byte stream. This
+requires either hardcoding protocol byte-offsets or build-time XML codegen
+to know which bytes in a payload are `object`/`new_id` typed -- not yet
+decided, see plan.md's Phase 3.5/4.
+
+## 5. Prior Art & Inspiration
 
 - **Waypipe / Sommelier:** Network/VM proxies that heavily utilize Wayland ID translation and serialization.
   - [Waypipe](https://github.com/deepin-community/waypipe) (mirror; canonical upstream is `gitlab.freedesktop.org/mstoeckl/waypipe`)

@@ -14,6 +14,11 @@ use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message};
 use wayland_backend::{client, server};
 
 mod interfaces;
+// Not yet called from anywhere -- main.rs still relays via wayland-backend.
+// Wiring this in (and dropping wayland-backend) is the next step, not this
+// one. Remove this allow once that happens.
+#[allow(dead_code)]
+mod wire;
 use interfaces::lookup_interface;
 
 /// Wraps a borrowed fd just so we can hand it to `tokio::io::unix::AsyncFd`,
