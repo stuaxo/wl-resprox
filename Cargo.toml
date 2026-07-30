@@ -13,6 +13,10 @@ wayland-backend = { version = "0.3.7", features = ["server_system", "client_syst
 wayland-client = "0.31.2"
 wayland-server = "0.31.2"
 
+# xdg-shell interface tables (needed for GTK toplevel windows -- not part of
+# core wayland.xml, so not covered by wayland-client/wayland-server above).
+wayland-protocols = { version = "0.32", features = ["client", "server"] }
+
 # Bidirectional maps for Object ID translation
 bimap = "0.6.3"
 
