@@ -4,12 +4,14 @@
 # start-guest.sh — not meant to be run directly on the host.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo "Guest sees WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}"
 echo "Sockets visible before starting nested compositor:"
 ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null || echo "  (none)"
 
 echo "Starting nested labwc..."
-labwc -C /dev/null &
+labwc -C "$SCRIPT_DIR/labwc-config" &
 
 sleep 2
 

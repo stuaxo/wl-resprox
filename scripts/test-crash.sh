@@ -18,10 +18,10 @@
 # This does NOT check that the client is still usable/rendering after the
 # crash, only that the proxy kept its socket open instead of tearing the
 # connection down -- i.e. that Phase 5's "freeze the client socket, don't
-# forward the error" rule (docs/implementation-constraints.md) holds. A
-# passing run today would be surprising -- crash recovery isn't
-# implemented yet -- this harness exists so that work has something to
-# iterate against.
+# forward the error" rule (docs/implementation-constraints.md) holds.
+# Doesn't restart the compositor either, so it doesn't exercise
+# reconnect/recreation -- see plan-test-harness.md for the fuller
+# testing-levels picture and why this stays a narrow L0 check.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,7 +76,7 @@ echo "== Starting headless compositor =="
 # previous approach) picked up exactly one of those live, and the proxy
 # then failed with "Connection refused" trying to reach a dead socket.
 existing_sockets="$(ls "$RUNTIME_DIR"/wayland-*[0-9] 2>/dev/null || true)"
-WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 labwc -C /dev/null > "$COMPOSITOR_LOG" 2>&1 &
+WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 labwc -C "$SCRIPT_DIR/labwc-config" > "$COMPOSITOR_LOG" 2>&1 &
 COMPOSITOR_PID=$!
 
 # 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow

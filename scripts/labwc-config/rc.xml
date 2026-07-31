@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- Minimal labwc config for our own headless test/nested compositor
+     instances (entrypoint.sh, test-crash.sh); NOT used by start-host.sh,
+     which runs a real interactive session and should keep labwc's
+     normal config search.
+
+     xwayland=no: this project never uses XWayland (no X11 clients
+     anywhere in the stack). Leaving it enabled just means our own
+     controlled compositor instances compete for XWayland's X-display
+     number slots against anything else running on a shared host;
+     confirmed live as the actual cause of an intermittent, hard to
+     diagnose test-crash.sh slowdown/failure (see the 2026-07-31 entry
+     in docs/debugging-notes.md). Disabling it here removes that
+     contention source entirely rather than just tolerating it.
+
+     Also fixed here on first attempt: XML comments cannot contain a
+     literal double hyphen anywhere in the body, only as the open/close
+     delimiters. An earlier draft of this exact comment had several,
+     which silently broke the whole file: labwc's parser rejected it and
+     fell back to default config, meaning XWayland stayed enabled, with
+     no visible warning beyond a one-line parse error easy to miss in
+     the log. Confirmed live. -->
+<labwc_config>
+  <core>
+    <xwayland>no</xwayland>
+  </core>
+</labwc_config>
