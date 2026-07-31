@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Pre-commit hook: runs the Rust unit test suite before allowing a commit.
+# Pre-commit hook: runs the Rust unit test suite, shellcheck on
+# scripts/*.sh, and a host-only environment sanity check before allowing
+# a commit.
 #
 # Runs directly on the HOST, not in the wayland-proxy-dev container. The
 # unit tests here are pure functions (interface lookup, bind() argument
@@ -15,13 +17,41 @@
 # (different rustc/glibc) -- keeping them apart avoids incremental-build
 # cache confusion between the two toolchains.
 #
+# Every step here is silent on success, output on failure only -- this
+# hook runs on every commit, and cargo test's own tracing output in
+# particular bypasses Rust's normal test-output capture (writes straight
+# to stdout regardless of pass/fail), so left unchecked it dumps
+# thousands of log lines into every commit's context for no reason.
+#
 # Installed via: git config core.hooksPath .githooks
 set -euo pipefail
 
 PROJECT_DIR="$(git rev-parse --show-toplevel)"
 
-echo "pre-commit: running cargo test on host..."
-if ! CARGO_TARGET_DIR="$PROJECT_DIR/target-host" cargo test --quiet --manifest-path "$PROJECT_DIR/Cargo.toml"; then
+echo "pre-commit: cargo test..."
+CARGO_TEST_LOG="$(mktemp)"
+trap 'rm -f "$CARGO_TEST_LOG"' EXIT
+if ! CARGO_TARGET_DIR="$PROJECT_DIR/target-host" cargo test --quiet --manifest-path "$PROJECT_DIR/Cargo.toml" \
+    > "$CARGO_TEST_LOG" 2>&1; then
+    cat "$CARGO_TEST_LOG"
     echo "pre-commit: cargo test failed -- commit aborted." >&2
     exit 1
 fi
+
+echo "pre-commit: shellcheck scripts/*.sh..."
+if ! command -v shellcheck >/dev/null; then
+    echo "pre-commit: shellcheck not found -- install it (e.g. sudo apt-get install shellcheck) -- commit aborted." >&2
+    exit 1
+fi
+if ! shellcheck "$PROJECT_DIR"/scripts/*.sh; then
+    echo "pre-commit: shellcheck failed -- commit aborted." >&2
+    exit 1
+fi
+
+echo "pre-commit: environment sanity check..."
+if ! "$PROJECT_DIR/scripts/diagnose.sh" --errors-only --host-only; then
+    echo "pre-commit: environment check failed (see above) -- commit aborted." >&2
+    exit 1
+fi
+
+echo "pre-commit: OK"

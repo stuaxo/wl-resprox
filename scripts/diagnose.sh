@@ -13,20 +13,46 @@
 # project), so those are labeled accordingly rather than presented as if
 # they were all ours.
 #
-# Usage: ./scripts/diagnose.sh [--verbose] [container-name]
-#   --verbose   also dump full file-descriptor listings per process.
-#               Default omits these -- rarely the first thing needed, and
-#               on a busy host they can run to hundreds of lines each.
+# Usage: ./scripts/diagnose.sh [--verbose] [--errors-only] [--host-only] [container-name]
+#   --verbose      also dump full file-descriptor listings per process.
+#                  Default omits these -- rarely the first thing needed,
+#                  and on a busy host they can run to hundreds of lines.
+#   --errors-only  print nothing on a clean run; only environment
+#                  problems (e.g. a required tool missing). Meant for
+#                  scripting/pre-commit use, not human debugging --
+#                  exits nonzero on a problem, zero and silent otherwise.
+#   --host-only    don't exec into the container at all. Combine with
+#                  --errors-only for a fast pre-commit check that never
+#                  touches podman.
 set +e  # diagnostics should keep going even if individual checks fail
 
 VERBOSE=false
+ERRORS_ONLY=false
+HOST_ONLY=false
 CONTAINER_NAME="wayland-proxy-dev"
 for arg in "$@"; do
   case "$arg" in
     --verbose) VERBOSE=true ;;
+    --errors-only) ERRORS_ONLY=true ;;
+    --host-only) HOST_ONLY=true ;;
     *) CONTAINER_NAME="$arg" ;;
   esac
 done
+
+ERROR_COUNT=0
+report_error() {
+  echo "ERROR: $1"
+  ERROR_COUNT=$((ERROR_COUNT + 1))
+}
+
+# The narrow set of things worth failing a commit over: required tools
+# actually missing, not current session/socket state (that's session
+# noise, not a code-health signal).
+check_environment_errors() {
+  local label="$1"
+  command -v fuser >/dev/null || report_error "[$label] fuser not installed (psmisc package)"
+  command -v ss >/dev/null || report_error "[$label] ss not installed (iproute2 package)"
+}
 
 # Fixed, not derived from this script's own host-side location -- the
 # container only ever mounts the project directory at /workspace (see
@@ -152,6 +178,9 @@ print_labwc_processes() {
     echo "  PID $pid (${state:-?}): ${cmd:-?}"
     if [[ "$VERBOSE" == true ]]; then
       echo "    open fds:"
+      # /proc/PID/fd entries are always plain fd numbers, never
+      # arbitrary/adversarial filenames.
+      # shellcheck disable=SC2012
       ls -la "/proc/$pid/fd" 2>/dev/null | tail -n +2 | sed 's/^/      /'
     fi
   done
@@ -226,22 +255,40 @@ run_host_checks() {
 }
 
 pull_guest_diagnostics() {
-  echo ""
-  echo "############################################"
-  echo "# Pulling diagnostics from inside '${CONTAINER_NAME}'..."
-  echo "############################################"
-  local verbose_flag=()
-  [[ "$VERBOSE" == true ]] && verbose_flag=(--verbose)
+  if [[ "$ERRORS_ONLY" != true ]]; then
+    echo ""
+    echo "############################################"
+    echo "# Pulling diagnostics from inside '${CONTAINER_NAME}'..."
+    echo "############################################"
+  fi
+  local flags=()
+  [[ "$VERBOSE" == true ]] && flags+=(--verbose)
+  [[ "$ERRORS_ONLY" == true ]] && flags+=(--errors-only)
   sudo podman exec --user dev -e XDG_RUNTIME_DIR=/run/user/1000 \
-    "$CONTAINER_NAME" bash "$CONTAINER_SCRIPT_PATH" "${verbose_flag[@]}"
+    "$CONTAINER_NAME" bash "$CONTAINER_SCRIPT_PATH" "${flags[@]}"
 }
 
 main() {
+  if [[ "$ERRORS_ONLY" == true ]]; then
+    if is_inside_container; then
+      check_environment_errors "GUEST"
+    else
+      check_environment_errors "HOST"
+      if [[ "$HOST_ONLY" != true ]]; then
+        pull_guest_diagnostics || ERROR_COUNT=$((ERROR_COUNT + 1))
+      fi
+    fi
+    [[ "$ERROR_COUNT" -eq 0 ]]
+    exit $?
+  fi
+
   if is_inside_container; then
     run_guest_checks
   else
     run_host_checks
-    pull_guest_diagnostics
+    if [[ "$HOST_ONLY" != true ]]; then
+      pull_guest_diagnostics
+    fi
   fi
 }
 

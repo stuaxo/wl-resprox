@@ -39,6 +39,11 @@ COMPOSITOR_PID=""
 PROXY_PID=""
 CLIENT_PID=""
 
+# Invoked indirectly via `trap cleanup EXIT` below -- shellcheck's
+# reachability analysis can't trace that, hence disabling both "never
+# invoked" (SC2329) and, on some versions, "unreachable" for the whole
+# body (SC2317).
+# shellcheck disable=SC2329,SC2317
 cleanup() {
     echo ""
     echo "Cleaning up..."

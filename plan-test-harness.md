@@ -87,6 +87,13 @@ surfaces something, not preemptively.
 
 ## Phase 10: Automated matrix runner
 
+Seed already exists: pre-commit runs `diagnose.sh --errors-only --host-only`
+(env sanity, no podman) on every commit. Next step, not done yet: a
+`scripts/self-test.sh` smoke test -- setup-env.sh -> start-guest.sh ->
+test-crash.sh -> diagnose.sh --errors-only -> teardown-env.sh, asserting
+clean at each step. Run by hand for now; becomes the per-WM unit this
+phase loops over once Phase 9's containers exist.
+
 - [ ] One entry point: build harness once, spin each Phase 9 container,
       install proxy, run L1, collect pass/fail + logs per WM.
 - [ ] Pass criteria: L1 minimum. L0-only doesn't count as verified.

@@ -25,3 +25,16 @@ verification, packaging).
 
 See `scripts/README.md`: building/running the dev container, testing
 against a nested compositor, watching over VNC.
+
+## Contributing
+
+Enable the pre-commit hook once per clone:
+```bash
+git config core.hooksPath .githooks
+```
+Runs `cargo test`, `shellcheck` on `scripts/*.sh`, and an environment
+sanity check on every commit — silent on success, see `.githooks/pre-commit`
+for details. Needs `shellcheck` on the host:
+```bash
+sudo apt install shellcheck   # Ubuntu/Debian
+```

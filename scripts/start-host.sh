@@ -11,7 +11,7 @@ WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 labwc &
 # Poll for the socket rather than assuming it exists immediately.
 sock=""
 for _ in $(seq 1 10); do
-  sock=$(ls "$XDG_RUNTIME_DIR"/wayland-*[0-9] 2>/dev/null | head -n1) || true
+  sock=$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -name 'wayland-*[0-9]' 2>/dev/null | head -n1) || true
   [[ -n "$sock" ]] && break
   sleep 0.5
 done
