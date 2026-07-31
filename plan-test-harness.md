@@ -20,16 +20,18 @@ containers, instead of one hand-built setup. Long-term target: real
 
 Matrix default: L1. L2 on demand per-container.
 
-## Phase 6: Proxy/harness boundary
+## Phase 6: Proxy/harness boundary — done, see ADR-0003
 
-- [ ] Define split: proxy = `wayland-proxy` binary/crate, versioned
+- [x] Define split: proxy = `wayland-proxy` binary/crate, versioned
       independently. Harness = containers, WM installers, crash-inducer,
       verification scripts, VNC wiring (currently `scripts/*` +
       `Containerfile`).
-- [ ] **Open Q:** harness own repo now, or stay here behind a clean
-      boundary until packaging's proven? Lean: stay here for now.
+- [x] **Open Q resolved:** harness stays in this repo for now. Revisit
+      once Phase 7/8 packaging proves the boundary holds.
 - [ ] Harness must only ever consume a built proxy artifact, never
-      `cargo build` the proxy inside a WM container.
+      `cargo build` the proxy inside a WM container. Known, accepted
+      exception right now: `test-crash.sh` still builds from source --
+      fine until Phase 7 exists, not to be left indefinitely.
 
 ## Phase 7: Package the proxy
 
