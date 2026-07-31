@@ -120,7 +120,16 @@ Not every pairing — just enough to sample same-family vs. cross-family,
 chained onto Phase 9's build order so each test only needs containers
 that already exist:
 
-- [ ] labwc → sway (same family, cheapest smoke test of the swap itself)
+- [x] **labwc → sway: pass** (client survives, full toplevel chain
+      recreated, zero unresolvable-interface warnings). Surfaced
+      dropped-buffer/syncobj warnings on reconnect that first looked
+      swap-specific; a same-compositor control reproduced them
+      identically, so they're a generic post-generation-bump artifact
+      (in-flight buffer/syncobj objects outside the `RecreationGraph`),
+      not a labwc/sway protocol difference. See the 2026-07-31 entry in
+      `docs/debugging-notes.md`. Open question noted there for an L2
+      pass, not blocking: whether the dropped `wl_surface.attach` stalls
+      the client's next visible frame.
 - [ ] sway → kwin (cross-family — the actual risk case)
 - [ ] kwin → mutter (cross-family, closest to the real target)
 
