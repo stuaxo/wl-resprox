@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Stops and removes the wayland-proxy-dev container. Reverses
+# Stops and removes a wayland-proxy-dev-<wm> container. Reverses
 # scripts/setup-env.sh. Re-run setup-env.sh to rebuild.
 #
-# Usage: ./scripts/teardown-env.sh [--image]
-#   --image   also remove the built image (wayland-proxy-dev:latest).
-#             Without it, setup-env.sh's next build reuses cached layers.
+# Usage: ./scripts/teardown-env.sh [--wm=<name>] [--image]
+#   --wm=<name>   which compositor's container to remove (default labwc).
+#   --image       also remove the built image. Without it, setup-env.sh's
+#                 next build reuses cached layers.
 set -euo pipefail
 
-CONTAINER_NAME="wayland-proxy-dev"
-IMAGE_TAG="wayland-proxy-dev:latest"
-
+WM="labwc"
 REMOVE_IMAGE=false
-if [[ "${1:-}" == "--image" ]]; then
-  REMOVE_IMAGE=true
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --wm=*) WM="${arg#--wm=}" ;;
+    --image) REMOVE_IMAGE=true ;;
+    *) echo "ERROR: unrecognized argument '$arg'" >&2; exit 1 ;;
+  esac
+done
+
+CONTAINER_NAME="wayland-proxy-dev-${WM}"
+IMAGE_TAG="wayland-proxy-dev-${WM}:latest"
 
 if sudo podman container exists "${CONTAINER_NAME}"; then
   echo "Stopping and removing ${CONTAINER_NAME}..."

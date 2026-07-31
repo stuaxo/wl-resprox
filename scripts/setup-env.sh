@@ -1,25 +1,44 @@
 #!/usr/bin/env bash
-# Builds and starts the wayland-proxy-dev container directly with podman --
-# no Distrobox involved. See scripts/Containerfile's own header comment for
-# why: Distrobox's own container-init script was the source of a recurring
-# "First time user password setup" prompt on every session (harmless --
-# fails fast rather than hanging -- but noisy, and the root cause of the
-# passwordless-sudo issues documented in docs/debugging-notes.md's
-# 2026-07-29/2026-07-30 entries). Building the image ourselves means we
-# control user/sudoers setup entirely at build time and never run that
-# script at all.
+# Builds and starts a wayland-proxy-dev-<wm> container directly with
+# podman -- no Distrobox involved. See scripts/containers/<wm>/Containerfile's
+# own header comment for why: Distrobox's own container-init script was
+# the source of a recurring "First time user password setup" prompt on
+# every session (harmless -- fails fast rather than hanging -- but
+# noisy, and the root cause of the passwordless-sudo issues documented
+# in docs/debugging-notes.md's 2026-07-29/2026-07-30 entries). Building
+# the image ourselves means we control user/sudoers setup entirely at
+# build time and never run that script at all.
+#
+# Usage: ./scripts/setup-env.sh [--wm=<name>]
+#   --wm=<name>   which compositor's container to build (default labwc).
+#                 Must match a scripts/containers/<name>/ directory.
 set -euo pipefail
 
-CONTAINER_NAME="wayland-proxy-dev"
-IMAGE_TAG="wayland-proxy-dev:latest"
+WM="labwc"
+for arg in "$@"; do
+  case "$arg" in
+    --wm=*) WM="${arg#--wm=}" ;;
+    *) echo "ERROR: unrecognized argument '$arg'" >&2; exit 1 ;;
+  esac
+done
+
+CONTAINER_NAME="wayland-proxy-dev-${WM}"
+IMAGE_TAG="wayland-proxy-dev-${WM}:latest"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 CONTAINER_PROJECT_ROOT="/workspace"
+WM_DIR="${SCRIPT_DIR}/containers/${WM}"
+
+if [[ ! -f "${WM_DIR}/Containerfile" ]]; then
+  echo "ERROR: no ${WM_DIR}/Containerfile -- unknown --wm value '${WM}'?" >&2
+  exit 1
+fi
 
 # UID/GID values are host-specific facts, not hardcoded -- read live
 # rather than assumed, so this works on a host with different values
-# (Containerfile's own ARG defaults exist only as a fallback documentation
-# of *this* host's actual values, confirmed via the same commands below).
+# (each Containerfile's own ARG defaults exist only as a fallback
+# documentation of *this* host's actual values, confirmed via the same
+# commands below).
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 HOST_VIDEO_GID="$(getent group video | cut -d: -f3)"
@@ -45,7 +64,7 @@ sudo podman build \
   --build-arg USER_GID="${HOST_GID}" \
   --build-arg VIDEO_GID="${HOST_VIDEO_GID}" \
   --build-arg RENDER_GID="${HOST_RENDER_GID}" \
-  -f "${SCRIPT_DIR}/Containerfile" "${SCRIPT_DIR}"
+  -f "${WM_DIR}/Containerfile" "${WM_DIR}"
 
 if sudo podman container exists "${CONTAINER_NAME}"; then
   echo "Removing existing ${CONTAINER_NAME} container..."
@@ -84,9 +103,9 @@ echo "Starting ${CONTAINER_NAME}..."
 # inside the container (entrypoint.sh) see the HOST compositor's Wayland
 # socket (scripts/start-host.sh's), and is exactly what Distrobox did
 # automatically that this replacement setup was missing (confirmed live:
-# without this, entrypoint.sh's nested labwc fails with "Could not connect
-# to remote display: No such file or directory" -- it never saw the host
-# socket at all).
+# without this, entrypoint.sh's nested compositor fails with "Could not
+# connect to remote display: No such file or directory" -- it never saw
+# the host socket at all).
 sudo podman run -d --name "${CONTAINER_NAME}" \
   --network host \
   --group-add "${HOST_VIDEO_GID}" --group-add "${HOST_RENDER_GID}" \
@@ -109,6 +128,6 @@ echo ''
 echo '======================================'
 echo 'Environment successfully provisioned!'
 echo 'To start testing, run:'
-echo "  ./scripts/start-guest.sh"
+echo "  ./scripts/start-guest.sh --wm=${WM}"
 echo '(needs a host Wayland session first — see scripts/start-host.sh)'
 echo '======================================'

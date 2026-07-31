@@ -27,6 +27,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 CLIENT_APP="${1:-gtk4-demo}"
+COMPOSITOR="${COMPOSITOR:?COMPOSITOR must be set -- baked into the image by scripts/containers/<wm>/Containerfile}"
 
 RUNTIME_DIR="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}"
 PROXY_DISPLAY="wayland-proxy-0" # fixed name the proxy binds, see src/main.rs
@@ -68,35 +69,65 @@ echo "== Building proxy =="
 ( cd "$PROJECT_DIR" && cargo build --quiet ) || fail "cargo build failed"
 
 echo "== Starting headless compositor =="
-# Snapshot sockets that already exist before starting, and only accept a
-# name that's genuinely new -- $RUNTIME_DIR is shared with the host and
-# any other running compositor (see scripts/setup-env.sh), so it can
-# already hold several wayland-N entries, including stale ones a crashed
-# compositor never unlinked. Scanning for "any non-proxy socket" (the
-# previous approach) picked up exactly one of those live, and the proxy
-# then failed with "Connection refused" trying to reach a dead socket.
-existing_sockets="$(ls "$RUNTIME_DIR"/wayland-*[0-9] 2>/dev/null || true)"
-WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 labwc -C "$SCRIPT_DIR/labwc-config" > "$COMPOSITOR_LOG" 2>&1 &
-COMPOSITOR_PID=$!
-
-# 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow
-# start here isn't a hang: labwc walks several theme directories probing
-# for window-decoration icons (all missing, normal fallback behavior) and
-# does real GPU work even in headless mode (DRM_IOCTL_AMDGPU_CS -- it
-# still renders via /dev/dri, just doesn't scan out to a display). On a
-# busy/shared host -- confirmed live: other labwc/Xwayland instances
-# entirely outside this container, competing for the same GPU and
-# XWayland X-display-number slots -- that startup can take longer than
-# 5s, which isn't a fault of anything here, just contention.
-COMPOSITOR_DISPLAY=""
-for _ in $(seq 1 80); do
+# Snapshot (name, live-pid) pairs before starting, not just names --
+# $RUNTIME_DIR is shared with the host and any other running compositor
+# (see scripts/setup-env.sh), so it can already hold several wayland-N
+# entries, including stale ones a crashed compositor never unlinked.
+# Comparing names alone has two distinct failure modes, both confirmed
+# live: scanning for "any non-proxy socket" picks up a stale one nothing
+# is listening on ("Connection refused" in the proxy); scanning for "any
+# name absent from the before-snapshot" misses a *legitimate* new
+# compositor that reused a stale name nothing currently holds a lock on
+# (wlroots' own auto-selection reuses any unlocked slot, dead or never
+# used) -- looked like a hang for a long time before this was found.
+# Comparing the full (name, pid) pair catches both: a name is "new" only
+# if it's live now and wasn't live with that same pid before.
+snapshot_live_sockets() {
+    local sock name pid
     for sock in "$RUNTIME_DIR"/wayland-*[0-9]; do
         [[ -e "$sock" ]] || continue
         name="$(basename "$sock")"
-        if [[ "$name" != "$PROXY_DISPLAY" ]] && ! grep -qxF "$sock" <<< "$existing_sockets"; then
+        pid="$(fuser "$sock" 2>/dev/null | xargs)"
+        [[ -n "$pid" ]] && echo "${name}=${pid}"
+    done
+}
+existing_sockets="$(snapshot_live_sockets)"
+case "$COMPOSITOR" in
+    labwc)
+        WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
+            labwc -C "$SCRIPT_DIR/containers/labwc/labwc-config" > "$COMPOSITOR_LOG" 2>&1 &
+        ;;
+    sway)
+        WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
+            sway -c "$SCRIPT_DIR/containers/sway/sway-config" > "$COMPOSITOR_LOG" 2>&1 &
+        ;;
+    *)
+        fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one here"
+        ;;
+esac
+COMPOSITOR_PID=$!
+
+# 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow
+# start here isn't necessarily a hang: labwc walks several theme
+# directories probing for window-decoration icons (all missing, normal
+# fallback behavior) and does real GPU work even in headless mode
+# (DRM_IOCTL_AMDGPU_CS -- it still renders via /dev/dri, just doesn't
+# scan out to a display), which can take longer than 5s on a busy/shared
+# host. Most of what looked like this in practice, though, turned out to
+# be a real detection bug (see snapshot_live_sockets above and the
+# 2026-07-31 debugging-notes.md entry), not host contention -- keeping
+# the generous budget regardless, since the slow-start case above is
+# real too, just not the dominant one it first appeared to be.
+COMPOSITOR_DISPLAY=""
+for _ in $(seq 1 80); do
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        name="${entry%%=*}"
+        [[ "$name" == "$PROXY_DISPLAY" ]] && continue
+        if ! grep -qxF "$entry" <<< "$existing_sockets"; then
             COMPOSITOR_DISPLAY="$name"
         fi
-    done
+    done <<< "$(snapshot_live_sockets)"
     [[ -n "$COMPOSITOR_DISPLAY" ]] && break
     sleep 0.25
 done

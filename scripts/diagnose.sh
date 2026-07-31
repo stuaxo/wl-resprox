@@ -24,12 +24,15 @@
 #   --host-only    don't exec into the container at all. Combine with
 #                  --errors-only for a fast pre-commit check that never
 #                  touches podman.
+#   container-name defaults to wayland-proxy-dev-labwc -- pass a
+#                  different one (e.g. wayland-proxy-dev-sway) to check
+#                  a different WM's container.
 set +e  # diagnostics should keep going even if individual checks fail
 
 VERBOSE=false
 ERRORS_ONLY=false
 HOST_ONLY=false
-CONTAINER_NAME="wayland-proxy-dev"
+CONTAINER_NAME="wayland-proxy-dev-labwc"
 for arg in "$@"; do
   case "$arg" in
     --verbose) VERBOSE=true ;;

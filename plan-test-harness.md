@@ -66,14 +66,17 @@ Matrix default: L1. L2 on demand per-container.
       `postinst`/`postrm` for enable/disable) once that packaging work
       starts.
 
-## Phase 8: Package the harness
+## Phase 8: Package the harness — deferred
 
-- [ ] Enumerate artifacts: container defs, crash-inducer, verification
-      logic, VNC wiring. Container defs may ship as data files, not
-      baked into the package.
-- [ ] Real `debian/` control file, replacing ad-hoc `scripts/*.sh`.
-- [ ] Verify clean install on a fresh container, no dependency on this
-      repo's working tree.
+Skipping for now: the harness's shape is still changing (Phase 9 adds
+per-WM containers, Phase 10 an automated runner), so packaging it before
+that settles would mean repackaging repeatedly. Revisit once Phase 9/10
+land and the harness stops changing shape every session. Original scope,
+unchanged, picked back up then: enumerate artifacts (container defs,
+crash-inducer, verification logic, VNC wiring -- container defs may ship
+as data files, not baked in), a real `debian/` control file replacing
+ad-hoc `scripts/*.sh`, verify clean install with no dependency on this
+repo's working tree.
 
 ## Phase 9: Per-WM containers
 
@@ -131,3 +134,23 @@ phase loops over once Phase 9's containers exist.
 - L3 / real GNOME Shell integration — Phase 9's mutter entry is
   groundwork only.
 - CI wiring for Phase 10's runner — after the matrix exists, not before.
+
+## Harness tooling follow-ups (noted, not scoped into a phase yet)
+
+Repeated ad-hoc operations from Phase 9 work worth turning into real
+scripts eventually:
+
+- `diagnose.sh`: show each socket's owning process cmdline inline, not
+  just its PID (`wayland-3: pid 12345 (labwc -C /workspace/...)`).
+  Motivated live: mistook this session's own long-running `start-host.sh`
+  labwc for an unrelated host session, purely from not having cmdline and
+  socket in the same view.
+- A cleanup script for stray/zombie compositor processes and stale
+  sockets — done ad hoc many times this session (manual `pgrep`+`fuser`+
+  `kill`, including a self-matching `pkill` mistake more than once).
+  Folding into `diagnose.sh` as an action mode, or a separate
+  `scripts/cleanup.sh`, are both reasonable; not decided.
+- Detecting which compositors/WMs are installed and which are currently
+  running, on host and per-container — relevant once Phase 9's matrix has
+  more than two entries and Phase 10 needs to reason about it
+  automatically rather than a human eyeballing `ps`.

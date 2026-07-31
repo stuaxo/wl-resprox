@@ -19,10 +19,18 @@
 # shadows anything this image bakes into a user's home directory, and
 # risks the container writing into the host's real home directory).
 #
-# Build: podman build -t wayland-proxy-dev -f scripts/Containerfile scripts/
-# Run:   see scripts/setup-env.sh, which also handles the render/video
-#        GID matching and the project mount this image alone doesn't set
-#        up (those are host-specific, not build-time facts).
+# One Containerfile per compositor under scripts/containers/<wm>/ --
+# see plan-test-harness.md Phase 9. Deliberately separate files, not one
+# parameterized template: different compositors need genuinely different
+# apt packages (kwin/plasma needs far more than labwc/sway), and with
+# only two WMs done so far it's too early to know what's actually shared
+# vs. coincidentally similar.
+#
+# Build: podman build -t wayland-proxy-dev-labwc -f scripts/containers/labwc/Containerfile scripts/containers/labwc/
+# Run:   see scripts/setup-env.sh --wm=labwc, which also handles the
+#        render/video GID matching and the project mount this image
+#        alone doesn't set up (those are host-specific, not build-time
+#        facts).
 
 FROM ubuntu:26.04
 
@@ -100,5 +108,11 @@ WORKDIR /workspace
 
 # scripts/diagnose.sh detects "am I running inside the container" via this
 # -- previously set automatically by Distrobox, now set explicitly since
-# nothing else provides it.
-ENV CONTAINER_ID=wayland-proxy-dev
+# nothing else provides it. Per-WM value (not just "wayland-proxy-dev")
+# so the PS1 prefix tells you which compositor's container you're in.
+ENV CONTAINER_ID=wayland-proxy-dev-labwc
+
+# entrypoint.sh/test-crash.sh dispatch on this to know which compositor
+# binary/config/launch flags to use -- see their own COMPOSITOR case
+# statements.
+ENV COMPOSITOR=labwc

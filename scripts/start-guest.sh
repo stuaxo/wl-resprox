@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Enters the wayland-proxy-dev container (a plain podman container, built
-# and started by scripts/setup-env.sh -- see scripts/Containerfile),
-# starts the nested compositor via entrypoint.sh, then drops you into an
-# interactive shell inside the container for testing (gtk4-demo,
-# wayland-info, etc.).
+# Enters a wayland-proxy-dev-<wm> container (a plain podman container,
+# built and started by scripts/setup-env.sh -- see
+# scripts/containers/<wm>/Containerfile), starts the nested compositor
+# via entrypoint.sh, then drops you into an interactive shell inside the
+# container for testing (gtk4-demo, wayland-info, etc.).
 #
-# Usage: ./scripts/start-guest.sh [host-wayland-socket]
-#   host-wayland-socket defaults to wayland-0 — match whatever
-#   scripts/start-host.sh printed.
+# Usage: ./scripts/start-guest.sh [--wm=<name>] [host-wayland-socket]
+#   --wm=<name>          which compositor's container to enter (default labwc).
+#   host-wayland-socket  defaults to wayland-0 — match whatever
+#                        scripts/start-host.sh printed.
 #
 # Note: this shells out to `sudo podman exec` -- expect a password prompt
 # (cached per your normal sudo timeout, not every call).
@@ -21,8 +22,17 @@
 # known-safe choice rather than re-relying on unverified group resolution.
 set -euo pipefail
 
-CONTAINER_NAME="wayland-proxy-dev"
-HOST_DISPLAY="${1:-wayland-0}"
+WM="labwc"
+HOST_DISPLAY=""
+for arg in "$@"; do
+  case "$arg" in
+    --wm=*) WM="${arg#--wm=}" ;;
+    *) HOST_DISPLAY="$arg" ;;
+  esac
+done
+HOST_DISPLAY="${HOST_DISPLAY:-wayland-0}"
+
+CONTAINER_NAME="wayland-proxy-dev-${WM}"
 # Fixed, not derived from this script's own host-side location -- the
 # container only ever mounts the project directory at /workspace (see
 # setup-env.sh), not a host-mirrored path.
