@@ -1,0 +1,7 @@
+# Minimal sway config for our own headless test/nested compositor
+# instances (entrypoint.sh, test-crash.sh). Deliberately as bare as
+# possible for a first pass -- labwc's equivalent config picked up an
+# xwayland-disable setting that consumed a lot of investigation time for
+# an improvement that turned out not to matter much in practice (see the
+# 2026-07-31 entries in docs/debugging-notes.md). Not repeating that
+# here; add settings only once something concrete needs them.

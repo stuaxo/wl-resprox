@@ -94,6 +94,18 @@ One `Containerfile` per WM, proxy package installed, added in risk order:
 - [ ] Per container: run L1 check, record pass/fail + any new
       `interfaces.rs` gaps (expected when a new compositor family shows
       up, not a bug — see architecture-notes.md Gap 1/Gap 2).
+- [x] **sway: L0 pass (5/5), L1 pass.** One new `interfaces.rs` gap found
+      and fixed: `zwp_keyboard_shortcuts_inhibit_manager_v1` (sway
+      advertises it, labwc's snapshot never did). Uncaught, it silently
+      dropped that one `wl_registry.bind`, desyncing the client's own
+      `new_id` sequence -- gtk4-demo stayed alive but never got as far as
+      `get_toplevel`, so its window never appeared. Same bug class as the
+      original labwc-era gap (docs/debugging-notes.md, 2026-07-30). Fixed
+      by adding the interface (`wayland_protocols::wp::
+      keyboard_shortcuts_inhibit::zv1`) to the lookup table. Re-verified
+      live: `get_toplevel` now appears, zero "unresolvable interface"
+      warnings, clean reconnect/recreate of the full toplevel chain after
+      killing and restarting sway, client survives throughout.
 
 ### Cross-compositor swap (limited pairs, not the full matrix)
 

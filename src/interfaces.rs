@@ -52,6 +52,7 @@ pub fn lookup_interface(name: &str) -> Option<&'static Interface> {
     use wayland_protocols::wp::primary_selection::zv1::client::__interfaces as primary_selection;
     use wayland_protocols::wp::relative_pointer::zv1::client::__interfaces as relative_pointer;
     use wayland_protocols::wp::idle_inhibit::zv1::client::__interfaces as idle_inhibit;
+    use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::__interfaces as keyboard_shortcuts_inhibit;
     use wayland_protocols::wp::single_pixel_buffer::v1::client::__interfaces as single_pixel_buffer;
     use wayland_protocols::wp::cursor_shape::v1::client::__interfaces as cursor_shape;
     use wayland_protocols::wp::tablet::zv1::client::__interfaces as tablet_v1;
@@ -134,6 +135,7 @@ pub fn lookup_interface(name: &str) -> Option<&'static Interface> {
         "zwp_primary_selection_device_manager_v1" => &primary_selection::ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
         "zwp_relative_pointer_manager_v1" => &relative_pointer::ZWP_RELATIVE_POINTER_MANAGER_V1_INTERFACE,
         "zwp_idle_inhibit_manager_v1" => &idle_inhibit::ZWP_IDLE_INHIBIT_MANAGER_V1_INTERFACE,
+        "zwp_keyboard_shortcuts_inhibit_manager_v1" => &keyboard_shortcuts_inhibit::ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_V1_INTERFACE,
         "wp_single_pixel_buffer_manager_v1" => &single_pixel_buffer::WP_SINGLE_PIXEL_BUFFER_MANAGER_V1_INTERFACE,
         "wp_cursor_shape_manager_v1" => &cursor_shape::WP_CURSOR_SHAPE_MANAGER_V1_INTERFACE,
         "zwp_tablet_manager_v1" => &tablet_v1::ZWP_TABLET_MANAGER_V1_INTERFACE,

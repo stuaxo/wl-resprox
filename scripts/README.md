@@ -1,8 +1,10 @@
 # Wayland Proxy Dev Environment
 
-Builds a `podman` container (Ubuntu 26.04) for testing the Wayland
-proxy. Includes Rust, GTK4, Wayland tooling, and `labwc` as a nested
-compositor. No Distrobox — see `Containerfile`'s header for why.
+Builds a `podman` container (Ubuntu 26.04) per window manager, for
+testing the Wayland proxy against each one. Includes Rust, GTK4, and
+Wayland tooling; the compositor itself is whichever `--wm=<name>` you
+pick (default `labwc`). No Distrobox — see
+`containers/labwc/Containerfile`'s header for why.
 
 ## Project layout
 
@@ -15,14 +17,21 @@ compositor. No Distrobox — see `Containerfile`'s header for why.
 └── scripts/
     ├── setup-env.sh     # builds the image and starts the container (run once)
     ├── teardown-env.sh  # stops and removes the container (reverses setup-env.sh)
-    ├── Containerfile    # used by setup-env.sh — must stay alongside it
+    ├── containers/      # one subdir per WM: Containerfile + compositor config
+    │   ├── labwc/
+    │   └── sway/
     ├── start-host.sh    # starts a headless labwc + wayvnc on the HOST
-    ├── entrypoint.sh    # runs INSIDE the container — starts nested labwc
+    ├── entrypoint.sh    # runs INSIDE the container — starts the nested
+    │                    # compositor named by $COMPOSITOR
     ├── start-guest.sh   # enters the container, runs entrypoint.sh, then
     │                    # drops you into an interactive shell for testing
     ├── test-crash.sh    # automated crash/reconnect check (see step 4 below)
-    └── diagnose.sh      # dumps labwc/Wayland/wayvnc state, host + guest
+    └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest
 ```
+
+All of `setup-env.sh`, `teardown-env.sh`, and `start-guest.sh` take a
+`--wm=<name>` flag (default `labwc`) selecting which
+`containers/<name>/` to build/run against.
 
 ## Host prerequisites
 
@@ -53,13 +62,15 @@ needs:
 ### 1. Build and start the container (once)
 
 ```bash
-./scripts/setup-env.sh
+./scripts/setup-env.sh              # labwc (default)
+./scripts/setup-env.sh --wm=sway
 ```
-Builds the `wayland-proxy-dev` image and starts it as a long-running
-container. Matches the container's `dev` user's UID/GID and the host's
-video/render GIDs — but `dev` is a fixed, generic login name, not tied
-to your host account. Only the project directory is shared with the
-container, mounted at `/workspace` — not your whole home directory.
+Builds the `wayland-proxy-dev-<wm>` image and starts it as a
+long-running container. Matches the container's `dev` user's UID/GID
+and the host's video/render GIDs — but `dev` is a fixed, generic login
+name, not tied to your host account. Only the project directory is
+shared with the container, mounted at `/workspace` — not your whole
+home directory.
 
 ### 2. Start the host compositor + VNC (Terminal A)
 
@@ -84,24 +95,28 @@ Run that from your own machine, then point a VNC client at
 ### 3. Start the nested compositor and enter the container (Terminal B)
 
 ```bash
-./scripts/start-guest.sh wayland-0   # match the socket start-host.sh printed
+./scripts/start-guest.sh wayland-0            # match the socket start-host.sh printed
+./scripts/start-guest.sh --wm=sway wayland-0  # against a different WM's container
 ```
-Runs `entrypoint.sh` inside the container: starts the nested `labwc`,
-reports its new socket, then drops you into an interactive shell. Run:
+Runs `entrypoint.sh` inside the container: starts the nested
+compositor, reports its new socket, then drops you into an interactive
+shell. Run:
 ```bash
 WAYLAND_DISPLAY=<new-socket> gtk4-demo
 ```
 
 ### 4. Automated crash-recovery check (optional)
 
-Run from the shell step 3 leaves you in (already at the project root):
+Run from the shell step 3 leaves you in (already at the project root;
+`$COMPOSITOR` is already set there, baked in by the image):
 ```bash
 bash scripts/test-crash.sh
 ```
 Starts its own compositor, proxy, and `gtk4-demo`. Crashes the
 compositor. Checks the client process survives — nothing more.
-Self-contained; doesn't use step 3's nested `labwc`. See
-`plan-test-harness.md` for the fuller testing-levels picture.
+Self-contained; doesn't use step 3's nested compositor. See
+`plan-test-harness.md` for the fuller testing-levels picture and the
+per-WM results recorded there.
 
 ### 5. Tear down
 
@@ -115,22 +130,24 @@ Self-contained; doesn't use step 3's nested `labwc`. See
 - **Podman permission errors** — Configure rootless Podman: see the
   [Podman rootless setup docs](https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md).
   Unlikely here — this project's scripts always run Podman via `sudo`;
-  see `Containerfile`'s header for why.
+  see `containers/labwc/Containerfile`'s header for why.
 - **`zsh: command not found: labwc` on the host** — Install `labwc`/
   `wayvnc` on the host (prerequisite 2). They run outside the container.
-- **Nested `labwc` fails with `libseat`/`Could not open target tty` /
-  `Failed to start a DRM session`** — `labwc` didn't see the host's
-  Wayland socket and tried to run as a root compositor instead. Fix: set
+  Only `start-host.sh`'s outer session needs this — the nested
+  compositor tested inside the container can be any `--wm=` this repo
+  covers.
+- **Nested compositor fails with `libseat`/`Could not open target tty` /
+  `Failed to start a DRM session`** — it didn't see the host's Wayland
+  socket and tried to run as a root compositor instead. Fix: set
   `WAYLAND_DISPLAY=<host-socket>` before starting it — `start-guest.sh`
   does this for you.
-- **`xwayland/sockets.c: /tmp/.X11-unix not owned by root or us`,
-  `cannot create xwayland server`** — XWayland fails inside the
-  container (`/tmp` ownership mismatch with the shared mount). Harmless:
-  this project doesn't use XWayland. Check for a new `wayland-N` socket
-  instead. To silence it, add to `~/.config/labwc/rc.xml`:
-  ```xml
-  <labwc_config><core><xwayland>no</xwayland></core></labwc_config>
-  ```
+- **XWayland errors** (`/tmp/.X11-unix not owned by root or us`,
+  `Cannot find Xwayland binary`, or similar) on compositor startup —
+  harmless: this project doesn't use XWayland, and neither WM container
+  installs it. Check for a new `wayland-N` socket instead of a clean
+  log. (`containers/labwc/labwc-config/rc.xml` sets `xwayland=no`, but
+  don't rely on it suppressing the process entirely — see the
+  2026-07-31 corrections in `docs/debugging-notes.md`.)
 - **`ls: cannot access '#': No such file or directory` (or similar) when
   sourcing a script in zsh** — zsh errors on inline `#` comments and
   empty globs. Run scripts as `./script.sh` or `bash script.sh`, not

@@ -1,5 +1,10 @@
 # Wayland Crash Resilience Proxy
 
+> **Status: AI/slop-coded spike.** Built largely with an AI coding
+> assistant, exploratory in nature. Live-verified against a real
+> compositor (see below), but not yet independently reviewed. Treat
+> accordingly.
+
 A crash-resilient Wayland proxy (Rust): relays a client to a compositor
 via direct wire-protocol translation, and survives the compositor
 crashing and restarting without the client noticing.

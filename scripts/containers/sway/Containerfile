@@ -1,0 +1,89 @@
+# Wayland proxy dev environment, built directly with `podman build` --
+# see scripts/containers/labwc/Containerfile's header comment for the
+# full Distrobox/devcontainer-style rationale, identical here. This file
+# differs from that one only in which compositor package it installs and
+# the two ENV values at the bottom -- see plan-test-harness.md Phase 9
+# for why these are separate files rather than one parameterized
+# template.
+#
+# Build: podman build -t wayland-proxy-dev-sway -f scripts/containers/sway/Containerfile scripts/containers/sway/
+# Run:   see scripts/setup-env.sh --wm=sway, which also handles the
+#        render/video GID matching and the project mount this image
+#        alone doesn't set up (those are host-specific, not build-time
+#        facts).
+
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# psmisc (fuser) and iproute2 (ss): not needed by the proxy or sway
+# themselves, but scripts/diagnose.sh depends on both for live/stale
+# socket detection and XWayland-slot ownership.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    sudo \
+    rustc \
+    cargo \
+    libgtk-4-dev \
+    gtk-4-examples \
+    sway \
+    libwayland-dev \
+    wayland-utils \
+    dbus \
+    wev \
+    psmisc \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# GID/UID values are baked in as build args, not hardcoded -- host-specific
+# facts, passed by scripts/setup-env.sh at build time (its own `id -u`/
+# `getent group video render` calls). Matching them is what lets the
+# container's `dev` user actually use /dev/dri and the bind-mounted
+# XDG_RUNTIME_DIR without a permissions mismatch -- only the numeric
+# UID/GID need to match the host, not the username, which is why the
+# username itself is a fixed, generic `dev` rather than mirroring
+# whoever's host account happens to be running this.
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG VIDEO_GID=44
+ARG RENDER_GID=991
+
+# Ubuntu's own base image ships a default `ubuntu` user/group at
+# UID/GID 1000 (the common case for a first host user account) -- remove
+# it first so it doesn't collide with the group/useradd calls below.
+RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true
+
+RUN groupadd -g "${USER_GID}" dev \
+    && (groupmod -g "${VIDEO_GID}" video 2>/dev/null || groupadd -g "${VIDEO_GID}" video) \
+    && groupadd -g "${RENDER_GID}" render \
+    && useradd -u "${USER_UID}" -g "${USER_GID}" -G video,render,sudo -m -s /bin/bash dev
+
+# A loud PS1 prefix, so a container shell is never mistaken for a host
+# one -- see scripts/containers/labwc/Containerfile's own comment for
+# the full story (tried /etc/bash.bashrc first, Ubuntu's stock ~/.bashrc
+# clobbers it, appending here instead runs last and wins).
+RUN echo 'export PS1="\[\e[1;41;37m\][${CONTAINER_ID}]\[\e[0m\] ${PS1}"' >> /home/dev/.bashrc
+
+# Passwordless sudo baked in at build time -- no interactive password flow
+# exists anywhere in this image, so there's nothing that can be caught
+# mid-setup the way distrobox-init's was.
+RUN echo "dev ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/zz-dev-nopasswd \
+    && chmod 0440 /etc/sudoers.d/zz-dev-nopasswd \
+    && visudo -cf /etc/sudoers.d/zz-dev-nopasswd
+
+# /workspace: fixed, generic mount point for the project (scripts/setup-env.sh
+# bind-mounts it there) -- created and owned by `dev` here, as root, since
+# `dev` can't create anything directly under root:root 0755 /.
+RUN mkdir -p /workspace && chown dev:dev /workspace
+
+USER dev
+WORKDIR /workspace
+
+# scripts/diagnose.sh detects "am I running inside the container" via this
+# -- per-WM value so the PS1 prefix tells you which compositor's
+# container you're in.
+ENV CONTAINER_ID=wayland-proxy-dev-sway
+
+# entrypoint.sh/test-crash.sh dispatch on this to know which compositor
+# binary/config/launch flags to use -- see their own COMPOSITOR case
+# statements.
+ENV COMPOSITOR=sway
