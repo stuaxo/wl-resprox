@@ -14,8 +14,8 @@ crashing and restarting without the client noticing.
 Phases 1-5 done: proxy core, Shadow Table (guest/host id translation),
 full crash recovery, live-verified against real `labwc`. See
 `docs/plan/plan-0001-proxy-core-and-crash-recovery.md` for the build
-history and `plan-test-harness.md` for what's next (multi-WM
-verification, packaging).
+history. Current plan: [`plan-test-harness.md`](plan-test-harness.md)
+(multi-WM verification, packaging) — Phase 9 in progress, sway done.
 
 ## Documentation
 
@@ -26,12 +26,10 @@ verification, packaging).
 - `docs/implementation-constraints.md` — binding spec for crash recovery
 - `docs/debugging-notes.md` — investigation log for bugs found live
 
-## Development environment
+## Development
 
 See `scripts/README.md`: building/running the dev container, testing
 against a nested compositor, watching over VNC.
-
-## Contributing
 
 Enable the pre-commit hook once per clone:
 ```bash
