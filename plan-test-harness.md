@@ -36,7 +36,17 @@ Matrix default: L1. L2 on demand per-container.
 ## Phase 7: Package the proxy
 
 - [x] **Open Q resolved:** `.deb`, via `cargo-deb`.
-- [ ] Confirm it installs on the Ubuntu base every Phase 9 container uses.
+- [x] Confirm it installs on the Ubuntu base every Phase 9 container uses.
+      `cargo deb` builds cleanly (MIT license, matching prior art:
+      sommelier-rs is Apache-2.0, waypipe's Rust rewrite is
+      GPL-3.0-or-later, neither obligates this project since no code was
+      copied from either -- reference/ is gitignored, never committed).
+      `apt-get install` of the built .deb verified live on the actual
+      Phase 9 base image: binary lands at /usr/bin/wayland-proxy, unit at
+      /usr/lib/systemd/user/, `$auto` dependency detection resolved to
+      just `libc6`. `[package.metadata.deb]` deliberately skips
+      cargo-deb's systemd-units automation (system-unit-oriented, wrong
+      for our --user unit) in favour of shipping it as a plain asset.
 - [x] **Open Q resolved:** ship a systemd --user unit
       (`packaging/wayland-proxy.service`) alongside the `.deb`, don't wait
       for L3. Not a jump ahead -- a packaged background service

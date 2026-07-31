@@ -3,6 +3,33 @@ name = "wayland-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "A crash-resilient stateful Wayland proxy"
+license = "MIT"
+
+# cargo-deb (Phase 7, plan-test-harness.md). No systemd-units table here
+# deliberately -- cargo-deb's automation is system-unit-oriented
+# (installs to /usr/lib/systemd/system/, auto-generates
+# postinst-systemd-enable/-start assuming root-context install-time
+# enable), wrong for packaging/wayland-proxy.service, which is
+# deliberately a --user unit (WAYLAND_DISPLAY/XDG_RUNTIME_DIR are
+# per-user-session concepts -- see that file's own header). Shipped as a
+# plain asset at the correct /usr/lib/systemd/user/ path instead; a user
+# opts in themselves with `systemctl --user enable --now wayland-proxy`,
+# same as any other optional user-session service.
+[package.metadata.deb]
+maintainer = "Stuart Axon <stuaxo2@yahoo.com>"
+copyright = "2026, Stuart Axon <stuaxo2@yahoo.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A crash-resilient Wayland proxy. Relays a client to a compositor via \
+direct wire-protocol translation, and survives the compositor crashing \
+and restarting without the client noticing."""
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/wayland-proxy", "usr/bin/", "755"],
+    ["packaging/wayland-proxy.service", "usr/lib/systemd/user/", "644"],
+]
 
 [dependencies]
 # Async runtime for socket multiplexing
