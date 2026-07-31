@@ -101,6 +101,14 @@ case "$COMPOSITOR" in
         WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
             sway -c "$SCRIPT_DIR/containers/sway/sway-config" > "$COMPOSITOR_LOG" 2>&1 &
         ;;
+    kwin)
+        # --virtual is kwin's own headless backend (confirmed live via
+        # `kwin_wayland --help`) -- the WLR_BACKENDS=headless env var
+        # above is wlroots-specific and doesn't apply to kwin (Qt-based,
+        # not wlroots). No -c/config-file equivalent needed for a bare
+        # virtual-backend instance, unlike labwc/sway.
+        kwin_wayland --virtual > "$COMPOSITOR_LOG" 2>&1 &
+        ;;
     *)
         fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one here"
         ;;

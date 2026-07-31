@@ -19,7 +19,8 @@ pick (default `labwc`). No Distrobox — see
     ├── teardown-env.sh  # stops and removes the container (reverses setup-env.sh)
     ├── containers/      # one subdir per WM: Containerfile + compositor config
     │   ├── labwc/
-    │   └── sway/
+    │   ├── sway/
+    │   └── kwin/
     ├── start-host.sh    # starts a headless labwc + wayvnc on the HOST
     ├── entrypoint.sh    # runs INSIDE the container — starts the nested
     │                    # compositor named by $COMPOSITOR

@@ -21,6 +21,9 @@ case "$COMPOSITOR" in
   sway)
     sway -c "$SCRIPT_DIR/containers/sway/sway-config" &
     ;;
+  kwin)
+    kwin_wayland --virtual &
+    ;;
   *)
     echo "ERROR: no launch case for COMPOSITOR='$COMPOSITOR' -- add one here." >&2
     exit 1

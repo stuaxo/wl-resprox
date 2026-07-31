@@ -1,0 +1,117 @@
+# Wayland proxy dev environment, built directly with `podman build` --
+# see scripts/containers/labwc/Containerfile's header comment for the
+# full Distrobox/devcontainer-style rationale, identical here. This file
+# differs from that one only in which compositor package it installs and
+# the two ENV values at the bottom -- see plan-test-harness.md Phase 9
+# for why these are separate files rather than one parameterized
+# template.
+#
+# kwin-wayland pulls in the full KDE Frameworks/Qt6 stack plus xwayland
+# (a hard dependency here, unlike labwc/sway where it's absent by
+# choice -- see those Containerfiles). No separate
+# kwin-wayland-backend-virtual package on this base: older Debian/Ubuntu
+# split the virtual backend out, but Plasma 6's kwin-wayland ships it
+# in the main binary -- confirmed via `apt-cache depends kwin-wayland`
+# on the host, no such package exists to install separately.
+#
+# Build: podman build -t wayland-proxy-dev-kwin -f scripts/containers/kwin/Containerfile scripts/containers/kwin/
+# Run:   see scripts/setup-env.sh --wm=kwin, which also handles the
+#        render/video GID matching and the project mount this image
+#        alone doesn't set up (those are host-specific, not build-time
+#        facts).
+
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# psmisc (fuser) and iproute2 (ss): not needed by the proxy or kwin
+# themselves, but scripts/diagnose.sh depends on both for live/stale
+# socket detection and XWayland-slot ownership.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    sudo \
+    rustc \
+    cargo \
+    libgtk-4-dev \
+    gtk-4-examples \
+    kwin-wayland \
+    libwayland-dev \
+    wayland-utils \
+    dbus \
+    wev \
+    psmisc \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# GID/UID values are baked in as build args, not hardcoded -- host-specific
+# facts, passed by scripts/setup-env.sh at build time (its own `id -u`/
+# `getent group video render` calls). Matching them is what lets the
+# container's `dev` user actually use /dev/dri and the bind-mounted
+# XDG_RUNTIME_DIR without a permissions mismatch -- only the numeric
+# UID/GID need to match the host, not the username, which is why the
+# username itself is a fixed, generic `dev` rather than mirroring
+# whoever's host account happens to be running this.
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG VIDEO_GID=44
+ARG RENDER_GID=991
+
+# Ubuntu's own base image ships a default `ubuntu` user/group at
+# UID/GID 1000 (the common case for a first host user account) -- remove
+# it first so it doesn't collide with the group/useradd calls below.
+RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true
+
+# Unlike labwc/sway's images, one of kwin-wayland's own dependencies
+# (systemd/udev rules pulled in transitively) already creates a `render`
+# group at build time here, so `groupadd` alone (which worked for
+# labwc/sway) fails with "group 'render' already exists" -- confirmed
+# live. Same groupmod-with-fallback pattern as `video` below handles
+# both cases: rename the existing group's GID if present, create it
+# fresh if not.
+RUN groupadd -g "${USER_GID}" dev \
+    && (groupmod -g "${VIDEO_GID}" video 2>/dev/null || groupadd -g "${VIDEO_GID}" video) \
+    && (groupmod -g "${RENDER_GID}" render 2>/dev/null || groupadd -g "${RENDER_GID}" render) \
+    && useradd -u "${USER_UID}" -g "${USER_GID}" -G video,render,sudo -m -s /bin/bash dev
+
+# A loud PS1 prefix, so a container shell is never mistaken for a host
+# one -- see scripts/containers/labwc/Containerfile's own comment for
+# the full story (tried /etc/bash.bashrc first, Ubuntu's stock ~/.bashrc
+# clobbers it, appending here instead runs last and wins).
+RUN echo 'export PS1="\[\e[1;41;37m\][${CONTAINER_ID}]\[\e[0m\] ${PS1}"' >> /home/dev/.bashrc
+
+# Passwordless sudo baked in at build time -- no interactive password flow
+# exists anywhere in this image, so there's nothing that can be caught
+# mid-setup the way distrobox-init's was.
+RUN echo "dev ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/zz-dev-nopasswd \
+    && chmod 0440 /etc/sudoers.d/zz-dev-nopasswd \
+    && visudo -cf /etc/sudoers.d/zz-dev-nopasswd
+
+# /workspace: fixed, generic mount point for the project (scripts/setup-env.sh
+# bind-mounts it there) -- created and owned by `dev` here, as root, since
+# `dev` can't create anything directly under root:root 0755 /.
+RUN mkdir -p /workspace && chown dev:dev /workspace
+
+# kwin_wayland ships with the file capability cap_sys_nice=ep (for
+# realtime thread priority on a real desktop). Confirmed live: execve()
+# of a capability-carrying binary fails outright with EPERM in this
+# rootless-podman user namespace -- not a /dev/dri permissions issue
+# like the video/render GID one, a completely different failure mode
+# (the shell itself can't even exec the file). Stripping the capability
+# is the fix, not adding it back via --cap-add on the podman run side --
+# this is a single WM's binary quirk, not something setup-env.sh (shared
+# across all --wm= targets) should carry. Losing cap_sys_nice just makes
+# kwin log a non-fatal "Failed to gain real time thread priority"
+# warning and continue -- a fine trade for a headless test compositor.
+RUN setcap -r /usr/bin/kwin_wayland
+
+USER dev
+WORKDIR /workspace
+
+# scripts/diagnose.sh detects "am I running inside the container" via this
+# -- per-WM value so the PS1 prefix tells you which compositor's
+# container you're in.
+ENV CONTAINER_ID=wayland-proxy-dev-kwin
+
+# entrypoint.sh/test-crash.sh dispatch on this to know which compositor
+# binary/config/launch flags to use -- see their own COMPOSITOR case
+# statements.
+ENV COMPOSITOR=kwin

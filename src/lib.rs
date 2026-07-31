@@ -436,8 +436,8 @@ async fn relay_ready_messages(
                             // gap) since ids are independently allocated per
                             // side -- see docs/architecture-notes.md.
                             warn!(
-                                "{}.{} would create an object with unresolvable interface -- dropping",
-                                interface.name, desc.name
+                                "{}.{} would create an object with unresolvable interface {:?} -- dropping",
+                                interface.name, desc.name, walk.dynamic_interface_name
                             );
                             if let Some(rec) = recorder() {
                                 rec.record(
