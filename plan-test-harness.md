@@ -35,11 +35,26 @@ Matrix default: L1. L2 on demand per-container.
 
 ## Phase 7: Package the proxy
 
-- [ ] **Open Q:** `.deb` (via `cargo-deb`) vs bare prebuilt binary.
-- [ ] If `.deb`: confirm installs on the Ubuntu base every Phase 9
-      container uses.
-- [ ] **Open Q:** systemd unit vs harness-managed direct invocation.
-      Lean: direct invocation (matches all tests so far); revisit at L3.
+- [x] **Open Q resolved:** `.deb`, via `cargo-deb`.
+- [ ] Confirm it installs on the Ubuntu base every Phase 9 container uses.
+- [x] **Open Q resolved:** ship a systemd --user unit
+      (`packaging/wayland-proxy.service`) alongside the `.deb`, don't wait
+      for L3. Not a jump ahead -- a packaged background service
+      conventionally ships one regardless, and building it against a
+      plain binary first (done, see below) is faster to iterate on than
+      inside `.deb` machinery. Test harness (`test-crash.sh` etc.) still
+      manages the proxy process directly, unaffected -- different concern
+      per ADR-0003.
+- [x] Unit validated on the host (real systemd --user, unlike the dev
+      container which has no init system at all): start, `Restart=on-failure`
+      after a `kill -9` (confirmed new PID within RestartSec), clean stop,
+      `EnvironmentFile=` override for `WAYLAND_DISPLAY` all confirmed live.
+      No proxy-side changes needed -- confirmed no signal handling exists
+      today, and none is needed: default SIGTERM-terminates is correct
+      for a proxy with no state to flush on shutdown.
+- [ ] Wire the validated unit into the `.deb` (`cargo-deb` asset +
+      `postinst`/`postrm` for enable/disable) once that packaging work
+      starts.
 
 ## Phase 8: Package the harness
 
