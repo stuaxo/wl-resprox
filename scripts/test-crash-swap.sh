@@ -84,6 +84,8 @@ PROXY_DISPLAY="wayland-proxy-0" # fixed name the proxy binds, see src/main.rs
 
 # shellcheck source=./run-registry.sh disable=SC1091
 source "$SCRIPT_DIR/run-registry.sh"
+# shellcheck source=./socket-wait.sh disable=SC1091
+source "$SCRIPT_DIR/socket-wait.sh"
 run_dir_init
 
 PROXY_LOG="$(mktemp)"
@@ -112,42 +114,6 @@ fail() {
     echo "--- ${TO_CONTAINER} compositor log ---"; sudo podman exec "$TO_CONTAINER" cat /tmp/swap-compositor.log 2>/dev/null
     echo "--- ${TO_CONTAINER} client log ---"; sudo podman exec "$TO_CONTAINER" cat /tmp/swap-client.log 2>/dev/null
     exit 1
-}
-
-# Same (name, live-pid) snapshot-diff test-crash.sh uses, run from the
-# host this time -- $RUNTIME_DIR is the same bind-mounted directory
-# either way, so the exact same reasoning (stale sockets, legitimate
-# slot reuse) applies unchanged. See test-crash.sh's own comment for the
-# two failure modes this specifically guards against.
-snapshot_live_sockets() {
-    local sock name pid
-    for sock in "$RUNTIME_DIR"/wayland-*[0-9]; do
-        [[ -e "$sock" ]] || continue
-        name="$(basename "$sock")"
-        pid="$(fuser "$sock" 2>/dev/null | xargs)"
-        [[ -n "$pid" ]] && echo "${name}=${pid}"
-    done
-}
-
-# wait_for_new_socket <before-snapshot> -- polls up to 20s (same budget
-# test-crash.sh uses) for a socket that's live now and wasn't live under
-# the same pid before. Echoes the new socket's name, or nothing on
-# timeout.
-wait_for_new_socket() {
-    local before="$1" found="" entry name
-    for _ in $(seq 1 80); do
-        while IFS= read -r entry; do
-            [[ -z "$entry" ]] && continue
-            name="${entry%%=*}"
-            [[ "$name" == "$PROXY_DISPLAY" ]] && continue
-            if ! grep -qxF "$entry" <<< "$before"; then
-                found="$name"
-            fi
-        done <<< "$(snapshot_live_sockets)"
-        [[ -n "$found" ]] && break
-        sleep 0.25
-    done
-    echo "$found"
 }
 
 echo "== Building proxy on host =="

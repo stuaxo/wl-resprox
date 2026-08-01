@@ -106,7 +106,27 @@ echo "Starting ${CONTAINER_NAME}..."
 # without this, entrypoint.sh's nested compositor fails with "Could not
 # connect to remote display: No such file or directory" -- it never saw
 # the host socket at all).
+# --init: without it, `sleep infinity` (the CMD below) IS pid 1, and
+# pid 1 has no default SIGCHLD handling of its own -- every backgrounded
+# process anything inside the container ever forks and doesn't
+# explicitly wait() for (labwc/sway/kwin/gnome-shell restarts across
+# repeated test-crash.sh runs, dbus-daemon --fork, gnome-shell's own
+# heavy child-process fan-out: gvfsd, evolution-data-server, dconf,
+# at-spi, xdg-desktop-portal, ...) becomes a permanent zombie once it
+# exits, since nothing ever reaps it. Confirmed live this isn't just
+# cosmetic ("diagnose.sh's own count_zombie_labwc calls it harmless" was
+# true for the small numbers a few manual test runs leave behind, but
+# not at scale): repeated `test-crash.sh --l1` runs against the mutter
+# container piled up 1483 zombies against this container's 2048
+# pids-limit, and gtk4-demo started failing outright with `fork: retry:
+# Resource temporarily unavailable` once fork() itself couldn't get a
+# new pid. `--init` installs Podman's own bundled subreaper
+# (`podman-init`) as the real pid 1, which reaps every terminated child
+# it isn't itself waiting on -- confirmed live afterward, zero zombies
+# survive a backgrounded child exiting. See docs/debugging-notes.md's
+# 2026-07-31 entry for the full story and the live before/after check.
 sudo podman run -d --name "${CONTAINER_NAME}" \
+  --init \
   --network host \
   --group-add "${HOST_VIDEO_GID}" --group-add "${HOST_RENDER_GID}" \
   --device /dev/dri \

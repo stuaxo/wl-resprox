@@ -21,7 +21,22 @@
 # forward the error" rule (docs/implementation-constraints.md) holds.
 # Doesn't restart the compositor either, so it doesn't exercise
 # reconnect/recreation -- see plan-test-harness.md for the fuller
-# testing-levels picture and why this stays a narrow L0 check.
+# testing-levels picture and why this stays a narrow L0 check by default.
+#
+# Pass --l1 to go further: after confirming the client survives the
+# crash, restarts the SAME compositor on the same freed socket and
+# additionally asserts protocol-level recovery from the proxy's own log
+# -- zero "unresolvable interface" warnings (an interfaces.rs gap, see
+# architecture-notes.md) and a "recreated xdg_toplevel" line (proof the
+# reconnect actually recreated the toplevel chain, not just that the
+# client process happens to still be alive). This is the exact
+# RUST_LOG=debug-and-grep check that's been run by hand for every Phase 9
+# container and swap pair so far (see docs/debugging-notes.md); --l1
+# automates it as the per-WM unit Phase 10's matrix runner needs, since
+# "L0-only doesn't count as verified" per plan-test-harness.md. Default
+# (no --l1) behavior is unchanged, so existing "L0 pass (N/N)" results
+# elsewhere in this project's docs stay meaningful as exactly what they
+# say -- L0 only.
 #
 # Every pid/socket this script starts is also recorded via
 # run-registry.sh, under $XDG_RUNTIME_DIR/wayland-proxy-runs/<run-id>/
@@ -34,7 +49,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-CLIENT_APP="${1:-gtk4-demo}"
+CLIENT_APP="gtk4-demo"
+CHECK_L1=false
+for arg in "$@"; do
+    case "$arg" in
+        --l1) CHECK_L1=true ;;
+        *) CLIENT_APP="$arg" ;;
+    esac
+done
 COMPOSITOR="${COMPOSITOR:?COMPOSITOR must be set -- baked into the image by scripts/containers/<wm>/Containerfile}"
 
 RUNTIME_DIR="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}"
@@ -44,6 +66,8 @@ PROXY_DISPLAY="wayland-proxy-0" # fixed name the proxy binds, see src/main.rs
 source "$SCRIPT_DIR/run-registry.sh"
 # shellcheck source=./compositor-launch.sh disable=SC1091
 source "$SCRIPT_DIR/compositor-launch.sh"
+# shellcheck source=./socket-wait.sh disable=SC1091
+source "$SCRIPT_DIR/socket-wait.sh"
 run_dir_init
 
 COMPOSITOR_LOG="$(mktemp)"
@@ -89,55 +113,20 @@ echo "== Building proxy =="
 ( cd "$PROJECT_DIR" && cargo build --quiet ) || fail "cargo build failed"
 
 echo "== Starting headless compositor =="
-# Snapshot (name, live-pid) pairs before starting, not just names --
-# $RUNTIME_DIR is shared with the host and any other running compositor
-# (see scripts/setup-env.sh), so it can already hold several wayland-N
-# entries, including stale ones a crashed compositor never unlinked.
-# Comparing names alone has two distinct failure modes, both confirmed
-# live: scanning for "any non-proxy socket" picks up a stale one nothing
-# is listening on ("Connection refused" in the proxy); scanning for "any
-# name absent from the before-snapshot" misses a *legitimate* new
-# compositor that reused a stale name nothing currently holds a lock on
-# (wlroots' own auto-selection reuses any unlocked slot, dead or never
-# used) -- looked like a hang for a long time before this was found.
-# Comparing the full (name, pid) pair catches both: a name is "new" only
-# if it's live now and wasn't live with that same pid before.
-snapshot_live_sockets() {
-    local sock name pid
-    for sock in "$RUNTIME_DIR"/wayland-*[0-9]; do
-        [[ -e "$sock" ]] || continue
-        name="$(basename "$sock")"
-        pid="$(fuser "$sock" 2>/dev/null | xargs)"
-        [[ -n "$pid" ]] && echo "${name}=${pid}"
-    done
-}
-existing_sockets="$(snapshot_live_sockets)"
-launch_compositor "$COMPOSITOR" "$COMPOSITOR_LOG" || fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one to scripts/compositor-launch.sh"
-
-# 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow
-# start here isn't necessarily a hang: labwc walks several theme
-# directories probing for window-decoration icons (all missing, normal
-# fallback behavior) and does real GPU work even in headless mode
-# (DRM_IOCTL_AMDGPU_CS -- it still renders via /dev/dri, just doesn't
-# scan out to a display), which can take longer than 5s on a busy/shared
-# host. Most of what looked like this in practice, though, turned out to
-# be a real detection bug (see snapshot_live_sockets above and the
+# 20s budget (80 x 0.25s, see socket-wait.sh), not 5s -- confirmed via
+# strace that a slow start here isn't necessarily a hang: labwc walks
+# several theme directories probing for window-decoration icons (all
+# missing, normal fallback behavior) and does real GPU work even in
+# headless mode (DRM_IOCTL_AMDGPU_CS -- it still renders via /dev/dri,
+# just doesn't scan out to a display), which can take longer than 5s on
+# a busy/shared host. Most of what looked like this in practice, though,
+# turned out to be a real detection bug (see socket-wait.sh and the
 # 2026-07-31 debugging-notes.md entry), not host contention -- keeping
 # the generous budget regardless, since the slow-start case above is
 # real too, just not the dominant one it first appeared to be.
-COMPOSITOR_DISPLAY=""
-for _ in $(seq 1 80); do
-    while IFS= read -r entry; do
-        [[ -z "$entry" ]] && continue
-        name="${entry%%=*}"
-        [[ "$name" == "$PROXY_DISPLAY" ]] && continue
-        if ! grep -qxF "$entry" <<< "$existing_sockets"; then
-            COMPOSITOR_DISPLAY="$name"
-        fi
-    done <<< "$(snapshot_live_sockets)"
-    [[ -n "$COMPOSITOR_DISPLAY" ]] && break
-    sleep 0.25
-done
+existing_sockets="$(snapshot_live_sockets)"
+launch_compositor "$COMPOSITOR" "$COMPOSITOR_LOG" || fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one to scripts/compositor-launch.sh"
+COMPOSITOR_DISPLAY="$(wait_for_new_socket "$existing_sockets")"
 [[ -n "$COMPOSITOR_DISPLAY" ]] || fail "headless compositor never created a socket"
 run_link_socket compositor "$RUNTIME_DIR/$COMPOSITOR_DISPLAY"
 echo "Compositor socket: $COMPOSITOR_DISPLAY (pid $COMPOSITOR_PID)"
@@ -175,15 +164,50 @@ COMPOSITOR_PID=""
 
 sleep 2
 
-echo ""
-if kill -0 "$CLIENT_PID" 2>/dev/null; then
-    echo "SUCCESS: $CLIENT_APP (pid $CLIENT_PID) survived the compositor crash."
-    exit 0
-else
-    echo "FAIL: $CLIENT_APP did not survive the compositor crash."
-    echo "--- proxy log ---"
-    cat "$PROXY_LOG"
-    echo "--- client log ---"
-    cat "$CLIENT_LOG"
-    exit 1
+if [[ "$CHECK_L1" != true ]]; then
+    echo ""
+    if kill -0 "$CLIENT_PID" 2>/dev/null; then
+        echo "SUCCESS: $CLIENT_APP (pid $CLIENT_PID) survived the compositor crash."
+        exit 0
+    else
+        echo "FAIL: $CLIENT_APP did not survive the compositor crash."
+        echo "--- proxy log ---"
+        cat "$PROXY_LOG"
+        echo "--- client log ---"
+        cat "$CLIENT_LOG"
+        exit 1
+    fi
 fi
+
+kill -0 "$CLIENT_PID" 2>/dev/null || fail "$CLIENT_APP did not survive the compositor crash (never even reached the reconnect attempt)"
+
+echo "== --l1: restarting $COMPOSITOR on the same socket ($COMPOSITOR_DISPLAY) =="
+existing_sockets="$(snapshot_live_sockets)"
+launch_compositor "$COMPOSITOR" "$COMPOSITOR_LOG" "compositor-restarted" || fail "no launch case for COMPOSITOR='$COMPOSITOR'"
+RESTARTED_DISPLAY="$(wait_for_new_socket "$existing_sockets")"
+[[ -n "$RESTARTED_DISPLAY" ]] || fail "restarted $COMPOSITOR never created a socket"
+run_link_socket compositor-restarted "$RUNTIME_DIR/$RESTARTED_DISPLAY"
+if [[ "$RESTARTED_DISPLAY" != "$COMPOSITOR_DISPLAY" ]]; then
+    fail "restarted $COMPOSITOR landed on $RESTARTED_DISPLAY, not the freed $COMPOSITOR_DISPLAY -- the proxy is still pointed at $COMPOSITOR_DISPLAY and will never see it"
+fi
+
+sleep 2
+
+echo ""
+kill -0 "$CLIENT_PID" 2>/dev/null || fail "$CLIENT_APP did not survive the $COMPOSITOR restart"
+# gtk_shell1 is a confirmed-safe, permanent Gap 2 (GNOME/GTK-internal
+# protocol, not generated by any dependency crate this project draws
+# from -- see interfaces.rs's own module doc and architecture-notes.md's
+# Gap 2 list). Excluded here rather than treated as a failure; any OTHER
+# unresolvable interface is a real gap. Keep this exclusion list and
+# architecture-notes.md's Gap 2 list in sync if a second permanent one
+# is ever confirmed.
+if grep "unresolvable interface" "$PROXY_LOG" | grep -qv 'unresolvable interface Some("gtk_shell1")'; then
+    fail "proxy log contains unresolvable-interface warnings -- likely a new interfaces.rs gap (see architecture-notes.md's Gap 1/Gap 2), grep the log for the specific interface name"
+fi
+if ! grep -q "recreated xdg_toplevel" "$PROXY_LOG"; then
+    fail "proxy log never shows the toplevel chain being recreated after reconnect -- L1 requires protocol-level recovery, not just process survival"
+fi
+
+echo "SUCCESS: $CLIENT_APP (pid $CLIENT_PID) survived the $COMPOSITOR crash+restart -- zero unresolvable-interface warnings, toplevel chain recreated (L1 verified)."
+exit 0
