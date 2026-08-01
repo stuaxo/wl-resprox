@@ -39,6 +39,8 @@ CLIENT_LOG="$(mktemp)"
 COMPOSITOR_PID=""
 PROXY_PID=""
 CLIENT_PID=""
+DBUS_SESSION_DAEMON_PID="" # mutter only -- see its case below
+DBUS_SYSTEM_DAEMON_PID=""  # mutter only -- see its case below
 
 # Invoked indirectly via `trap cleanup EXIT` below -- shellcheck's
 # reachability analysis can't trace that, hence disabling both "never
@@ -48,7 +50,7 @@ CLIENT_PID=""
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    for pid in "$CLIENT_PID" "$PROXY_PID" "$COMPOSITOR_PID"; do
+    for pid in "$CLIENT_PID" "$PROXY_PID" "$COMPOSITOR_PID" "$DBUS_SESSION_DAEMON_PID" "$DBUS_SYSTEM_DAEMON_PID"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -9 "$pid" 2>/dev/null || true
         fi
@@ -108,6 +110,50 @@ case "$COMPOSITOR" in
         # not wlroots). No -c/config-file equivalent needed for a bare
         # virtual-backend instance, unlike labwc/sway.
         kwin_wayland --virtual > "$COMPOSITOR_LOG" 2>&1 &
+        ;;
+    mutter)
+        # gnome-shell needs BOTH a D-Bus session bus and a D-Bus system
+        # bus -- unlike labwc/sway/kwin, none of which need either.
+        # Missing the session bus alone was the first symptom found (it's
+        # the more obviously-needed one); missing the system bus is a
+        # separate, less obvious requirement discovered afterward:
+        # timeLimitsManager.js's constructor reads `Gio.DBus.system` to
+        # open an org.freedesktop.MalcontentTimer1 proxy, and that
+        # property getter *fatally* throws if no system bus is reachable
+        # at all (not merely "the service isn't running", which alone
+        # would be a harmless, gracefully-handled
+        # DBus.Error.ServiceUnknown, same as several other warnings seen
+        # below) -- confirmed live via a Gjs-CRITICAL JS ERROR /
+        # `free(): invalid pointer` abort in exactly that constructor
+        # when only a session bus existed. Fix: start a second private
+        # bus and point DBUS_SYSTEM_BUS_ADDRESS at it too -- it doesn't
+        # need to behave like a *real* system bus (no policy files, no
+        # actual logind/PolicyKit/GDM/GeoClue2 services), just needs to
+        # exist, since gnome-shell already handles individual
+        # service-not-found errors gracefully once the bus itself opens.
+        # See the 2026-07-31 mutter entry in docs/debugging-notes.md.
+        #
+        # Both launched directly (not via a `dbus-run-session` wrapper)
+        # so `$!` below is gnome-shell's own pid, not a wrapper's -- a
+        # `dbus-run-session` wrapper forks a separate dbus-daemon *and*
+        # compositor child rather than exec'ing into it, so `$!` would be
+        # the wrapper, not the compositor (confirmed live). --no-x11:
+        # gnome-shell starts Xwayland by default otherwise, unlike
+        # labwc/sway/kwin's images, none of which install it.
+        #
+        # --fork daemonizes immediately (detaches, reparents to init) --
+        # `$!` doesn't apply to it, so track its pid separately
+        # (--print-pid) for cleanup() to kill; it otherwise outlives this
+        # script and leaks across repeated runs.
+        session_out="$(dbus-daemon --session --fork --print-address --print-pid)"
+        DBUS_SESSION_BUS_ADDRESS="$(head -1 <<< "$session_out")"
+        export DBUS_SESSION_BUS_ADDRESS
+        DBUS_SESSION_DAEMON_PID="$(tail -1 <<< "$session_out")"
+        system_out="$(dbus-daemon --session --fork --print-address --print-pid)"
+        DBUS_SYSTEM_BUS_ADDRESS="$(head -1 <<< "$system_out")"
+        export DBUS_SYSTEM_BUS_ADDRESS
+        DBUS_SYSTEM_DAEMON_PID="$(tail -1 <<< "$system_out")"
+        gnome-shell --headless --no-x11 > "$COMPOSITOR_LOG" 2>&1 &
         ;;
     *)
         fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one here"

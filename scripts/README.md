@@ -20,7 +20,8 @@ pick (default `labwc`). No Distrobox — see
     ├── containers/      # one subdir per WM: Containerfile + compositor config
     │   ├── labwc/
     │   ├── sway/
-    │   └── kwin/
+    │   ├── kwin/
+    │   └── mutter/
     ├── start-host.sh    # starts a headless labwc + wayvnc on the HOST
     ├── entrypoint.sh    # runs INSIDE the container — starts the nested
     │                    # compositor named by $COMPOSITOR

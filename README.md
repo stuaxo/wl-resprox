@@ -15,7 +15,7 @@ Phases 1-5 done: proxy core, Shadow Table (guest/host id translation),
 full crash recovery, live-verified against real `labwc`. See
 `docs/plan/plan-0001-proxy-core-and-crash-recovery.md` for the build
 history. Current plan: [`plan-test-harness.md`](plan-test-harness.md)
-(multi-WM verification, packaging) — Phase 9 in progress, sway and kwin done.
+(multi-WM verification, packaging) — Phase 9 in progress, sway, kwin, and mutter done.
 
 ## Documentation
 

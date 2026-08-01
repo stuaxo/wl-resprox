@@ -24,6 +24,21 @@ case "$COMPOSITOR" in
   kwin)
     kwin_wayland --virtual &
     ;;
+  mutter)
+    # gnome-shell needs BOTH a D-Bus session bus and a D-Bus system bus,
+    # unlike labwc/sway/kwin -- missing either one is fatal (not just a
+    # missing-service warning), see docs/debugging-notes.md's 2026-07-31
+    # mutter entry for the live-confirmed crash and root cause. Start two
+    # private buses and export both addresses before launching directly
+    # (not via a `dbus-run-session` wrapper) so `$!` below is gnome-shell's
+    # own pid, not a wrapper's (test-crash.sh's crash step kills `$!`
+    # directly, same reasoning applies here for consistency).
+    DBUS_SESSION_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+    export DBUS_SESSION_BUS_ADDRESS
+    DBUS_SYSTEM_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+    export DBUS_SYSTEM_BUS_ADDRESS
+    gnome-shell --headless --no-x11 &
+    ;;
   *)
     echo "ERROR: no launch case for COMPOSITOR='$COMPOSITOR' -- add one here." >&2
     exit 1
