@@ -42,14 +42,17 @@ for arg in "$@"; do
   esac
 done
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./harness-paths.sh disable=SC1091
+source "$SCRIPT_DIR/harness-paths.sh"
+
 # Optional: only meaningful once XDG_RUNTIME_DIR is set (guarded at each
 # call site below, same defensive style as the rest of this script --
 # run-registry.sh's own `${XDG_RUNTIME_DIR:?...}` guard would otherwise
 # hard-exit, which this diagnostic script never does elsewhere).
-SCRIPT_DIR_FOR_REGISTRY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
   # shellcheck source=./run-registry.sh disable=SC1091
-  source "$SCRIPT_DIR_FOR_REGISTRY/run-registry.sh"
+  source "$SCRIPT_DIR/run-registry.sh"
 fi
 
 ERROR_COUNT=0
@@ -68,11 +71,11 @@ check_environment_errors() {
 }
 
 # Fixed, not derived from this script's own host-side location -- the
-# container only ever mounts the project directory at /workspace (see
-# setup-env.sh), not a host-mirrored path, so this is the one path that's
-# guaranteed to be correct regardless of where the project lives on the
-# host.
-CONTAINER_SCRIPT_PATH="/workspace/scripts/diagnose.sh"
+# container only ever mounts the project directory at $HARNESS_CONTAINER_ROOT
+# (see setup-env.sh), not a host-mirrored path, so this is the one path
+# that's guaranteed to be correct regardless of where the project lives
+# on the host.
+CONTAINER_SCRIPT_PATH="${HARNESS_CONTAINER_ROOT}/scripts/diagnose.sh"
 
 is_inside_container() {
   [[ -n "${CONTAINER_ID:-}" ]]

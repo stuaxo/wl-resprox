@@ -26,7 +26,8 @@ CONTAINER_NAME="wayland-proxy-dev-${WM}"
 IMAGE_TAG="wayland-proxy-dev-${WM}:latest"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-CONTAINER_PROJECT_ROOT="/workspace"
+# shellcheck source=./harness-paths.sh disable=SC1091
+source "$SCRIPT_DIR/harness-paths.sh"
 WM_DIR="${SCRIPT_DIR}/containers/${WM}"
 
 if [[ ! -f "${WM_DIR}/Containerfile" ]]; then
@@ -80,7 +81,7 @@ echo "Starting ${CONTAINER_NAME}..."
 # groups through to `podman exec --user=<name>` (no `:group` override
 # needed), unlike the Distrobox-managed container this replaces, which
 # never did regardless of this flag for reasons never fully root-caused.
-# -v "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT": only the project directory,
+# -v "$PROJECT_ROOT:$HARNESS_CONTAINER_ROOT": only the project directory,
 # at a fixed generic path -- deliberately NOT the whole $HOME the way
 # Distrobox shared it. A whole-$HOME mount means anything the container
 # writes under $HOME lands in the host's real home directory, and on any
@@ -130,7 +131,7 @@ sudo podman run -d --name "${CONTAINER_NAME}" \
   --network host \
   --group-add "${HOST_VIDEO_GID}" --group-add "${HOST_RENDER_GID}" \
   --device /dev/dri \
-  -v "${PROJECT_ROOT}:${CONTAINER_PROJECT_ROOT}" \
+  -v "${PROJECT_ROOT}:${HARNESS_CONTAINER_ROOT}" \
   -v /dev:/dev \
   -v "${HOST_RUNTIME_DIR}:${HOST_RUNTIME_DIR}" \
   "${IMAGE_TAG}" sleep infinity
@@ -161,7 +162,7 @@ echo "Building wayland-proxy .deb (cargo deb)..."
 # fine here, same reasoning as diagnose.sh's own SC2012 disable.
 # shellcheck disable=SC2012
 DEB_PATH="$(ls -t "$PROJECT_ROOT"/target/debian/wayland-proxy_*.deb | head -1)"
-CONTAINER_DEB_PATH="${CONTAINER_PROJECT_ROOT}/${DEB_PATH#"$PROJECT_ROOT"/}"
+CONTAINER_DEB_PATH="${HARNESS_CONTAINER_ROOT}/${DEB_PATH#"$PROJECT_ROOT"/}"
 
 echo "Installing $(basename "$DEB_PATH") into ${CONTAINER_NAME}..."
 sudo podman exec --user dev "${CONTAINER_NAME}" sudo dpkg -i "${CONTAINER_DEB_PATH}"

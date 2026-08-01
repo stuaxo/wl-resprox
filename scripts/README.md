@@ -40,6 +40,8 @@ Rust toolchain at all (see ADR-0003).
     │                    # one implementation of each WM's headless-launch quirks
     ├── socket-wait.sh   # sourced by test-crash.sh/test-crash-swap.sh:
     │                    # "did a new compositor socket appear" detection
+    ├── harness-paths.sh # sourced by setup-env.sh/start-guest.sh/diagnose.sh:
+    │                    # the one shared container-mount-point constant
     ├── self-test.sh     # per-WM smoke test, run from the HOST (see step 6 below)
     ├── test-matrix.sh   # loops self-test.sh over every Phase 9 WM (step 6)
     └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest

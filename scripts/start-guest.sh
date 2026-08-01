@@ -33,21 +33,20 @@ done
 HOST_DISPLAY="${HOST_DISPLAY:-wayland-0}"
 
 CONTAINER_NAME="wayland-proxy-dev-${WM}"
-# Fixed, not derived from this script's own host-side location -- the
-# container only ever mounts the project directory at /workspace (see
-# setup-env.sh), not a host-mirrored path.
-CONTAINER_PROJECT_ROOT="/workspace"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./harness-paths.sh disable=SC1091
+source "$SCRIPT_DIR/harness-paths.sh"
 
 echo "Starting nested compositor in '${CONTAINER_NAME}' (host display: ${HOST_DISPLAY})..."
 sudo podman exec --user dev:render \
   -e WAYLAND_DISPLAY="$HOST_DISPLAY" \
   -e XDG_RUNTIME_DIR="/run/user/1000" \
-  "$CONTAINER_NAME" bash "${CONTAINER_PROJECT_ROOT}/scripts/entrypoint.sh"
+  "$CONTAINER_NAME" bash "${HARNESS_CONTAINER_ROOT}/scripts/entrypoint.sh"
 
 echo ""
 echo "Entering '${CONTAINER_NAME}' interactively for testing..."
 sudo podman exec -it --user dev:render \
   -e WAYLAND_DISPLAY="$HOST_DISPLAY" \
   -e XDG_RUNTIME_DIR="/run/user/1000" \
-  -w "${CONTAINER_PROJECT_ROOT}" \
+  -w "${HARNESS_CONTAINER_ROOT}" \
   "$CONTAINER_NAME" bash
