@@ -116,8 +116,16 @@ fail() {
     exit 1
 }
 
-echo "== Building proxy on host =="
-( cd "$PROJECT_DIR" && cargo build --quiet ) || fail "cargo build failed"
+# Per ADR-0003, the harness never builds the proxy from source itself.
+# On the host (unlike inside a container) that means the release binary
+# `cargo deb` already produced as a build byproduct, not a system-wide
+# `dpkg -i` -- this is a dev machine, not a disposable container. Both
+# containers already had to exist (checked above), which means
+# setup-env.sh already ran `cargo deb` for at least one of them, so this
+# should already be here; the check exists to fail clearly rather than
+# with a confusing "no such file" if it somehow isn't.
+PROXY_BIN="$PROJECT_DIR/target/release/wayland-proxy"
+[[ -x "$PROXY_BIN" ]] || fail "$PROXY_BIN not found -- run ./scripts/setup-env.sh --wm=<name> first (it builds this as a byproduct of packaging the .deb)"
 
 echo "== Starting ${FROM}'s compositor in ${FROM_CONTAINER} =="
 before="$(snapshot_live_sockets)"
@@ -136,7 +144,7 @@ echo "${FROM} socket: $FROM_DISPLAY"
 
 echo "== Starting proxy on host (-> $FROM_DISPLAY) =="
 rm -f "$RUNTIME_DIR/$PROXY_DISPLAY"
-WAYLAND_DISPLAY="$FROM_DISPLAY" "$PROJECT_DIR/target/debug/wayland-proxy" \
+WAYLAND_DISPLAY="$FROM_DISPLAY" "$PROXY_BIN" \
     > "$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 run_track proxy "$PROXY_PID"

@@ -48,7 +48,6 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 CLIENT_APP="gtk4-demo"
 CHECK_L1=false
 for arg in "$@"; do
@@ -109,8 +108,10 @@ fail() {
     exit 1
 }
 
-echo "== Building proxy =="
-( cd "$PROJECT_DIR" && cargo build --quiet ) || fail "cargo build failed"
+# Consumes the .deb setup-env.sh already installed -- per ADR-0003, the
+# harness never builds the proxy from source itself (see that ADR's
+# "Negative consequences" for why this used to be a `cargo build` here).
+command -v wayland-proxy >/dev/null || fail "wayland-proxy not installed -- run ./scripts/setup-env.sh --wm=$COMPOSITOR first"
 
 echo "== Starting headless compositor =="
 # 20s budget (80 x 0.25s, see socket-wait.sh), not 5s -- confirmed via
@@ -133,7 +134,7 @@ echo "Compositor socket: $COMPOSITOR_DISPLAY (pid $COMPOSITOR_PID)"
 
 echo "== Starting proxy (-> $COMPOSITOR_DISPLAY) =="
 rm -f "$RUNTIME_DIR/$PROXY_DISPLAY"
-WAYLAND_DISPLAY="$COMPOSITOR_DISPLAY" "$PROJECT_DIR/target/debug/wayland-proxy" \
+WAYLAND_DISPLAY="$COMPOSITOR_DISPLAY" wayland-proxy \
     > "$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 run_track proxy "$PROXY_PID"

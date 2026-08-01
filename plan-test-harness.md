@@ -28,10 +28,12 @@ Matrix default: L1. L2 on demand per-container.
       `Containerfile`).
 - [x] **Open Q resolved:** harness stays in this repo for now. Revisit
       once Phase 7/8 packaging proves the boundary holds.
-- [ ] Harness must only ever consume a built proxy artifact, never
-      `cargo build` the proxy inside a WM container. Known, accepted
-      exception right now: `test-crash.sh` still builds from source --
-      fine until Phase 7 exists, not to be left indefinitely.
+- [x] Harness must only ever consume a built proxy artifact, never
+      `cargo build` the proxy inside a WM container. Done (Phase 8):
+      `setup-env.sh` builds the `.deb` once and `dpkg -i`'s it into the
+      container; `test-crash.sh`/`test-crash-swap.sh` consume the
+      installed/built binary instead of compiling it themselves. See
+      ADR-0003's now-resolved "Negative consequences" entry.
 
 ## Phase 7: Package the proxy
 
@@ -66,17 +68,30 @@ Matrix default: L1. L2 on demand per-container.
       `postinst`/`postrm` for enable/disable) once that packaging work
       starts.
 
-## Phase 8: Package the harness — deferred
+## Phase 8: Package the harness — in progress
 
-Skipping for now: the harness's shape is still changing (Phase 9 adds
-per-WM containers, Phase 10 an automated runner), so packaging it before
-that settles would mean repackaging repeatedly. Revisit once Phase 9/10
-land and the harness stops changing shape every session. Original scope,
-unchanged, picked back up then: enumerate artifacts (container defs,
-crash-inducer, verification logic, VNC wiring -- container defs may ship
-as data files, not baked in), a real `debian/` control file replacing
-ad-hoc `scripts/*.sh`, verify clean install with no dependency on this
-repo's working tree.
+Picked back up now that Phase 9/10 have landed and the harness has
+stopped changing shape every session. Doing this iteratively rather than
+as one big cutover -- each slice verified live (full test-matrix.sh
+pass) before moving to the next.
+
+- [x] Close the ADR-0003 debt: harness no longer ever invokes `cargo
+      build`/`cargo deb` per-container-per-run. `setup-env.sh` builds
+      the `.deb` once (host-side) and `dpkg -i`'s it into the container
+      as part of provisioning; `test-crash.sh` uses the installed
+      `wayland-proxy` from `PATH`, `test-crash-swap.sh` uses
+      `target/release/wayland-proxy` (the build byproduct) for its
+      host-side proxy. Verified: full 4-WM `test-matrix.sh` pass with
+      zero `cargo build` inside any container.
+- [ ] Enumerate the remaining artifacts (container defs, crash-inducer,
+      verification logic, VNC wiring -- container defs may ship as data
+      files, not baked into a git-checkout-relative path).
+- [ ] A real `debian/` control file for the harness itself, replacing
+      ad-hoc `scripts/*.sh` invocation as the primary interface.
+- [ ] Verify clean install with no dependency on this repo's working
+      tree (today every script still assumes `$SCRIPT_DIR`/`/workspace`
+      -- a git checkout bind-mounted into each container -- which an
+      installed package can't assume).
 
 ## Phase 9: Per-WM containers
 

@@ -144,6 +144,28 @@ sudo podman exec --user dev "${CONTAINER_NAME}" bash -c '
   echo "groups: $(groups)"
 '
 
+# ADR-0003: "the harness must only ever consume a built proxy artifact
+# ... never invoke cargo build against the proxy's own source from a
+# harness script or inside a WM container." test-crash.sh used to run
+# `cargo build` itself, inside every container, on every single run --
+# a direct violation, accepted only until Phase 7's packaging landed.
+# It has now: build the .deb here, once, on the host, and install it
+# into the container -- the actual installation path this project would
+# use in practice, not a proxy for it. Every WM container gets the exact
+# same built artifact, matching the ADR's "installing the same built
+# artifact everywhere" reasoning, rather than each one rebuilding from
+# source independently.
+echo "Building wayland-proxy .deb (cargo deb)..."
+( cd "$PROJECT_ROOT" && cargo deb --quiet )
+# cargo-deb's own output, not adversarial/arbitrary input -- ls -t is
+# fine here, same reasoning as diagnose.sh's own SC2012 disable.
+# shellcheck disable=SC2012
+DEB_PATH="$(ls -t "$PROJECT_ROOT"/target/debian/wayland-proxy_*.deb | head -1)"
+CONTAINER_DEB_PATH="${CONTAINER_PROJECT_ROOT}/${DEB_PATH#"$PROJECT_ROOT"/}"
+
+echo "Installing $(basename "$DEB_PATH") into ${CONTAINER_NAME}..."
+sudo podman exec --user dev "${CONTAINER_NAME}" sudo dpkg -i "${CONTAINER_DEB_PATH}"
+
 echo ''
 echo '======================================'
 echo 'Environment successfully provisioned!'

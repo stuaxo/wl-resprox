@@ -32,6 +32,6 @@ Deferring the repository split avoids paying that cost before the boundary is pr
 
 Negative
 
-test-crash.sh currently runs `cargo build --quiet` against the proxy's own source -- a direct violation of the "never cargo build inside the harness" rule above. Acceptable for now, since no packaged artifact exists yet (Phase 7 isn't done), but not something to leave indefinitely: it needs switching to a built artifact once Phase 7 lands, not treated as settled.
+~~test-crash.sh currently runs `cargo build --quiet` against the proxy's own source -- a direct violation of the "never cargo build inside the harness" rule above.~~ **Resolved** (2026-08-01, Phase 8): `setup-env.sh` now builds the `.deb` once per invocation (`cargo deb`) and installs it into the container via `dpkg -i`; `test-crash.sh`/`test-crash-swap.sh` consume the resulting `wayland-proxy` binary (from `PATH` inside a container, or `target/release/wayland-proxy` on the host for the swap test's host-side proxy) and no longer invoke `cargo build`/`cargo deb` themselves. Verified live: full 4-WM matrix (`./scripts/test-matrix.sh`) passes with the containers no longer ever compiling the proxy.
 
 Keeping proxy and harness in one repo means their git history stays entangled. A future split, if the "stay here for now" call is revisited, will need to disentangle that history if it matters -- a deferred cost, not an eliminated one.
