@@ -38,12 +38,15 @@ if ! CARGO_TARGET_DIR="$PROJECT_DIR/target-host" cargo test --quiet --manifest-p
     exit 1
 fi
 
-echo "pre-commit: shellcheck scripts/*.sh..."
+echo "pre-commit: shellcheck scripts/*.sh, packaging/..."
 if ! command -v shellcheck >/dev/null; then
     echo "pre-commit: shellcheck not found -- install it (e.g. sudo apt-get install shellcheck) -- commit aborted." >&2
     exit 1
 fi
-if ! shellcheck "$PROJECT_DIR"/scripts/*.sh; then
+# packaging/harness/wayland-headless-harness has no .sh extension (it's
+# the installed CLI binary's own name) -- named explicitly rather than
+# globbed by extension.
+if ! shellcheck "$PROJECT_DIR"/scripts/*.sh "$PROJECT_DIR"/packaging/*.sh "$PROJECT_DIR"/packaging/harness/wayland-headless-harness; then
     echo "pre-commit: shellcheck failed -- commit aborted." >&2
     exit 1
 fi

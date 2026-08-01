@@ -1,19 +1,33 @@
-# Wayland Proxy Dev Environment
+# Wayland Headless Test Harness
 
 Builds a `podman` container (Ubuntu 26.04) per window manager, for
-testing the Wayland proxy against each one. Includes GTK4 and Wayland
-tooling; the compositor itself is whichever `--wm=<name>` you pick
-(default `labwc`). No Distrobox — see `containers/labwc/Containerfile`'s
+reproducing Wayland client/compositor protocol issues against real
+compositor implementations -- headless, no full desktop session needed
+on the host. Includes GTK4 and Wayland tooling; the compositor itself is
+whichever `--wm=<name>` you pick (`labwc`, `sway`, `kwin`, or `mutter`;
+default `labwc`). No Distrobox — see `containers/labwc/Containerfile`'s
 header for why.
 
-A proxy under test is optional and installed into each container by
-`setup-env.sh` as a `.deb` -- containers don't need a Rust toolchain at
-all (see ADR-0003). By default it auto-detects and builds `wayland-proxy`
-from this repo (`cargo deb`) if checked out alongside `scripts/`; pass
-`--proxy-deb=<path>` to install a specific `.deb` instead (doesn't have
-to be `wayland-proxy`, or built from this repo). With neither, the
-container is still fully usable for compositor/client debugging on its
-own -- only the proxy-specific test scripts need one installed.
+A proxy under test (e.g. `wayland-proxy`, the project this harness
+started life alongside) is entirely optional -- the container matrix
+and diagnostics work standalone, with no proxy involved, for
+straightforward compositor/client debugging. When you do want one
+installed, `setup-env.sh` handles it as a `.deb`; containers don't need
+a Rust toolchain at all (see ADR-0003). By default it auto-detects and
+builds `wayland-proxy` (`cargo deb`) if this is checked out alongside
+`wayland-proxy`'s own `Cargo.toml`; pass `--proxy-deb=<path>` to install
+a specific `.deb` instead (doesn't have to be `wayland-proxy`, or built
+from any particular checkout).
+
+**Two ways to use this:**
+- **In place, from a git checkout** (this document's own instructions
+  below) -- `./scripts/setup-env.sh`, etc., run directly.
+- **Installed as a package** (`packaging/build-harness-deb.sh` builds
+  `wayland-headless-harness_<version>_all.deb`; `sudo dpkg -i` it) --
+  gives a `wayland-headless-harness <command>` CLI (`setup`, `teardown`,
+  `test-crash`, `matrix`, ...) instead of invoking scripts directly. Same
+  underlying scripts either way; see `packaging/harness/wayland-headless-harness`'s
+  own `help` output for the full command list.
 
 ## Project layout
 
@@ -50,6 +64,13 @@ own -- only the proxy-specific test scripts need one installed.
     ├── self-test.sh     # per-WM smoke test, run from the HOST (see step 6 below)
     ├── test-matrix.sh   # loops self-test.sh over every Phase 9 WM (step 6)
     └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest
+
+debian/control              # package metadata for wayland-headless-harness
+packaging/
+├── build-harness-deb.sh    # builds the .deb from scripts/ + the CLI dispatcher
+├── harness/
+│   └── wayland-headless-harness  # CLI dispatcher, installed to /usr/bin/
+└── wayland-proxy.service   # systemd --user unit, packaged with wayland-proxy itself
 ```
 
 All of `setup-env.sh`, `teardown-env.sh`, and `start-guest.sh` take a

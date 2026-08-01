@@ -1,0 +1,16 @@
+Package: wayland-headless-harness
+Architecture: all
+Maintainer: Stuart Axon <stuaxo2@yahoo.com>
+Depends: bash, psmisc, iproute2, podman, sudo
+Section: net
+Priority: optional
+Description: Headless multi-compositor Wayland test harness
+ Spins up headless, containerized instances of labwc, sway, kwin, and
+ gnome-shell (mutter) for reproducing Wayland client/compositor
+ protocol issues across real compositor implementations, without
+ needing a full desktop session on the host.
+ .
+ Includes crash/reconnect testing tooling for an optional proxy under
+ test (e.g. wayland-proxy) -- the container matrix and diagnostics work
+ standalone too, with no proxy involved, for straightforward
+ compositor/client debugging.

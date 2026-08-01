@@ -68,7 +68,7 @@ Matrix default: L1. L2 on demand per-container.
       `postinst`/`postrm` for enable/disable) once that packaging work
       starts.
 
-## Phase 8: Package the harness — in progress
+## Phase 8: Package the harness — done
 
 Picked back up now that Phase 9/10 have landed and the harness has
 stopped changing shape every session. Doing this iteratively rather than
@@ -126,18 +126,48 @@ unchanged; packaging is additive. See `docs/debugging-notes.md`'s
       at all (correctly provisions with the "no proxy" message and
       stays fully usable via `diagnose.sh`). Full 4-WM `test-matrix.sh`
       pass confirms zero regression to the default path.
-- [ ] Enumerate the remaining artifacts (container defs, crash-inducer,
-      verification logic, VNC wiring -- container defs may ship as data
-      files, not baked into a git-checkout-relative path).
-- [ ] A real `debian/` control file for a general-purpose harness
-      package (proposed name `wayland-headless-harness`, open to
-      change), replacing ad-hoc `scripts/*.sh` invocation with a thin
-      CLI dispatcher as the primary interface.
-- [ ] `docs/adr/adr-0003-proxy-harness-boundary.md`: update the "never
-      shipped to an end user" line to reflect the repositioning.
-- [ ] Verify clean install with no dependency on this repo's working
-      tree, via a scratch environment with no checkout reference at
-      all (stronger proof than testing from inside the checkout).
+- [x] Mount `scripts/` itself into containers, not its parent checkout
+      (`setup-env.sh` now mounts `$SCRIPT_DIR`, not `$PROJECT_ROOT`, at
+      `$HARNESS_CONTAINER_ROOT`; every container-side reference dropped
+      the redundant `/scripts` suffix) -- confirmed via grep that
+      nothing inside a container needed anything outside `scripts/`
+      once the proxy `.deb` stopped relying on the bind mount (see the
+      item above). Makes `$HARNESS_CONTAINER_ROOT` mean the same thing
+      whether mounted from a checkout or an installed package. Verified:
+      full 4-WM `test-matrix.sh` pass, plus `test-crash-swap.sh` and
+      `entrypoint.sh`'s interactive path.
+- [x] `debian/control` + `packaging/build-harness-deb.sh` +
+      `packaging/harness/wayland-headless-harness` (CLI dispatcher,
+      `setup`/`teardown`/`test-crash`/`matrix`/... forwarding to the
+      installed scripts). Package name: `wayland-headless-harness`.
+      Deliberately built via `dpkg-deb --build` against a hand-staged
+      tree rather than `dpkg-buildpackage`/debhelper -- pure scripts +
+      data files, no compilation, and a hand-built `DEBIAN/control` is
+      an equally real, equally installable `.deb` with far less
+      machinery to get wrong for a first pass. Verified live: builds,
+      `dpkg -i`'s cleanly (with its declared deps: bash, psmisc,
+      iproute2, podman, sudo -- `sudo` was missing from the first
+      attempt, caught by testing in a truly bare scratch container),
+      correct file layout (`/usr/lib/wayland-headless-harness/`,
+      `/usr/bin/wayland-headless-harness`), and `-x`-traced confirmation
+      that `setup --wm=sway` run from the *installed* location resolves
+      every path correctly (Containerfile, `SCRIPT_DIR`, `PROJECT_ROOT`)
+      before hitting an unrelated nested-podman-in-podman virtualization
+      limitation of the scratch container itself (not a packaging bug --
+      not chased further since proving that isn't what this item is
+      about). Enumerating "remaining artifacts" turned out to already be
+      complete: scripts + `containers/` (Containerfiles and WM configs,
+      shipped as data files) are everything the harness has.
+- [x] `docs/adr/adr-0003-proxy-harness-boundary.md`: updated the "never
+      shipped to an end user" line and noted the repo-split question
+      this ADR deferred is now, per its own text, ripe for revisiting
+      (two independently-installable `.deb`s built cleanly from one
+      repo) -- not acted on, a separate decision with its own cost.
+
+**Phase 8 done.** `wayland-headless-harness` is a real, installable
+package with no dependency on this repo's working tree for its own
+logic; the in-place git-checkout dev workflow this whole project's
+development has used stays fully supported, unchanged, alongside it.
 
 ## Phase 9: Per-WM containers
 

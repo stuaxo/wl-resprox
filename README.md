@@ -15,9 +15,11 @@ Phases 1-5 done: proxy core, Shadow Table (guest/host id translation),
 full crash recovery, live-verified against real `labwc`. See
 `docs/plan/plan-0001-proxy-core-and-crash-recovery.md` for the build
 history. Current plan: [`plan-test-harness.md`](plan-test-harness.md)
-(multi-WM verification, packaging) — Phases 9 and 10 done (all four WMs
-pass an automated L1 matrix, `./scripts/test-matrix.sh`); Phase 8
-(harness packaging) next.
+(multi-WM verification, packaging) — Phases 6-10 all done: all four WMs
+pass an automated L1 matrix (`./scripts/test-matrix.sh`), and the test
+harness is now also its own installable, general-purpose package
+(`wayland-headless-harness`), independent of this project's own git
+checkout -- see `scripts/README.md`.
 
 ## Documentation
 
@@ -37,9 +39,9 @@ Enable the pre-commit hook once per clone:
 ```bash
 git config core.hooksPath .githooks
 ```
-Runs `cargo test`, `shellcheck` on `scripts/*.sh`, and an environment
-sanity check on every commit — silent on success, see `.githooks/pre-commit`
-for details. Needs `shellcheck` on the host:
+Runs `cargo test`, `shellcheck` on `scripts/*.sh`/`packaging/`, and an
+environment sanity check on every commit — silent on success, see
+`.githooks/pre-commit` for details. Needs `shellcheck` on the host:
 ```bash
 sudo apt install shellcheck   # Ubuntu/Debian
 ```
