@@ -9,9 +9,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSITOR="${COMPOSITOR:?COMPOSITOR must be set -- baked into the image by scripts/containers/<wm>/Containerfile}"
 
+# shellcheck source=./run-registry.sh disable=SC1091
+source "$SCRIPT_DIR/run-registry.sh"
+run_dir_init
+# Unlike test-crash.sh, this script doesn't clean up after itself (the
+# whole point is to leave the nested compositor running for the
+# interactive shell start-guest.sh drops you into next) -- so nothing
+# here calls run_cleanup. Tracking pids is still worth it purely for
+# `cat`-ability: `$XDG_RUNTIME_DIR/wayland-proxy-runs/current/chain`
+# gives a manual debugging session one place to check "what's actually
+# running and what's its pid" instead of `pgrep`-ing around, which is
+# exactly the friction that motivated this (see run-registry.sh's own
+# header and the 2026-07-31 mutter entry in docs/debugging-notes.md for
+# the DBUS_SESSION_BUS_ADDRESS-shuttling-between-podman-exec-calls
+# version of the same problem).
+
 echo "Guest sees WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}, COMPOSITOR=${COMPOSITOR}"
 echo "Sockets visible before starting nested compositor:"
-ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null || echo "  (none)"
+ls "$XDG_RUNTIME_DIR"/wayland-*[0-9] 2>/dev/null || echo "  (none)"
 
 echo "Starting nested ${COMPOSITOR}..."
 case "$COMPOSITOR" in
@@ -33,10 +48,14 @@ case "$COMPOSITOR" in
     # (not via a `dbus-run-session` wrapper) so `$!` below is gnome-shell's
     # own pid, not a wrapper's (test-crash.sh's crash step kills `$!`
     # directly, same reasoning applies here for consistency).
-    DBUS_SESSION_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+    session_out="$(dbus-daemon --session --fork --print-address --print-pid)"
+    DBUS_SESSION_BUS_ADDRESS="$(head -1 <<< "$session_out")"
     export DBUS_SESSION_BUS_ADDRESS
-    DBUS_SYSTEM_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+    run_track dbus-session "$(tail -1 <<< "$session_out")"
+    system_out="$(dbus-daemon --session --fork --print-address --print-pid)"
+    DBUS_SYSTEM_BUS_ADDRESS="$(head -1 <<< "$system_out")"
     export DBUS_SYSTEM_BUS_ADDRESS
+    run_track dbus-system "$(tail -1 <<< "$system_out")"
     gnome-shell --headless --no-x11 &
     ;;
   *)
@@ -44,13 +63,14 @@ case "$COMPOSITOR" in
     exit 1
     ;;
 esac
+run_track compositor "$!"
 
 # 5s, not 2s -- sway confirmed live to need more than 2s here at least
 # once; labwc is usually faster but this costs little either way.
 sleep 5
 
 echo "Sockets visible after starting nested compositor:"
-ls "$XDG_RUNTIME_DIR"/wayland-*
+ls "$XDG_RUNTIME_DIR"/wayland-*[0-9]
 
 echo ""
 echo "If a new wayland-N socket appeared above (distinct from \$WAYLAND_DISPLAY),"

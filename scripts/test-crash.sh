@@ -22,6 +22,14 @@
 # Doesn't restart the compositor either, so it doesn't exercise
 # reconnect/recreation -- see plan-test-harness.md for the fuller
 # testing-levels picture and why this stays a narrow L0 check.
+#
+# Every pid/socket this script starts is also recorded via
+# run-registry.sh, under $XDG_RUNTIME_DIR/wayland-proxy-runs/<run-id>/
+# (printed at startup, also reachable via that directory's `current`
+# symlink) -- `cat` the `chain` file there for a human-readable log of
+# what belongs to what, or point diagnose.sh at it. Not required reading
+# to use this script; it exists for when something gets stuck and the
+# usual `ps`/`fuser` archaeology isn't enough.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +40,10 @@ COMPOSITOR="${COMPOSITOR:?COMPOSITOR must be set -- baked into the image by scri
 RUNTIME_DIR="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}"
 PROXY_DISPLAY="wayland-proxy-0" # fixed name the proxy binds, see src/main.rs
 
+# shellcheck source=./run-registry.sh disable=SC1091
+source "$SCRIPT_DIR/run-registry.sh"
+run_dir_init
+
 COMPOSITOR_LOG="$(mktemp)"
 PROXY_LOG="$(mktemp)"
 CLIENT_LOG="$(mktemp)"
@@ -39,8 +51,6 @@ CLIENT_LOG="$(mktemp)"
 COMPOSITOR_PID=""
 PROXY_PID=""
 CLIENT_PID=""
-DBUS_SESSION_DAEMON_PID="" # mutter only -- see its case below
-DBUS_SYSTEM_DAEMON_PID=""  # mutter only -- see its case below
 
 # Invoked indirectly via `trap cleanup EXIT` below -- shellcheck's
 # reachability analysis can't trace that, hence disabling both "never
@@ -48,14 +58,20 @@ DBUS_SYSTEM_DAEMON_PID=""  # mutter only -- see its case below
 # body (SC2317).
 # shellcheck disable=SC2329,SC2317
 cleanup() {
+    local exit_status=$? # must be captured before any other command runs
     echo ""
     echo "Cleaning up..."
-    for pid in "$CLIENT_PID" "$PROXY_PID" "$COMPOSITOR_PID" "$DBUS_SESSION_DAEMON_PID" "$DBUS_SYSTEM_DAEMON_PID"; do
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-    done
+    run_cleanup
     rm -f "$COMPOSITOR_LOG" "$PROXY_LOG" "$CLIENT_LOG"
+    # Only discard the run directory on a clean pass -- on failure, keep
+    # it (chain file + per-role pid/container/socket records) for
+    # postmortem inspection instead of erasing the one thing this exists
+    # for right when it'd actually be useful.
+    if [[ "$exit_status" -eq 0 ]]; then
+        rm -rf "$RUN_DIR"
+    else
+        echo "Run directory kept for inspection: $RUN_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -148,11 +164,11 @@ case "$COMPOSITOR" in
         session_out="$(dbus-daemon --session --fork --print-address --print-pid)"
         DBUS_SESSION_BUS_ADDRESS="$(head -1 <<< "$session_out")"
         export DBUS_SESSION_BUS_ADDRESS
-        DBUS_SESSION_DAEMON_PID="$(tail -1 <<< "$session_out")"
+        run_track dbus-session "$(tail -1 <<< "$session_out")"
         system_out="$(dbus-daemon --session --fork --print-address --print-pid)"
         DBUS_SYSTEM_BUS_ADDRESS="$(head -1 <<< "$system_out")"
         export DBUS_SYSTEM_BUS_ADDRESS
-        DBUS_SYSTEM_DAEMON_PID="$(tail -1 <<< "$system_out")"
+        run_track dbus-system "$(tail -1 <<< "$system_out")"
         gnome-shell --headless --no-x11 > "$COMPOSITOR_LOG" 2>&1 &
         ;;
     *)
@@ -160,6 +176,7 @@ case "$COMPOSITOR" in
         ;;
 esac
 COMPOSITOR_PID=$!
+run_track compositor "$COMPOSITOR_PID"
 
 # 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow
 # start here isn't necessarily a hang: labwc walks several theme
@@ -186,6 +203,7 @@ for _ in $(seq 1 80); do
     sleep 0.25
 done
 [[ -n "$COMPOSITOR_DISPLAY" ]] || fail "headless compositor never created a socket"
+run_link_socket compositor "$RUNTIME_DIR/$COMPOSITOR_DISPLAY"
 echo "Compositor socket: $COMPOSITOR_DISPLAY (pid $COMPOSITOR_PID)"
 
 echo "== Starting proxy (-> $COMPOSITOR_DISPLAY) =="
@@ -193,6 +211,7 @@ rm -f "$RUNTIME_DIR/$PROXY_DISPLAY"
 WAYLAND_DISPLAY="$COMPOSITOR_DISPLAY" "$PROJECT_DIR/target/debug/wayland-proxy" \
     > "$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
+run_track proxy "$PROXY_PID"
 
 for _ in $(seq 1 20); do
     [[ -e "$RUNTIME_DIR/$PROXY_DISPLAY" ]] && break
@@ -200,11 +219,13 @@ for _ in $(seq 1 20); do
     sleep 0.25
 done
 [[ -e "$RUNTIME_DIR/$PROXY_DISPLAY" ]] || fail "proxy never created $PROXY_DISPLAY"
+run_link_socket proxy "$RUNTIME_DIR/$PROXY_DISPLAY"
 echo "Proxy socket: $PROXY_DISPLAY (pid $PROXY_PID)"
 
 echo "== Starting client ($CLIENT_APP) through the proxy =="
 WAYLAND_DISPLAY="$PROXY_DISPLAY" "$CLIENT_APP" > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
+run_track client "$CLIENT_PID"
 
 sleep 2
 kill -0 "$CLIENT_PID" 2>/dev/null || fail "$CLIENT_APP exited before the crash even happened"

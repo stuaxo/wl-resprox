@@ -42,6 +42,16 @@ for arg in "$@"; do
   esac
 done
 
+# Optional: only meaningful once XDG_RUNTIME_DIR is set (guarded at each
+# call site below, same defensive style as the rest of this script --
+# run-registry.sh's own `${XDG_RUNTIME_DIR:?...}` guard would otherwise
+# hard-exit, which this diagnostic script never does elsewhere).
+SCRIPT_DIR_FOR_REGISTRY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  # shellcheck source=./run-registry.sh disable=SC1091
+  source "$SCRIPT_DIR_FOR_REGISTRY/run-registry.sh"
+fi
+
 ERROR_COUNT=0
 report_error() {
   echo "ERROR: $1"
@@ -242,11 +252,63 @@ print_wayvnc_port() {
   fi
 }
 
+# test-crash.sh/entrypoint.sh's run-registry.sh entries -- see that
+# file's own header. Same directory viewed from host or guest (it's
+# bind-mounted, like every other $XDG_RUNTIME_DIR content this script
+# reports on), so this is deliberately shown under both labels, same as
+# print_wayland_sockets above -- consistent content on both sides is
+# itself a confirmation the bind mount is intact, and if it isn't,
+# whichever side shows an empty/missing directory tells you which one.
+print_run_registry() {
+  if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    section "$1: run registry"
+    echo "(XDG_RUNTIME_DIR not set)"
+    return
+  fi
+  section "$1: run registry"
+  local root="$XDG_RUNTIME_DIR/wayland-proxy-runs"
+  if [[ ! -d "$root" ]]; then
+    echo "(none yet -- $root doesn't exist)"
+    return
+  fi
+  local current=""
+  [[ -L "$root/current" ]] && current="$(readlink "$root/current")"
+  local dir run_id pidfile role container pid alive any=false
+  for dir in "$root"/*/; do
+    [[ -d "$dir" ]] || continue
+    run_id="$(basename "$dir")"
+    # `*/ ` matches the `current` symlink too, since it points at a
+    # directory -- skip it explicitly, it's not a run of its own.
+    [[ "$run_id" == "current" ]] && continue
+    any=true
+    if [[ "$run_id" == "$current" ]]; then
+      echo "  ${run_id} (current):"
+    else
+      echo "  ${run_id}:"
+    fi
+    for pidfile in "$dir"*.pid; do
+      [[ -e "$pidfile" ]] || continue
+      role="$(basename "$pidfile" .pid)"
+      container="$(sed -n '1p' "$pidfile")"
+      pid="$(sed -n '2p' "$pidfile")"
+      if declare -F run_is_alive >/dev/null; then
+        alive="dead"
+        run_is_alive "$role" "$dir" && alive="alive"
+      else
+        alive="not checked"
+      fi
+      echo "    ${role}: container=${container} pid=${pid} (${alive})"
+    done
+  done
+  $any || echo "(none)"
+}
+
 run_guest_checks() {
   print_summary "GUEST"
   print_wayland_sockets "GUEST"
   print_labwc_processes "GUEST"
   print_x11_contention "GUEST"
+  print_run_registry "GUEST"
 }
 
 run_host_checks() {
@@ -255,6 +317,10 @@ run_host_checks() {
   print_labwc_processes "HOST"
   print_x11_contention "HOST"
   print_wayvnc_port
+  print_run_registry "HOST"
+  if [[ -n "${XDG_RUNTIME_DIR:-}" ]] && declare -F run_gc_stale_runs >/dev/null; then
+    run_gc_stale_runs
+  fi
 }
 
 pull_guest_diagnostics() {

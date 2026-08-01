@@ -222,11 +222,20 @@ scripts eventually:
   Motivated live: mistook this session's own long-running `start-host.sh`
   labwc for an unrelated host session, purely from not having cmdline and
   socket in the same view.
-- A cleanup script for stray/zombie compositor processes and stale
-  sockets — done ad hoc many times this session (manual `pgrep`+`fuser`+
-  `kill`, including a self-matching `pkill` mistake more than once).
-  Folding into `diagnose.sh` as an action mode, or a separate
-  `scripts/cleanup.sh`, are both reasonable; not decided.
+- ~~A cleanup script for stray/zombie compositor processes and stale
+  sockets~~ — done: `scripts/run-registry.sh` (sourced by
+  `test-crash.sh`/`entrypoint.sh`), one directory per run under
+  `$XDG_RUNTIME_DIR/wayland-proxy-runs/<run-id>/` recording every tracked
+  pid's container, pid, and process-identity, plus symlinks to the
+  sockets in play. `run_cleanup` kills by literal pid (confirmed still
+  the same process instance first -- no more `pkill -f` pattern-matching
+  self-hits), `run_gc_stale_runs` reaps directories whose pids are all
+  confirmed dead (fails closed on anything it can't verify), and a
+  failed `test-crash.sh` run keeps its directory around for postmortem
+  instead of deleting the one thing that'd help debug it. `diagnose.sh`
+  surfaces the registry under a new "run registry" section. Chosen over
+  a separate `scripts/cleanup.sh` since the existing scripts already had
+  the right hook points (pid assignment, trap-based cleanup).
 - Detecting which compositors/WMs are installed and which are currently
   running, on host and per-container — relevant once Phase 9's matrix has
   more than two entries and Phase 10 needs to reason about it

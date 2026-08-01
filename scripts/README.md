@@ -28,6 +28,8 @@ pick (default `labwc`). No Distrobox — see
     ├── start-guest.sh   # enters the container, runs entrypoint.sh, then
     │                    # drops you into an interactive shell for testing
     ├── test-crash.sh    # automated crash/reconnect check (see step 4 below)
+    ├── run-registry.sh  # sourced by entrypoint.sh/test-crash.sh: tracks
+    │                    # each run's pids/containers/sockets in one place
     └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest
 ```
 
