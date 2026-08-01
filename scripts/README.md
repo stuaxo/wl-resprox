@@ -28,8 +28,12 @@ pick (default `labwc`). No Distrobox — see
     ├── start-guest.sh   # enters the container, runs entrypoint.sh, then
     │                    # drops you into an interactive shell for testing
     ├── test-crash.sh    # automated crash/reconnect check (see step 4 below)
+    ├── test-crash-swap.sh # cross-compositor swap check, run from the HOST
+    │                    # (see plan-test-harness.md's "Cross-compositor swap")
     ├── run-registry.sh  # sourced by entrypoint.sh/test-crash.sh: tracks
     │                    # each run's pids/containers/sockets in one place
+    ├── compositor-launch.sh # sourced by all three test/entrypoint scripts:
+    │                    # one implementation of each WM's headless-launch quirks
     └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest
 ```
 

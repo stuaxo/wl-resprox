@@ -17,11 +17,16 @@
 # entrypoint.sh's interactive use, where output should land straight on
 # the terminal; test-crash.sh passes its own mktemp'd log path.
 #
+# [role] is optional, defaults to "compositor" -- test-crash-swap.sh
+# overrides it (e.g. "compositor-sway", "compositor-kwin") so a run
+# spanning two compositors in two containers keeps a distinct pid/socket
+# record for each instead of the second launch overwriting the first's.
+#
 # Tracks the compositor pid via run-registry.sh's run_track as a side
 # effect (requires $RUN_DIR to already be set) -- every caller gets this
 # for free rather than remembering to call run_track itself.
 launch_compositor() {
-    local wm="$1" log="${2:-/dev/stdout}"
+    local wm="$1" log="${2:-/dev/stdout}" role="${3:-compositor}"
     case "$wm" in
         labwc)
             WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
@@ -78,15 +83,23 @@ launch_compositor() {
             # outlives this script and leaks across repeated runs (run
             # -registry.sh's gc reaps it once confirmed dead, but nothing
             # kills it proactively without a tracked pid to act on).
-            local session_out system_out
+            # Suffix the dbus roles the same way a non-default $role
+            # suffixes "compositor" -- otherwise two mutter instances in
+            # two different containers (a hypothetical mutter->mutter
+            # swap; not one of the pairs this project actually runs, but
+            # cheap to get right) would both write dbus-session.pid /
+            # dbus-system.pid into the same shared $RUN_DIR and clobber
+            # each other.
+            local suffix="" session_out system_out
+            [[ "$role" != "compositor" ]] && suffix="${role#compositor}"
             session_out="$(dbus-daemon --session --fork --print-address --print-pid)"
             DBUS_SESSION_BUS_ADDRESS="$(head -1 <<< "$session_out")"
             export DBUS_SESSION_BUS_ADDRESS
-            run_track dbus-session "$(tail -1 <<< "$session_out")"
+            run_track "dbus-session${suffix}" "$(tail -1 <<< "$session_out")"
             system_out="$(dbus-daemon --session --fork --print-address --print-pid)"
             DBUS_SYSTEM_BUS_ADDRESS="$(head -1 <<< "$system_out")"
             export DBUS_SYSTEM_BUS_ADDRESS
-            run_track dbus-system "$(tail -1 <<< "$system_out")"
+            run_track "dbus-system${suffix}" "$(tail -1 <<< "$system_out")"
             gnome-shell --headless --no-x11 > "$log" 2>&1 &
             ;;
         *)
@@ -95,5 +108,5 @@ launch_compositor() {
             ;;
     esac
     COMPOSITOR_PID=$!
-    run_track compositor "$COMPOSITOR_PID"
+    run_track "$role" "$COMPOSITOR_PID"
 }

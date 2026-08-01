@@ -94,7 +94,7 @@ One `Containerfile` per WM, proxy package installed, added in risk order:
    Done -- needed two private D-Bus buses (session + system), not one;
    no real systemd/logind needed after all.
 
-- [ ] Per container: run L1 check, record pass/fail + any new
+- [x] Per container: run L1 check, record pass/fail + any new
       `interfaces.rs` gaps (expected when a new compositor family shows
       up, not a bug — see architecture-notes.md Gap 1/Gap 2).
 - [x] **sway: L0 pass (5/5), L1 pass.** One new `interfaces.rs` gap found
@@ -186,8 +186,24 @@ that already exist:
       `docs/debugging-notes.md`. Open question noted there for an L2
       pass, not blocking: whether the dropped `wl_surface.attach` stalls
       the client's next visible frame.
-- [ ] sway → kwin (cross-family — the actual risk case)
-- [ ] kwin → mutter (cross-family, closest to the real target)
+- [x] **sway → kwin: pass** (3/3 automated runs via `test-crash-swap.sh`,
+      plus a manual `RUST_LOG=debug` pass for L1 confirmation). Socket
+      reuse held across the container boundary and the WM-family switch.
+      Zero unresolvable-interface warnings; full toplevel chain
+      recreated. Same generic post-generation-bump buffer/syncobj
+      warnings as the labwc → sway pair (already root-caused there, not
+      swap-specific) -- no new interfaces.rs gap surfaced.
+- [x] **kwin → mutter: pass** (3/3 automated, plus a manual L1 pass) --
+      the pairing closest to the real target. Same clean result: socket
+      reuse held, zero unresolvable-interface warnings, full chain
+      recreated. One reassuring incidental finding: gnome-shell's own
+      startup was rockier than kwin/sway's (its first accepted
+      connection reset almost immediately, likely its heavier init
+      sequence), and the proxy's existing reconnect-freeze logic handled
+      the resulting double EOF cleanly, completing recovery on the next
+      attempt -- not a bug, evidence the recovery path tolerates a
+      flakier real compositor gracefully. See the 2026-07-31 swap-tests
+      entry in `docs/debugging-notes.md`.
 
 Same L1 pass criteria as above. Add more pairs only if one of these
 surfaces something, not preemptively.
