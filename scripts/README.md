@@ -1,10 +1,14 @@
 # Wayland Proxy Dev Environment
 
 Builds a `podman` container (Ubuntu 26.04) per window manager, for
-testing the Wayland proxy against each one. Includes Rust, GTK4, and
-Wayland tooling; the compositor itself is whichever `--wm=<name>` you
-pick (default `labwc`). No Distrobox — see
-`containers/labwc/Containerfile`'s header for why.
+testing the Wayland proxy against each one. Includes GTK4 and Wayland
+tooling; the compositor itself is whichever `--wm=<name>` you pick
+(default `labwc`). No Distrobox — see `containers/labwc/Containerfile`'s
+header for why.
+
+The proxy itself is built on the HOST (`cargo deb`) and installed into
+each container as a `.deb` by `setup-env.sh` -- containers don't need a
+Rust toolchain at all (see ADR-0003).
 
 ## Project layout
 
@@ -47,10 +51,11 @@ All of `setup-env.sh`, `teardown-env.sh`, and `start-guest.sh` take a
 
 ## Host prerequisites
 
-The container image installs Rust, GTK4, and Wayland libs. Your host
-needs:
+The container image installs GTK4 and Wayland libs. Your host needs:
 
-1. **A container engine — Podman (recommended) or Docker**
+1. **A container engine — Podman (recommended) or Docker**, and a Rust
+   toolchain (`cargo`, `cargo-deb`) to build the proxy `.deb`
+   `setup-env.sh` installs into each container.
    ```bash
    sudo apt install podman      # Ubuntu/Debian
    ```

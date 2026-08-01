@@ -83,6 +83,19 @@ pass) before moving to the next.
       `target/release/wayland-proxy` (the build byproduct) for its
       host-side proxy. Verified: full 4-WM `test-matrix.sh` pass with
       zero `cargo build` inside any container.
+- [x] Remove now-dead `rustc`/`cargo` from all four Containerfiles --
+      nothing inside any container has invoked either since the item
+      above. Independent of (not gated on) the shared-base-image idea
+      below: one's a removal, the other's a DRY refactor of whatever's
+      left. Verified: full 4-WM `test-matrix.sh` pass after rebuilding
+      all four images from scratch.
+- [ ] Deferred, not scoped in yet: a shared base image for the four
+      Containerfiles' common subset (sudo, GTK4, wayland tools, dbus,
+      wev, psmisc, iproute2, user/GID setup), leaving only the
+      compositor package + WM-specific quirks (kwin's `setcap`,
+      mutter's GID-collision handling) per-WM. Raised while removing
+      rustc/cargo above; not acted on since it's not a dependency of
+      anything currently in flight.
 - [ ] Enumerate the remaining artifacts (container defs, crash-inducer,
       verification logic, VNC wiring -- container defs may ship as data
       files, not baked into a git-checkout-relative path).

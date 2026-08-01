@@ -29,8 +29,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 # socket detection and XWayland-slot ownership.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
-    rustc \
-    cargo \
     libgtk-4-dev \
     gtk-4-examples \
     kwin-wayland \

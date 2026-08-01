@@ -22,9 +22,12 @@
 # One Containerfile per compositor under scripts/containers/<wm>/ --
 # see plan-test-harness.md Phase 9. Deliberately separate files, not one
 # parameterized template: different compositors need genuinely different
-# apt packages (kwin/plasma needs far more than labwc/sway), and with
-# only two WMs done so far it's too early to know what's actually shared
-# vs. coincidentally similar.
+# apt packages (kwin/plasma and mutter/gnome-shell both need far more
+# than labwc/sway). Now that all four exist, there IS a real common
+# subset (sudo, GTK4, wayland tools, dbus, wev, psmisc, iproute2, the
+# user/GID setup) a shared base image could factor out -- not done yet,
+# noted in plan-test-harness.md's Phase 8 as a deferred improvement, not
+# a blocker for anything currently in flight.
 #
 # Build: podman build -t wayland-proxy-dev-labwc -f scripts/containers/labwc/Containerfile scripts/containers/labwc/
 # Run:   see scripts/setup-env.sh --wm=labwc, which also handles the
@@ -43,8 +46,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 # container until these were added).
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
-    rustc \
-    cargo \
     libgtk-4-dev \
     gtk-4-examples \
     labwc \
