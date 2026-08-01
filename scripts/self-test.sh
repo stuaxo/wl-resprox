@@ -56,7 +56,7 @@ fi
 
 echo "== [$WM] Running test-crash.sh --l1 =="
 if ! sudo podman exec --user dev -e XDG_RUNTIME_DIR=/run/user/1000 "$CONTAINER_NAME" \
-    bash -c 'cd /workspace && bash scripts/test-crash.sh --l1'; then
+    bash -c 'cd /workspace && bash test-crash.sh --l1'; then
     echo "FAIL [$WM]: test-crash.sh --l1"
     exit 1
 fi

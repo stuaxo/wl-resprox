@@ -91,8 +91,19 @@ echo "Starting ${CONTAINER_NAME}..."
 # groups through to `podman exec --user=<name>` (no `:group` override
 # needed), unlike the Distrobox-managed container this replaces, which
 # never did regardless of this flag for reasons never fully root-caused.
-# -v "$PROJECT_ROOT:$HARNESS_CONTAINER_ROOT": only the project directory,
-# at a fixed generic path -- deliberately NOT the whole $HOME the way
+# -v "$SCRIPT_DIR:$HARNESS_CONTAINER_ROOT": only the harness's own
+# scripts/ directory, not the whole wayland-proxy checkout it might
+# happen to be a subdirectory of -- nothing inside a container has
+# referenced anything outside scripts/ since the proxy .deb started
+# getting `podman cp`'d in directly (see the --proxy-deb entry above)
+# rather than relying on Cargo.toml/src/ being visible via this mount.
+# This also means $HARNESS_CONTAINER_ROOT means the same thing whether
+# it's mounted from a git checkout (scripts/ as a subdirectory) or an
+# installed harness package (scripts/'s own contents, at the
+# installed root, no repo around it at all) -- container-side scripts
+# reference "$HARNESS_CONTAINER_ROOT/foo.sh" directly, not
+# "$HARNESS_CONTAINER_ROOT/scripts/foo.sh".
+# At a fixed generic path -- deliberately NOT the whole $HOME the way
 # Distrobox shared it. A whole-$HOME mount means anything the container
 # writes under $HOME lands in the host's real home directory, and on any
 # host where the container's (now-fixed, generic) user happens to share a
@@ -141,7 +152,7 @@ sudo podman run -d --name "${CONTAINER_NAME}" \
   --network host \
   --group-add "${HOST_VIDEO_GID}" --group-add "${HOST_RENDER_GID}" \
   --device /dev/dri \
-  -v "${PROJECT_ROOT}:${HARNESS_CONTAINER_ROOT}" \
+  -v "${SCRIPT_DIR}:${HARNESS_CONTAINER_ROOT}" \
   -v /dev:/dev \
   -v "${HOST_RUNTIME_DIR}:${HOST_RUNTIME_DIR}" \
   "${IMAGE_TAG}" sleep infinity

@@ -131,9 +131,9 @@ echo "== Starting ${FROM}'s compositor in ${FROM_CONTAINER} =="
 before="$(snapshot_live_sockets)"
 sudo podman exec -d --user dev -e XDG_RUNTIME_DIR="$CONTAINER_RUNTIME_DIR" -e RUN_DIR="$RUN_DIR" \
     "$FROM_CONTAINER" bash -c "
-        SCRIPT_DIR=/workspace/scripts
-        source /workspace/scripts/run-registry.sh
-        source /workspace/scripts/compositor-launch.sh
+        SCRIPT_DIR=/workspace
+        source /workspace/run-registry.sh
+        source /workspace/compositor-launch.sh
         launch_compositor '$FROM' /tmp/swap-compositor.log 'compositor-${FROM}'
     " || fail "couldn't start ${FROM} in ${FROM_CONTAINER}"
 
@@ -162,7 +162,7 @@ echo "== Starting client ($CLIENT_APP) in ${TO_CONTAINER}, through the proxy =="
 sudo podman exec -d --user dev -e XDG_RUNTIME_DIR="$CONTAINER_RUNTIME_DIR" \
     -e WAYLAND_DISPLAY="$PROXY_DISPLAY" -e RUN_DIR="$RUN_DIR" \
     "$TO_CONTAINER" bash -c "
-        source /workspace/scripts/run-registry.sh
+        source /workspace/run-registry.sh
         '$CLIENT_APP' > /tmp/swap-client.log 2>&1 &
         run_track client \"\$!\"
     " || fail "couldn't start ${CLIENT_APP} in ${TO_CONTAINER}"
@@ -182,9 +182,9 @@ echo "== Starting ${TO}'s compositor in ${TO_CONTAINER} (expecting it to reclaim
 before="$(snapshot_live_sockets)"
 sudo podman exec -d --user dev -e XDG_RUNTIME_DIR="$CONTAINER_RUNTIME_DIR" -e RUN_DIR="$RUN_DIR" \
     "$TO_CONTAINER" bash -c "
-        SCRIPT_DIR=/workspace/scripts
-        source /workspace/scripts/run-registry.sh
-        source /workspace/scripts/compositor-launch.sh
+        SCRIPT_DIR=/workspace
+        source /workspace/run-registry.sh
+        source /workspace/compositor-launch.sh
         launch_compositor '$TO' /tmp/swap-compositor.log 'compositor-${TO}'
     " || fail "couldn't start ${TO} in ${TO_CONTAINER}"
 

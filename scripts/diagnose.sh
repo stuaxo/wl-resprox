@@ -71,11 +71,12 @@ check_environment_errors() {
 }
 
 # Fixed, not derived from this script's own host-side location -- the
-# container only ever mounts the project directory at $HARNESS_CONTAINER_ROOT
-# (see setup-env.sh), not a host-mirrored path, so this is the one path
-# that's guaranteed to be correct regardless of where the project lives
-# on the host.
-CONTAINER_SCRIPT_PATH="${HARNESS_CONTAINER_ROOT}/scripts/diagnose.sh"
+# container only ever mounts the harness's own scripts/ directory at
+# $HARNESS_CONTAINER_ROOT (see setup-env.sh), not a host-mirrored path,
+# so this is the one path that's guaranteed to be correct regardless of
+# where the harness lives on the host (a git checkout or an installed
+# package).
+CONTAINER_SCRIPT_PATH="${HARNESS_CONTAINER_ROOT}/diagnose.sh"
 
 is_inside_container() {
   [[ -n "${CONTAINER_ID:-}" ]]

@@ -41,7 +41,7 @@ echo "Starting nested compositor in '${CONTAINER_NAME}' (host display: ${HOST_DI
 sudo podman exec --user dev:render \
   -e WAYLAND_DISPLAY="$HOST_DISPLAY" \
   -e XDG_RUNTIME_DIR="/run/user/1000" \
-  "$CONTAINER_NAME" bash "${HARNESS_CONTAINER_ROOT}/scripts/entrypoint.sh"
+  "$CONTAINER_NAME" bash "${HARNESS_CONTAINER_ROOT}/entrypoint.sh"
 
 echo ""
 echo "Entering '${CONTAINER_NAME}' interactively for testing..."
