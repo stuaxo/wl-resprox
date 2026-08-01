@@ -9,15 +9,25 @@
 # the image ourselves means we control user/sudoers setup entirely at
 # build time and never run that script at all.
 #
-# Usage: ./scripts/setup-env.sh [--wm=<name>]
-#   --wm=<name>   which compositor's container to build (default labwc).
-#                 Must match a scripts/containers/<name>/ directory.
+# Usage: ./scripts/setup-env.sh [--wm=<name>] [--proxy-deb=<path>]
+#   --wm=<name>        which compositor's container to build (default labwc).
+#                       Must match a scripts/containers/<name>/ directory.
+#   --proxy-deb=<path> a proxy .deb to install into the container --
+#                       doesn't have to be wayland-proxy, or built from
+#                       this repo at all. Without it: auto-detects
+#                       whether this checkout has a wayland-proxy
+#                       Cargo.toml one directory up and builds+installs
+#                       that (today's default); if not, the container is
+#                       provisioned without a proxy (still fully usable
+#                       for compositor/client debugging on its own).
 set -euo pipefail
 
 WM="labwc"
+PROXY_DEB=""
 for arg in "$@"; do
   case "$arg" in
     --wm=*) WM="${arg#--wm=}" ;;
+    --proxy-deb=*) PROXY_DEB="${arg#--proxy-deb=}" ;;
     *) echo "ERROR: unrecognized argument '$arg'" >&2; exit 1 ;;
   esac
 done
@@ -150,22 +160,43 @@ sudo podman exec --user dev "${CONTAINER_NAME}" bash -c '
 # harness script or inside a WM container." test-crash.sh used to run
 # `cargo build` itself, inside every container, on every single run --
 # a direct violation, accepted only until Phase 7's packaging landed.
-# It has now: build the .deb here, once, on the host, and install it
-# into the container -- the actual installation path this project would
-# use in practice, not a proxy for it. Every WM container gets the exact
-# same built artifact, matching the ADR's "installing the same built
-# artifact everywhere" reasoning, rather than each one rebuilding from
-# source independently.
-echo "Building wayland-proxy .deb (cargo deb)..."
-( cd "$PROJECT_ROOT" && cargo deb --quiet )
-# cargo-deb's own output, not adversarial/arbitrary input -- ls -t is
-# fine here, same reasoning as diagnose.sh's own SC2012 disable.
-# shellcheck disable=SC2012
-DEB_PATH="$(ls -t "$PROJECT_ROOT"/target/debian/wayland-proxy_*.deb | head -1)"
-CONTAINER_DEB_PATH="${HARNESS_CONTAINER_ROOT}/${DEB_PATH#"$PROJECT_ROOT"/}"
+# It has now.
+#
+# Which proxy gets installed is an explicit input, not an assumed
+# sibling: --proxy-deb=<path> can point anywhere, at anything (not
+# necessarily wayland-proxy, not necessarily built from this repo) --
+# the harness has no opinion about what's under test. Without it, this
+# falls back to today's dev-checkout convenience: build+install
+# wayland-proxy from the Cargo project one directory up from scripts/,
+# if one's there. If neither applies (harness installed standalone, no
+# checkout nearby), the container is provisioned without a proxy --
+# still fully usable via diagnose.sh/start-guest.sh for compositor/
+# client debugging on its own; only the proxy-specific test scripts
+# (test-crash.sh etc.) actually need one installed.
+DEB_PATH=""
+if [[ -n "$PROXY_DEB" ]]; then
+  [[ -f "$PROXY_DEB" ]] || { echo "ERROR: --proxy-deb='$PROXY_DEB' not found." >&2; exit 1; }
+  DEB_PATH="$(cd "$(dirname "$PROXY_DEB")" && pwd)/$(basename "$PROXY_DEB")"
+elif [[ -f "$PROJECT_ROOT/Cargo.toml" ]]; then
+  echo "Building wayland-proxy .deb (cargo deb)..."
+  ( cd "$PROJECT_ROOT" && cargo deb --quiet )
+  # cargo-deb's own output, not adversarial/arbitrary input -- ls -t is
+  # fine here, same reasoning as diagnose.sh's own SC2012 disable.
+  # shellcheck disable=SC2012
+  DEB_PATH="$(ls -t "$PROJECT_ROOT"/target/debian/wayland-proxy_*.deb | head -1)"
+else
+  echo "No --proxy-deb given and no wayland-proxy checkout found at ${PROJECT_ROOT} -- provisioning ${CONTAINER_NAME} without a proxy installed."
+fi
 
-echo "Installing $(basename "$DEB_PATH") into ${CONTAINER_NAME}..."
-sudo podman exec --user dev "${CONTAINER_NAME}" sudo dpkg -i "${CONTAINER_DEB_PATH}"
+if [[ -n "$DEB_PATH" ]]; then
+  # podman cp, not a path derived from the bind mount -- works
+  # identically whether $DEB_PATH came from --proxy-deb (could be
+  # anywhere) or the auto-detected build above, with no assumption that
+  # the source file happens to be visible inside the container already.
+  echo "Installing $(basename "$DEB_PATH") into ${CONTAINER_NAME}..."
+  sudo podman cp "$DEB_PATH" "${CONTAINER_NAME}:/tmp/$(basename "$DEB_PATH")"
+  sudo podman exec --user dev "${CONTAINER_NAME}" sudo dpkg -i "/tmp/$(basename "$DEB_PATH")"
+fi
 
 echo ''
 echo '======================================'

@@ -75,6 +75,16 @@ stopped changing shape every session. Doing this iteratively rather than
 as one big cutover -- each slice verified live (full test-matrix.sh
 pass) before moving to the next.
 
+**Repositioned (2026-08-02)**: the harness (headless per-WM containers,
+`diagnose.sh`, the run-registry/compositor-launch/socket-wait machinery)
+has value to the wider Wayland community for reproducing client/
+compositor protocol issues, independent of `wayland-proxy` specifically
+-- confirmed with the user. `wayland-proxy` becomes one optional thing
+to test with the harness, not its reason for existing. Confirmed
+dual-mode: today's in-place git-checkout dev workflow keeps working
+unchanged; packaging is additive. See `docs/debugging-notes.md`'s
+2026-08-02 entry for the full audit/design story.
+
 - [x] Close the ADR-0003 debt: harness no longer ever invokes `cargo
       build`/`cargo deb` per-container-per-run. `setup-env.sh` builds
       the `.deb` once (host-side) and `dpkg -i`'s it into the container
@@ -96,15 +106,38 @@ pass) before moving to the next.
       mutter's GID-collision handling) per-WM. Raised while removing
       rustc/cargo above; not acted on since it's not a dependency of
       anything currently in flight.
+- [x] One shared container-mount-point constant: `scripts/harness-paths.sh`
+      (`HARNESS_CONTAINER_ROOT`), replacing three independently-hardcoded
+      `/workspace` literals (`setup-env.sh`, `start-guest.sh`,
+      `diagnose.sh`). Mechanical, zero behavior change. Verified: full
+      4-WM `test-matrix.sh` pass.
+- [x] Make "which proxy to install" an explicit input: `setup-env.sh
+      --proxy-deb=<path>` installs any `.deb`, from anywhere -- doesn't
+      have to be `wayland-proxy`, doesn't have to be built from this
+      repo. Falls back to auto-detecting a `wayland-proxy` checkout one
+      directory up (today's dev-checkout default, unchanged); if
+      neither applies, provisions the container without a proxy rather
+      than failing. Replaced the old `${DEB_PATH#"$PROJECT_ROOT"/}`
+      string-stripping rewrite with `podman cp` (works regardless of
+      the source path's relationship to the bind mount). Verified live:
+      default auto-detect, `--proxy-deb=` pointing inside the repo,
+      `--proxy-deb=` pointing at `/tmp` (fully outside the checkout),
+      and a simulated standalone harness copy with no checkout nearby
+      at all (correctly provisions with the "no proxy" message and
+      stays fully usable via `diagnose.sh`). Full 4-WM `test-matrix.sh`
+      pass confirms zero regression to the default path.
 - [ ] Enumerate the remaining artifacts (container defs, crash-inducer,
       verification logic, VNC wiring -- container defs may ship as data
       files, not baked into a git-checkout-relative path).
-- [ ] A real `debian/` control file for the harness itself, replacing
-      ad-hoc `scripts/*.sh` invocation as the primary interface.
+- [ ] A real `debian/` control file for a general-purpose harness
+      package (proposed name `wayland-headless-harness`, open to
+      change), replacing ad-hoc `scripts/*.sh` invocation with a thin
+      CLI dispatcher as the primary interface.
+- [ ] `docs/adr/adr-0003-proxy-harness-boundary.md`: update the "never
+      shipped to an end user" line to reflect the repositioning.
 - [ ] Verify clean install with no dependency on this repo's working
-      tree (today every script still assumes `$SCRIPT_DIR`/`/workspace`
-      -- a git checkout bind-mounted into each container -- which an
-      installed package can't assume).
+      tree, via a scratch environment with no checkout reference at
+      all (stronger proof than testing from inside the checkout).
 
 ## Phase 9: Per-WM containers
 

@@ -6,9 +6,14 @@ tooling; the compositor itself is whichever `--wm=<name>` you pick
 (default `labwc`). No Distrobox — see `containers/labwc/Containerfile`'s
 header for why.
 
-The proxy itself is built on the HOST (`cargo deb`) and installed into
-each container as a `.deb` by `setup-env.sh` -- containers don't need a
-Rust toolchain at all (see ADR-0003).
+A proxy under test is optional and installed into each container by
+`setup-env.sh` as a `.deb` -- containers don't need a Rust toolchain at
+all (see ADR-0003). By default it auto-detects and builds `wayland-proxy`
+from this repo (`cargo deb`) if checked out alongside `scripts/`; pass
+`--proxy-deb=<path>` to install a specific `.deb` instead (doesn't have
+to be `wayland-proxy`, or built from this repo). With neither, the
+container is still fully usable for compositor/client debugging on its
+own -- only the proxy-specific test scripts need one installed.
 
 ## Project layout
 
