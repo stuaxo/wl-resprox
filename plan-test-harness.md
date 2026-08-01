@@ -208,19 +208,38 @@ that already exist:
 Same L1 pass criteria as above. Add more pairs only if one of these
 surfaces something, not preemptively.
 
-## Phase 10: Automated matrix runner
+## Phase 10: Automated matrix runner — done
 
-Seed already exists: pre-commit runs `diagnose.sh --errors-only --host-only`
-(env sanity, no podman) on every commit. Next step, not done yet: a
-`scripts/self-test.sh` smoke test -- setup-env.sh -> start-guest.sh ->
-test-crash.sh -> diagnose.sh --errors-only -> teardown-env.sh, asserting
-clean at each step. Run by hand for now; becomes the per-WM unit this
-phase loops over once Phase 9's containers exist.
+Seed already existed: pre-commit runs `diagnose.sh --errors-only --host-only`
+(env sanity, no podman) on every commit.
 
-- [ ] One entry point: build harness once, spin each Phase 9 container,
-      install proxy, run L1, collect pass/fail + logs per WM.
-- [ ] Pass criteria: L1 minimum. L0-only doesn't count as verified.
-- [ ] Surface results durably (e.g. generated markdown table).
+- [x] `scripts/self-test.sh --wm=<name>`: the per-WM unit. setup-env.sh
+      -> test-crash.sh --l1 -> diagnose.sh --errors-only -> teardown-env.sh,
+      asserting clean at each step, always tearing down on the way out
+      (pass or fail). Deviates from this section's original sketch by
+      skipping `start-guest.sh`: its nested-compositor step needs a real,
+      already-running HOST Wayland session, which an automated/headless
+      run won't have, and every Phase 9 container has already been
+      verified exclusively through `test-crash.sh`'s own self-contained
+      headless path -- see the 2026-07-31 Phase 10 entry in
+      `docs/debugging-notes.md`.
+- [x] One entry point: `scripts/test-matrix.sh [wm...]` loops
+      self-test.sh over every Phase 9 container (default: labwc sway
+      kwin mutter), collecting pass/fail + a per-WM log per container.
+- [x] Pass criteria: L1 minimum. L0-only doesn't count as verified --
+      `test-crash.sh --l1` (new, see below) is what makes this
+      automatable at all: it restarts the compositor and asserts
+      protocol-level recovery from the proxy's own log (zero
+      unresolvable-interface warnings, toplevel chain recreated),
+      instead of relying on the manual `RUST_LOG=debug` runs every prior
+      "L1 pass" claim in this file was actually based on.
+- [x] Surface results durably: `results.md` (gitignored, regenerated per
+      run) at the project root, a markdown table with a PASS/FAIL and
+      log path per WM.
+
+Verified live: full 4/4 pass (`./scripts/test-matrix.sh`, no args),
+correct exit code and **FAIL** row on an injected failure
+(`./scripts/test-matrix.sh bogus-wm`).
 
 ## Out of scope here
 

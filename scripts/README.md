@@ -34,6 +34,10 @@ pick (default `labwc`). No Distrobox — see
     │                    # each run's pids/containers/sockets in one place
     ├── compositor-launch.sh # sourced by all three test/entrypoint scripts:
     │                    # one implementation of each WM's headless-launch quirks
+    ├── socket-wait.sh   # sourced by test-crash.sh/test-crash-swap.sh:
+    │                    # "did a new compositor socket appear" detection
+    ├── self-test.sh     # per-WM smoke test, run from the HOST (see step 6 below)
+    ├── test-matrix.sh   # loops self-test.sh over every Phase 9 WM (step 6)
     └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest
 ```
 
@@ -118,20 +122,34 @@ WAYLAND_DISPLAY=<new-socket> gtk4-demo
 Run from the shell step 3 leaves you in (already at the project root;
 `$COMPOSITOR` is already set there, baked in by the image):
 ```bash
-bash scripts/test-crash.sh
+bash scripts/test-crash.sh       # L0: crashes the compositor, checks the client survives
+bash scripts/test-crash.sh --l1  # L1: also restarts the compositor and checks
+                                  # protocol-level recovery (zero unresolvable-interface
+                                  # warnings, toplevel chain recreated) from the proxy's own log
 ```
-Starts its own compositor, proxy, and `gtk4-demo`. Crashes the
-compositor. Checks the client process survives — nothing more.
 Self-contained; doesn't use step 3's nested compositor. See
 `plan-test-harness.md` for the fuller testing-levels picture and the
 per-WM results recorded there.
 
-### 5. Tear down
+### 5. Full matrix check (optional, replaces steps 1-4 per WM)
+
+```bash
+./scripts/self-test.sh --wm=sway   # one WM: setup -> test-crash.sh --l1 -> diagnose -> teardown
+./scripts/test-matrix.sh           # every Phase 9 WM (labwc sway kwin mutter), one command
+./scripts/test-matrix.sh sway kwin # a subset
+```
+Builds and tears down each container itself — no need to run steps 1-4
+first. Writes a pass/fail table per WM to `results.md` (gitignored,
+regenerated each run) and prints where the full logs landed.
+
+### 6. Tear down
 
 ```bash
 ./scripts/teardown-env.sh          # remove the container
 ./scripts/teardown-env.sh --image  # also remove the built image
 ```
+Not needed after step 5 -- `self-test.sh`/`test-matrix.sh` already tear
+down after themselves, pass or fail.
 
 ## Troubleshooting
 
