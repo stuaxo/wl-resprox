@@ -42,6 +42,8 @@ PROXY_DISPLAY="wayland-proxy-0" # fixed name the proxy binds, see src/main.rs
 
 # shellcheck source=./run-registry.sh disable=SC1091
 source "$SCRIPT_DIR/run-registry.sh"
+# shellcheck source=./compositor-launch.sh disable=SC1091
+source "$SCRIPT_DIR/compositor-launch.sh"
 run_dir_init
 
 COMPOSITOR_LOG="$(mktemp)"
@@ -110,73 +112,7 @@ snapshot_live_sockets() {
     done
 }
 existing_sockets="$(snapshot_live_sockets)"
-case "$COMPOSITOR" in
-    labwc)
-        WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
-            labwc -C "$SCRIPT_DIR/containers/labwc/labwc-config" > "$COMPOSITOR_LOG" 2>&1 &
-        ;;
-    sway)
-        WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
-            sway -c "$SCRIPT_DIR/containers/sway/sway-config" > "$COMPOSITOR_LOG" 2>&1 &
-        ;;
-    kwin)
-        # --virtual is kwin's own headless backend (confirmed live via
-        # `kwin_wayland --help`) -- the WLR_BACKENDS=headless env var
-        # above is wlroots-specific and doesn't apply to kwin (Qt-based,
-        # not wlroots). No -c/config-file equivalent needed for a bare
-        # virtual-backend instance, unlike labwc/sway.
-        kwin_wayland --virtual > "$COMPOSITOR_LOG" 2>&1 &
-        ;;
-    mutter)
-        # gnome-shell needs BOTH a D-Bus session bus and a D-Bus system
-        # bus -- unlike labwc/sway/kwin, none of which need either.
-        # Missing the session bus alone was the first symptom found (it's
-        # the more obviously-needed one); missing the system bus is a
-        # separate, less obvious requirement discovered afterward:
-        # timeLimitsManager.js's constructor reads `Gio.DBus.system` to
-        # open an org.freedesktop.MalcontentTimer1 proxy, and that
-        # property getter *fatally* throws if no system bus is reachable
-        # at all (not merely "the service isn't running", which alone
-        # would be a harmless, gracefully-handled
-        # DBus.Error.ServiceUnknown, same as several other warnings seen
-        # below) -- confirmed live via a Gjs-CRITICAL JS ERROR /
-        # `free(): invalid pointer` abort in exactly that constructor
-        # when only a session bus existed. Fix: start a second private
-        # bus and point DBUS_SYSTEM_BUS_ADDRESS at it too -- it doesn't
-        # need to behave like a *real* system bus (no policy files, no
-        # actual logind/PolicyKit/GDM/GeoClue2 services), just needs to
-        # exist, since gnome-shell already handles individual
-        # service-not-found errors gracefully once the bus itself opens.
-        # See the 2026-07-31 mutter entry in docs/debugging-notes.md.
-        #
-        # Both launched directly (not via a `dbus-run-session` wrapper)
-        # so `$!` below is gnome-shell's own pid, not a wrapper's -- a
-        # `dbus-run-session` wrapper forks a separate dbus-daemon *and*
-        # compositor child rather than exec'ing into it, so `$!` would be
-        # the wrapper, not the compositor (confirmed live). --no-x11:
-        # gnome-shell starts Xwayland by default otherwise, unlike
-        # labwc/sway/kwin's images, none of which install it.
-        #
-        # --fork daemonizes immediately (detaches, reparents to init) --
-        # `$!` doesn't apply to it, so track its pid separately
-        # (--print-pid) for cleanup() to kill; it otherwise outlives this
-        # script and leaks across repeated runs.
-        session_out="$(dbus-daemon --session --fork --print-address --print-pid)"
-        DBUS_SESSION_BUS_ADDRESS="$(head -1 <<< "$session_out")"
-        export DBUS_SESSION_BUS_ADDRESS
-        run_track dbus-session "$(tail -1 <<< "$session_out")"
-        system_out="$(dbus-daemon --session --fork --print-address --print-pid)"
-        DBUS_SYSTEM_BUS_ADDRESS="$(head -1 <<< "$system_out")"
-        export DBUS_SYSTEM_BUS_ADDRESS
-        run_track dbus-system "$(tail -1 <<< "$system_out")"
-        gnome-shell --headless --no-x11 > "$COMPOSITOR_LOG" 2>&1 &
-        ;;
-    *)
-        fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one here"
-        ;;
-esac
-COMPOSITOR_PID=$!
-run_track compositor "$COMPOSITOR_PID"
+launch_compositor "$COMPOSITOR" "$COMPOSITOR_LOG" || fail "no launch case for COMPOSITOR='$COMPOSITOR' -- add one to scripts/compositor-launch.sh"
 
 # 20s budget (80 x 0.25s), not 5s -- confirmed via strace that a slow
 # start here isn't necessarily a hang: labwc walks several theme
