@@ -58,6 +58,12 @@ def image_tag(wm: str) -> str:
     return f"wayland-proxy-dev-{wm}:latest"
 
 
+# The shared base image every per-WM Containerfile builds FROM -- see
+# scripts/containers/base/Containerfile's own comment for what it
+# factors out and why group/user creation itself stays per-WM.
+BASE_IMAGE_TAG = "wayland-proxy-dev-base:latest"
+
+
 def wm_dir(wm: str) -> Path:
     return BASH_SCRIPT_DIR / "containers" / wm
 

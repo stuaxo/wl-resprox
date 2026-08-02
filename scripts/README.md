@@ -48,6 +48,9 @@ from any particular checkout).
     │                      # the disposable WM containers; none of the four
     │                      # Containerfiles install python3
     ├── containers/      # one subdir per WM: Containerfile + compositor config
+    │   ├── base/        # shared FROM for the four below: common apt
+    │   │                # packages + removing Ubuntu's default `ubuntu`
+    │   │                # user -- group/user creation stays per-WM
     │   ├── labwc/
     │   ├── sway/
     │   ├── kwin/

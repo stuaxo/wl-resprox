@@ -54,6 +54,28 @@ def setup(
         )
         raise typer.Exit(1)
 
+    # Always (re-)built, same as the per-WM image below -- relies on
+    # Podman's own layer cache to make a repeat build of an unchanged
+    # Containerfile near-instant, rather than tracking "does it already
+    # exist" ourselves.
+    typer.echo(f"Building {common.BASE_IMAGE_TAG} (shared across all WMs)...")
+    base_dir = common.BASH_SCRIPT_DIR / "containers" / "base"
+    common.check(
+        common.run(
+            common.sudo_podman(
+                "build",
+                "--network",
+                "host",
+                "-t",
+                common.BASE_IMAGE_TAG,
+                "-f",
+                str(base_dir / "Containerfile"),
+                str(base_dir),
+            )
+        ),
+        f"podman build failed for {common.BASE_IMAGE_TAG}",
+    )
+
     typer.echo(
         f"Building {image} (uid={host_uid} gid={host_gid} "
         f"video={host_video_gid} render={host_render_gid})..."

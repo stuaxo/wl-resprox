@@ -15,30 +15,21 @@
 # on the host, no such package exists to install separately.
 #
 # Build: podman build -t wayland-proxy-dev-kwin -f scripts/containers/kwin/Containerfile scripts/containers/kwin/
-# Run:   see scripts/setup-env.sh --wm=kwin, which also handles the
+#        (needs wayland-proxy-dev-base already built -- see
+#        scripts/containers/base/Containerfile)
+# Run:   see harness/'s `env setup --wm=kwin`, which also handles the
 #        render/video GID matching and the project mount this image
 #        alone doesn't set up (those are host-specific, not build-time
 #        facts).
 
-FROM ubuntu:26.04
+FROM wayland-proxy-dev-base:latest
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# psmisc (fuser) and iproute2 (ss): not needed by the proxy or kwin
-# themselves, but scripts/diagnose.sh depends on both for live/stale
-# socket detection and XWayland-slot ownership.
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
-    sudo \
-    libgtk-4-dev \
-    gtk-4-examples \
-    kwin-wayland \
-    libwayland-dev \
-    wayland-utils \
-    dbus \
-    wev \
-    psmisc \
-    iproute2 \
-    && rm -rf /var/lib/apt/lists/*
+# kwin-wayland's own package dependencies (systemd/udev rules pulled in
+# transitively) pre-create a `render` group at THIS step -- before the
+# group/user creation block below ever runs -- which is exactly why that
+# block needs the groupmod-or-groupadd fallback it has, unlike labwc/
+# sway's plain groupadd.
+RUN apt-get update && apt-get install -y kwin-wayland && rm -rf /var/lib/apt/lists/*
 
 # GID/UID values are baked in as build args, not hardcoded -- host-specific
 # facts, passed by scripts/setup-env.sh at build time (its own `id -u`/
@@ -53,21 +44,42 @@ ARG USER_GID=1000
 ARG VIDEO_GID=44
 ARG RENDER_GID=991
 
-# Ubuntu's own base image ships a default `ubuntu` user/group at
-# UID/GID 1000 (the common case for a first host user account) -- remove
-# it first so it doesn't collide with the group/useradd calls below.
-RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true
-
+# The base image already removed Ubuntu's default `ubuntu` user/group
+# (see scripts/containers/base/Containerfile).
+#
 # Unlike labwc/sway's images, one of kwin-wayland's own dependencies
 # (systemd/udev rules pulled in transitively) already creates a `render`
 # group at build time here, so `groupadd` alone (which worked for
 # labwc/sway) fails with "group 'render' already exists" -- confirmed
-# live. Same groupmod-with-fallback pattern as `video` below handles
-# both cases: rename the existing group's GID if present, create it
-# fresh if not.
+# live. Originally handled with a simpler groupmod-or-groupadd fallback
+# (rename the existing group's GID if present, create it fresh if not),
+# but factoring the common apt packages into their own base-image build
+# (see scripts/containers/base/Containerfile) surfaced the same class of
+# GID-collision mutter's image already has to handle: with the base
+# packages now installed in a separate transaction before kwin-wayland's
+# own, apt/dpkg's dynamic system-GID allocation lands differently, and
+# GID 991 can end up already claimed by some *other* system group before
+# kwin-wayland's postinst ever creates `render` -- confirmed live
+# (`groupadd: group 'render' already exists` after a silently-failed
+# `groupmod`, because `render` existed at the wrong GID, not because it
+# was missing). The simple fallback only handled "group doesn't exist
+# yet," not "the target GID is occupied by something else" -- same
+# generalized fix as mutter/Containerfile: move whatever's sitting on
+# the target GID out of the way first, then groupmod-or-groupadd either
+# way.
 RUN groupadd -g "${USER_GID}" dev \
-    && (groupmod -g "${VIDEO_GID}" video 2>/dev/null || groupadd -g "${VIDEO_GID}" video) \
-    && (groupmod -g "${RENDER_GID}" render 2>/dev/null || groupadd -g "${RENDER_GID}" render) \
+    && for pair in "video:${VIDEO_GID}" "render:${RENDER_GID}"; do \
+         name="${pair%%:*}"; gid="${pair##*:}"; \
+         conflict="$(getent group "$gid" | cut -d: -f1)"; \
+         if [ -n "$conflict" ] && [ "$conflict" != "$name" ]; then \
+           groupmod -g "$((gid + 50000))" "$conflict"; \
+         fi; \
+         if getent group "$name" >/dev/null; then \
+           groupmod -g "$gid" "$name"; \
+         else \
+           groupadd -g "$gid" "$name"; \
+         fi; \
+       done \
     && useradd -u "${USER_UID}" -g "${USER_GID}" -G video,render,sudo -m -s /bin/bash dev
 
 # A loud PS1 prefix, so a container shell is never mistaken for a host

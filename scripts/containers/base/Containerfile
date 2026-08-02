@@ -1,0 +1,56 @@
+# Shared base for all four scripts/containers/<wm>/Containerfiles --
+# factors out the subset genuinely identical across labwc/sway/kwin/
+# mutter: the base image, noninteractive apt, the common package list,
+# and removing Ubuntu's default `ubuntu` user/group (see each per-WM
+# Containerfile's own comment for why that removal matters).
+#
+# Deliberately NOT factoring out group/user creation, the PS1 prefix,
+# sudoers, /workspace, or the two ENV values at the bottom, even though
+# most of that text is also identical across all four today: group/user
+# creation genuinely differs per-WM (kwin-wayland's and gnome-shell's
+# own package dependencies pre-create a `render` group, which labwc/
+# sway's images never see -- see kwin/Containerfile's and
+# mutter/Containerfile's own comments), and everything downstream of it
+# (PS1, sudoers, /workspace) depends on the `dev` user already existing,
+# which happens at a different point read differently by each file.
+# Splitting further would need a second per-WM intermediate image just
+# to reorder around that dependency, for ~15 lines of boilerplate that
+# hasn't drifted out of sync since these files were created -- not worth
+# the added build-graph complexity.
+#
+# The real payoff here isn't just fewer lines: today, each WM's apt-get
+# RUN line embeds a different compositor package name, so Podman's
+# layer cache never hits across WM builds even though most of the
+# command is identical text -- each one re-runs `apt-get upgrade`
+# from scratch. Factoring the common, compositor-independent install
+# into its own image with its own stable cache key means it only
+# actually runs once; every WM build after the first reuses it.
+#
+# Build: podman build -t wayland-proxy-dev-base -f scripts/containers/base/Containerfile scripts/containers/base/
+# Built automatically by `env setup` before the per-WM image -- not
+# meant to be run standalone.
+
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# psmisc (fuser) and iproute2 (ss): not needed by the proxy or any
+# compositor itself, but scripts/diagnose.sh depends on both for
+# live/stale socket detection and XWayland-slot ownership.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    sudo \
+    libgtk-4-dev \
+    gtk-4-examples \
+    libwayland-dev \
+    wayland-utils \
+    dbus \
+    wev \
+    psmisc \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu's own base image ships a default `ubuntu` user/group at
+# UID/GID 1000 (the common case for a first host user account) -- remove
+# it here, once, rather than in every per-WM Containerfile, so it
+# doesn't collide with each one's own group/user creation.
+RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true

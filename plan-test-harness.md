@@ -99,13 +99,35 @@ unchanged; packaging is additive. See `docs/debugging-notes.md`'s
       below: one's a removal, the other's a DRY refactor of whatever's
       left. Verified: full 4-WM `test-matrix.sh` pass after rebuilding
       all four images from scratch.
-- [ ] Deferred, not scoped in yet: a shared base image for the four
-      Containerfiles' common subset (sudo, GTK4, wayland tools, dbus,
-      wev, psmisc, iproute2, user/GID setup), leaving only the
-      compositor package + WM-specific quirks (kwin's `setcap`,
-      mutter's GID-collision handling) per-WM. Raised while removing
-      rustc/cargo above; not acted on since it's not a dependency of
-      anything currently in flight.
+- [x] Shared base image for the four Containerfiles' common subset --
+      `scripts/containers/base/Containerfile` (sudo, GTK4, wayland
+      tools, dbus, wev, psmisc, iproute2, and removing Ubuntu's default
+      `ubuntu` user), each per-WM Containerfile now `FROM
+      wayland-proxy-dev-base:latest` instead of `FROM ubuntu:26.04`.
+      Group/user creation deliberately stayed per-WM, unchanged (kwin's
+      groupmod-or-groupadd fallback and mutter's generalized
+      GID-collision handling are genuinely different code paths, not
+      just cosmetic duplication -- see base/Containerfile's own comment
+      for why splitting further wasn't worth it). `env setup` builds the
+      base image before the per-WM one, same always-build-relies-on-cache
+      pattern as everything else. Real payoff beyond fewer lines: each
+      WM's apt-get line used to embed a different compositor package
+      name, so Podman's cache never hit across WM builds even on
+      identical content -- confirmed live building all four from
+      scratch that the base's `apt-get upgrade` runs once, then every
+      other WM's build hits cache on it (a full sway build after labwc
+      took 8.5s total). Found (and fixed) a real bug along the way, not
+      just a refactor: splitting the base packages into their own
+      transaction ahead of kwin-wayland's changed apt/dpkg's dynamic
+      system-GID allocation enough that kwin's group/user creation
+      started hitting the exact GID-collision class mutter's
+      Containerfile already handled generically but kwin's own simpler
+      groupmod-or-groupadd fallback didn't -- gave kwin mutter's
+      generalized "move whatever's occupying the target GID out of the
+      way first" logic too. Verified: full 4-WM `test-matrix` pass
+      (4/4, including kwin) after rebuilding every image from scratch,
+      confirmed both before and after the kwin fix so the failure and
+      the fix are both directly observed, not assumed.
 - [x] One shared container-mount-point constant: `scripts/harness-paths.sh`
       (`HARNESS_CONTAINER_ROOT`), replacing three independently-hardcoded
       `/workspace` literals (`setup-env.sh`, `start-guest.sh`,

@@ -23,39 +23,30 @@
 # see plan-test-harness.md Phase 9. Deliberately separate files, not one
 # parameterized template: different compositors need genuinely different
 # apt packages (kwin/plasma and mutter/gnome-shell both need far more
-# than labwc/sway). Now that all four exist, there IS a real common
-# subset (sudo, GTK4, wayland tools, dbus, wev, psmisc, iproute2, the
-# user/GID setup) a shared base image could factor out -- not done yet,
-# noted in plan-test-harness.md's Phase 8 as a deferred improvement, not
-# a blocker for anything currently in flight.
+# than labwc/sway). The subset that IS genuinely common across all four
+# (sudo, GTK4, wayland tools, dbus, wev, psmisc, iproute2, and removing
+# Ubuntu's default `ubuntu` user) lives in the shared
+# scripts/containers/base/Containerfile this one builds on -- see that
+# file's own comment for why group/user creation itself stays per-WM
+# rather than also moving there.
 #
 # Build: podman build -t wayland-proxy-dev-labwc -f scripts/containers/labwc/Containerfile scripts/containers/labwc/
-# Run:   see scripts/setup-env.sh --wm=labwc, which also handles the
+#        (needs wayland-proxy-dev-base already built -- see
+#        scripts/containers/base/Containerfile)
+# Run:   see harness/'s `env setup --wm=labwc`, which also handles the
 #        render/video GID matching and the project mount this image
 #        alone doesn't set up (those are host-specific, not build-time
 #        facts).
 
-FROM ubuntu:26.04
+FROM wayland-proxy-dev-base:latest
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# psmisc (fuser) and iproute2 (ss): not needed by the proxy or labwc
-# themselves, but scripts/diagnose.sh depends on both for live/stale
-# socket detection and XWayland-slot ownership -- confirmed missing live
-# (diagnose.sh silently reported everything as "stale" inside the
-# container until these were added).
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
-    sudo \
-    libgtk-4-dev \
-    gtk-4-examples \
-    labwc \
-    libwayland-dev \
-    wayland-utils \
-    dbus \
-    wev \
-    psmisc \
-    iproute2 \
-    && rm -rf /var/lib/apt/lists/*
+# labwc itself, on top of the base image's common package set. A
+# separate RUN (not merged into the base) since it has to run after
+# FROM base but is the one thing that differs per-WM -- keeping
+# compositor package install ahead of group/user creation matches the
+# base image's own ordering and is what surfaces kwin's/mutter's
+# group-collision quirks (see their own Containerfiles) at all.
+RUN apt-get update && apt-get install -y labwc && rm -rf /var/lib/apt/lists/*
 
 # GID/UID values are baked in as build args, not hardcoded -- host-specific
 # facts, passed by scripts/setup-env.sh at build time (its own `id -u`/
@@ -70,11 +61,9 @@ ARG USER_GID=1000
 ARG VIDEO_GID=44
 ARG RENDER_GID=991
 
-# Ubuntu's own base image ships a default `ubuntu` user/group at
-# UID/GID 1000 (the common case for a first host user account) -- remove
-# it first so it doesn't collide with the group/useradd calls below.
-RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true
-
+# The base image already removed Ubuntu's default `ubuntu` user/group
+# (see scripts/containers/base/Containerfile) -- straight into this
+# image's own group/user creation.
 RUN groupadd -g "${USER_GID}" dev \
     && (groupmod -g "${VIDEO_GID}" video 2>/dev/null || groupadd -g "${VIDEO_GID}" video) \
     && groupadd -g "${RENDER_GID}" render \

@@ -1,36 +1,22 @@
 # Wayland proxy dev environment, built directly with `podman build` --
 # see scripts/containers/labwc/Containerfile's header comment for the
-# full Distrobox/devcontainer-style rationale, identical here. This file
-# differs from that one only in which compositor package it installs and
-# the two ENV values at the bottom -- see plan-test-harness.md Phase 9
-# for why these are separate files rather than one parameterized
-# template.
+# full Distrobox/devcontainer-style rationale, identical here, and
+# scripts/containers/base/Containerfile for the shared base image both
+# build on. This file differs from labwc's only in which compositor
+# package it installs and the two ENV values at the bottom -- see
+# plan-test-harness.md Phase 9 for why these are separate files rather
+# than one parameterized template.
 #
 # Build: podman build -t wayland-proxy-dev-sway -f scripts/containers/sway/Containerfile scripts/containers/sway/
-# Run:   see scripts/setup-env.sh --wm=sway, which also handles the
+#        (needs wayland-proxy-dev-base already built)
+# Run:   see harness/'s `env setup --wm=sway`, which also handles the
 #        render/video GID matching and the project mount this image
 #        alone doesn't set up (those are host-specific, not build-time
 #        facts).
 
-FROM ubuntu:26.04
+FROM wayland-proxy-dev-base:latest
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# psmisc (fuser) and iproute2 (ss): not needed by the proxy or sway
-# themselves, but scripts/diagnose.sh depends on both for live/stale
-# socket detection and XWayland-slot ownership.
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
-    sudo \
-    libgtk-4-dev \
-    gtk-4-examples \
-    sway \
-    libwayland-dev \
-    wayland-utils \
-    dbus \
-    wev \
-    psmisc \
-    iproute2 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y sway && rm -rf /var/lib/apt/lists/*
 
 # GID/UID values are baked in as build args, not hardcoded -- host-specific
 # facts, passed by scripts/setup-env.sh at build time (its own `id -u`/
@@ -45,11 +31,9 @@ ARG USER_GID=1000
 ARG VIDEO_GID=44
 ARG RENDER_GID=991
 
-# Ubuntu's own base image ships a default `ubuntu` user/group at
-# UID/GID 1000 (the common case for a first host user account) -- remove
-# it first so it doesn't collide with the group/useradd calls below.
-RUN userdel -r ubuntu 2>/dev/null; groupdel ubuntu 2>/dev/null; true
-
+# The base image already removed Ubuntu's default `ubuntu` user/group
+# (see scripts/containers/base/Containerfile) -- straight into this
+# image's own group/user creation.
 RUN groupadd -g "${USER_GID}" dev \
     && (groupmod -g "${VIDEO_GID}" video 2>/dev/null || groupadd -g "${VIDEO_GID}" video) \
     && groupadd -g "${RENDER_GID}" render \
