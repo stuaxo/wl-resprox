@@ -2,3 +2,4 @@
 /target-host
 reference
 /results.md
+__pycache__/

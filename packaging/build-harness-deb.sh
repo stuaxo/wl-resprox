@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Builds the wayland-headless-harness .deb: stages scripts/ (the
-# harness's own files) plus this directory's CLI dispatcher into a
-# tree matching the target filesystem layout, and runs `dpkg-deb
-# --build` against it.
+# Builds the wayland-headless-harness .deb: stages the surviving
+# container-side scripts/ files, the harness/ Python package (the CLI
+# and all host-side orchestration), and the harness/ entry-point stub
+# into a tree matching the target filesystem layout, then runs
+# `dpkg-deb --build` against it.
 #
 # Deliberately NOT dpkg-buildpackage/debhelper -- this package is pure
 # scripts + data files, no compilation, and debian/control here is a
@@ -32,11 +33,22 @@ LIB_DIR="$STAGING/usr/lib/$PKG_NAME"
 rm -rf "$STAGING"
 mkdir -p "$STAGING/DEBIAN" "$LIB_DIR" "$STAGING/usr/bin"
 
+# Container-side scripts only (test-crash.sh, entrypoint.sh, and the
+# libraries they source) -- everything host-side moved to Python, see
+# the harness/ package below. Stays Bash deliberately: none of the four
+# Containerfiles install python3, and these run inside them.
 cp "$PROJECT_ROOT"/scripts/*.sh "$LIB_DIR/"
 cp -r "$PROJECT_ROOT/scripts/containers" "$LIB_DIR/"
 chmod +x "$LIB_DIR"/*.sh
 
-install -m 0755 "$SCRIPT_DIR/harness/wayland-headless-harness" "$STAGING/usr/bin/wayland-headless-harness"
+# The Python package sits alongside the surviving .sh files in the same
+# LIB_DIR -- harness/wayland-headless-harness's own path-resolution
+# looks for wayland_headless_harness/ next to itself either way (dev
+# checkout or installed), and diagnose.py/testing.py need BASH_SCRIPT_DIR
+# and the package to resolve to the same installed directory.
+cp -r "$PROJECT_ROOT/harness/wayland_headless_harness" "$LIB_DIR/"
+find "$LIB_DIR/wayland_headless_harness" -name '__pycache__' -type d -exec rm -rf {} +
+install -m 0755 "$PROJECT_ROOT/harness/wayland-headless-harness" "$STAGING/usr/bin/wayland-headless-harness"
 
 {
     cat "$PROJECT_ROOT/debian/control"

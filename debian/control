@@ -1,7 +1,7 @@
 Package: wayland-headless-harness
 Architecture: all
 Maintainer: Stuart Axon <stuaxo2@yahoo.com>
-Depends: bash, psmisc, iproute2, podman, sudo
+Depends: bash, psmisc, iproute2, podman, sudo, python3, python3-typer, python3-click, python3-rich
 Section: net
 Priority: optional
 Description: Headless multi-compositor Wayland test harness

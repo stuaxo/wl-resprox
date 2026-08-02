@@ -38,16 +38,22 @@ if ! CARGO_TARGET_DIR="$PROJECT_DIR/target-host" cargo test --quiet --manifest-p
     exit 1
 fi
 
-echo "pre-commit: shellcheck scripts/*.sh, packaging/..."
+echo "pre-commit: shellcheck scripts/*.sh, packaging/*.sh..."
 if ! command -v shellcheck >/dev/null; then
     echo "pre-commit: shellcheck not found -- install it (e.g. sudo apt-get install shellcheck) -- commit aborted." >&2
     exit 1
 fi
-# packaging/harness/wayland-headless-harness has no .sh extension (it's
-# the installed CLI binary's own name) -- named explicitly rather than
-# globbed by extension.
-if ! shellcheck "$PROJECT_DIR"/scripts/*.sh "$PROJECT_DIR"/packaging/*.sh "$PROJECT_DIR"/packaging/harness/wayland-headless-harness; then
+# Only the container-side scripts stay Bash now (test-crash.sh,
+# entrypoint.sh, and the libraries they source) -- host-side
+# orchestration moved to Python, see harness/ below.
+if ! shellcheck "$PROJECT_DIR"/scripts/*.sh "$PROJECT_DIR"/packaging/*.sh; then
     echo "pre-commit: shellcheck failed -- commit aborted." >&2
+    exit 1
+fi
+
+echo "pre-commit: python3 -m py_compile harness/..."
+if ! python3 -m py_compile "$PROJECT_DIR"/harness/wayland-headless-harness "$PROJECT_DIR"/harness/wayland_headless_harness/*.py "$PROJECT_DIR"/harness/wayland_headless_harness/commands/*.py; then
+    echo "pre-commit: harness/ has a Python syntax error -- commit aborted." >&2
     exit 1
 fi
 

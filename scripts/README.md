@@ -21,13 +21,13 @@ from any particular checkout).
 
 **Two ways to use this:**
 - **In place, from a git checkout** (this document's own instructions
-  below) -- `./scripts/setup-env.sh`, etc., run directly.
+  below) -- `./harness/wayland-headless-harness <command>`, run directly.
 - **Installed as a package** (`packaging/build-harness-deb.sh` builds
   `wayland-headless-harness_<version>_all.deb`; `sudo dpkg -i` it) --
-  gives a `wayland-headless-harness <command>` CLI (`setup`, `teardown`,
-  `test-crash`, `matrix`, ...) instead of invoking scripts directly. Same
-  underlying scripts either way; see `packaging/harness/wayland-headless-harness`'s
-  own `help` output for the full command list.
+  gives a `wayland-headless-harness <command>` CLI on `$PATH` instead of
+  a relative path into the checkout. Identical command surface either
+  way (Python/Typer); see `wayland-headless-harness --help` for the
+  full command list, or any subcommand's own `--help`.
 
 ## Project layout
 
@@ -37,60 +37,65 @@ from any particular checkout).
 ├── docs/
 │   ├── plan/             # phase-by-phase build history, one file per plan
 │   └── ...                # design notes, ADRs, debugging log
-└── scripts/
-    ├── setup-env.sh     # builds the image and starts the container (run once)
-    ├── teardown-env.sh  # stops and removes the container (reverses setup-env.sh)
+├── harness/              # the CLI + all host-side orchestration (Python/Typer)
+│   ├── wayland-headless-harness   # entry point -- run directly from a
+│   │                     # checkout, or staged to /usr/bin/ when installed
+│   └── wayland_headless_harness/
+│       ├── cli.py        # top-level Typer app (env/session/test/diagnose)
+│       ├── common.py     # shared: WM validation, podman wrappers, path resolution
+│       └── commands/     # env.py, session.py, testing.py, diagnose.py
+└── scripts/              # container-side only -- stays Bash, runs INSIDE
+    │                      # the disposable WM containers; none of the four
+    │                      # Containerfiles install python3
     ├── containers/      # one subdir per WM: Containerfile + compositor config
     │   ├── labwc/
     │   ├── sway/
     │   ├── kwin/
     │   └── mutter/
-    ├── start-host.sh    # starts a headless labwc + wayvnc on the HOST
     ├── entrypoint.sh    # runs INSIDE the container — starts the nested
     │                    # compositor named by $COMPOSITOR
-    ├── start-guest.sh   # enters the container, runs entrypoint.sh, then
-    │                    # drops you into an interactive shell for testing
     ├── test-crash.sh    # automated crash/reconnect check (see step 4 below)
-    ├── test-crash-swap.sh # cross-compositor swap check, run from the HOST
-    │                    # (see plan-test-harness.md's "Cross-compositor swap")
     ├── run-registry.sh  # sourced by entrypoint.sh/test-crash.sh: tracks
     │                    # each run's pids/containers/sockets in one place
-    ├── compositor-launch.sh # sourced by all three test/entrypoint scripts:
+    ├── compositor-launch.sh # sourced by test-crash.sh/entrypoint.sh/`test swap`:
     │                    # one implementation of each WM's headless-launch quirks
-    ├── socket-wait.sh   # sourced by test-crash.sh/test-crash-swap.sh:
+    ├── socket-wait.sh   # sourced by test-crash.sh/`test swap`:
     │                    # "did a new compositor socket appear" detection
-    ├── harness-paths.sh # sourced by setup-env.sh/start-guest.sh/diagnose.sh:
-    │                    # the one shared container-mount-point constant
-    ├── self-test.sh     # per-WM smoke test, run from the HOST (see step 6 below)
-    ├── test-matrix.sh   # loops self-test.sh over every Phase 9 WM (step 6)
-    └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest
+    ├── harness-paths.sh # sourced by diagnose.sh: the shared container-mount-point
+    │                    # constant (mirrored as a Python constant in common.py)
+    └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest --
+                         # unmodified; `diagnose` in harness/ is a thin wrapper
+                         # around this exact script
 
 debian/control              # package metadata for wayland-headless-harness
 packaging/
-├── build-harness-deb.sh    # builds the .deb from scripts/ + the CLI dispatcher
-├── harness/
-│   └── wayland-headless-harness  # CLI dispatcher, installed to /usr/bin/
+├── build-harness-deb.sh    # builds the .deb from harness/ + the surviving scripts/*.sh
 └── wayland-proxy.service   # systemd --user unit, packaged with wayland-proxy itself
 ```
 
-All of `setup-env.sh`, `teardown-env.sh`, and `start-guest.sh` take a
-`--wm=<name>` flag (default `labwc`) selecting which
-`containers/<name>/` to build/run against.
+Every subcommand that targets one compositor takes a `--wm=<name>` flag
+(default `labwc`, also settable via `WAYLAND_HARNESS_WM`) selecting
+which `containers/<name>/` to build/run against.
 
 ## Host prerequisites
 
 The container image installs GTK4 and Wayland libs. Your host needs:
 
-1. **A container engine — Podman (recommended) or Docker**, and a Rust
-   toolchain (`cargo`, `cargo-deb`) to build the proxy `.deb`
-   `setup-env.sh` installs into each container.
+1. **A container engine — Podman (recommended) or Docker**, a Rust
+   toolchain (`cargo`, `cargo-deb`) to build the proxy `.deb` `env setup`
+   installs into each container, and Python 3 with Typer for the
+   harness's own CLI.
    ```bash
-   sudo apt install podman      # Ubuntu/Debian
+   sudo apt install podman python3-typer      # Ubuntu/Debian
    ```
    Podman should be usable rootless (default on modern Ubuntu). Verify:
    ```bash
    podman info
    ```
+   `python3-typer` is declared in `debian/control`'s `Depends:`, but that
+   only matters for `apt install ./pkg.deb` -- this project's own
+   convention is plain `sudo dpkg -i`, which doesn't resolve
+   dependencies at all, so install it explicitly either way.
 
 2. **`labwc` and `wayvnc` on the HOST** — run the outer Wayland session,
    not just inside the container:
@@ -107,20 +112,20 @@ The container image installs GTK4 and Wayland libs. Your host needs:
 ### 1. Build and start the container (once)
 
 ```bash
-./scripts/setup-env.sh              # labwc (default)
-./scripts/setup-env.sh --wm=sway
+./harness/wayland-headless-harness env setup              # labwc (default)
+./harness/wayland-headless-harness env setup --wm=sway
 ```
 Builds the `wayland-proxy-dev-<wm>` image and starts it as a
 long-running container. Matches the container's `dev` user's UID/GID
 and the host's video/render GIDs — but `dev` is a fixed, generic login
-name, not tied to your host account. Only the project directory is
-shared with the container, mounted at `/workspace` — not your whole
-home directory.
+name, not tied to your host account. Only `scripts/` is shared with the
+container, mounted at `/workspace` — not your whole home directory, and
+not the rest of this checkout either.
 
 ### 2. Start the host compositor + VNC (Terminal A)
 
 ```bash
-./scripts/start-host.sh
+./harness/wayland-headless-harness session start-host
 ```
 Prints the host's Wayland socket name (e.g. `wayland-0`) and starts
 `wayvnc` listening on `127.0.0.1:5900`. Leave this running in the
@@ -135,13 +140,13 @@ ssh -L 5900:localhost:5900 <user>@<host>
 ```
 Run that from your own machine, then point a VNC client at
 `localhost:5900`. Skip it entirely if you don't need to see the screen —
-`test-crash.sh` (step 4) and the proxy logs don't need VNC at all.
+`test crash` (step 4) and the proxy logs don't need VNC at all.
 
 ### 3. Start the nested compositor and enter the container (Terminal B)
 
 ```bash
-./scripts/start-guest.sh wayland-0            # match the socket start-host.sh printed
-./scripts/start-guest.sh --wm=sway wayland-0  # against a different WM's container
+./harness/wayland-headless-harness session start-guest --host-socket=wayland-0            # match what start-host printed
+./harness/wayland-headless-harness session start-guest --wm=sway --host-socket=wayland-0  # against a different WM's container
 ```
 Runs `entrypoint.sh` inside the container: starts the nested
 compositor, reports its new socket, then drops you into an interactive
@@ -152,13 +157,17 @@ WAYLAND_DISPLAY=<new-socket> gtk4-demo
 
 ### 4. Automated crash-recovery check (optional)
 
-Run from the shell step 3 leaves you in (already at the project root;
+Run from the shell step 3 leaves you in (already at `/workspace`;
 `$COMPOSITOR` is already set there, baked in by the image):
 ```bash
-bash scripts/test-crash.sh       # L0: crashes the compositor, checks the client survives
-bash scripts/test-crash.sh --l1  # L1: also restarts the compositor and checks
-                                  # protocol-level recovery (zero unresolvable-interface
-                                  # warnings, toplevel chain recreated) from the proxy's own log
+bash test-crash.sh       # L0: crashes the compositor, checks the client survives
+bash test-crash.sh --l1  # L1: also restarts the compositor and checks
+                          # protocol-level recovery (zero unresolvable-interface
+                          # warnings, toplevel chain recreated) from the proxy's own log
+```
+Or from the HOST, without entering the container at all:
+```bash
+./harness/wayland-headless-harness test crash --wm=sway --verify-recovery
 ```
 Self-contained; doesn't use step 3's nested compositor. See
 `plan-test-harness.md` for the fuller testing-levels picture and the
@@ -167,9 +176,9 @@ per-WM results recorded there.
 ### 5. Full matrix check (optional, replaces steps 1-4 per WM)
 
 ```bash
-./scripts/self-test.sh --wm=sway   # one WM: setup -> test-crash.sh --l1 -> diagnose -> teardown
-./scripts/test-matrix.sh           # every Phase 9 WM (labwc sway kwin mutter), one command
-./scripts/test-matrix.sh sway kwin # a subset
+./harness/wayland-headless-harness test smoke --wm=sway          # one WM: setup -> crash --verify-recovery -> diagnose -> teardown
+./harness/wayland-headless-harness test matrix                   # every Phase 9 WM (labwc sway kwin mutter), one command
+./harness/wayland-headless-harness test matrix --wm=sway --wm=kwin  # a subset
 ```
 Builds and tears down each container itself — no need to run steps 1-4
 first. Writes a pass/fail table per WM to `results.md` (gitignored,
@@ -178,11 +187,11 @@ regenerated each run) and prints where the full logs landed.
 ### 6. Tear down
 
 ```bash
-./scripts/teardown-env.sh          # remove the container
-./scripts/teardown-env.sh --image  # also remove the built image
+./harness/wayland-headless-harness env teardown          # remove the container
+./harness/wayland-headless-harness env teardown --image  # also remove the built image
 ```
-Not needed after step 5 -- `self-test.sh`/`test-matrix.sh` already tear
-down after themselves, pass or fail.
+Not needed after step 5 -- `test smoke`/`test matrix` already tear down
+after themselves, pass or fail.
 
 ## Troubleshooting
 
