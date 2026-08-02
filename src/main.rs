@@ -1,25 +1,35 @@
+mod cli;
+
 use anyhow::{Context, Result};
+use clap::Parser;
 use std::env;
 use std::path::PathBuf;
 
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info};
 
+use cli::Cli;
 use wayland_proxy::run_connection;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
+        .with_context(|| format!("invalid --log-level/RUST_LOG filter: {:?}", cli.log_level))?;
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    wayland_proxy::recorder::init(cli.record.clone());
+
     info!("Starting Wayland proxy (hand-rolled wire protocol relay)...");
 
     let runtime_dir =
         env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR environment variable is not set")?;
 
-    let target_display = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-1".to_string());
+    let target_display = cli.display.clone();
     let target_socket_path = PathBuf::from(&runtime_dir).join(&target_display);
 
-    let proxy_display = "wayland-proxy-0";
-    let proxy_socket_path = PathBuf::from(&runtime_dir).join(proxy_display);
+    let proxy_display = cli.listen.clone();
+    let proxy_socket_path = PathBuf::from(&runtime_dir).join(&proxy_display);
 
     if proxy_socket_path.exists() {
         std::fs::remove_file(&proxy_socket_path).context("removing stale proxy socket")?;

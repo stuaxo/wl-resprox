@@ -25,9 +25,23 @@ pub struct Recorder {
     writer: Mutex<BufWriter<File>>,
 }
 
+static RECORD_PATH_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Lets the CLI's `--record` flag win over `WAYLAND_PROXY_RECORD` when
+/// given. Must be called at most once, before the first call to
+/// `recorder()` (that first call is what actually reads this). Passing
+/// `None` (flag not given) leaves the env var as the fallback, unchanged.
+pub fn init(explicit_path: Option<String>) {
+    let _ = RECORD_PATH_OVERRIDE.set(explicit_path);
+}
+
 impl Recorder {
     fn from_env() -> Option<Recorder> {
-        let path = std::env::var("WAYLAND_PROXY_RECORD").ok()?;
+        let path = RECORD_PATH_OVERRIDE
+            .get()
+            .cloned()
+            .flatten()
+            .or_else(|| std::env::var("WAYLAND_PROXY_RECORD").ok())?;
         match File::create(&path) {
             Ok(file) => {
                 eprintln!("recording message sequence to {path}");

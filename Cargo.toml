@@ -70,8 +70,13 @@ bimap = "0.6.3"
 
 # Logging and error handling
 tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = "1.0.81"
+
+# CLI parsing. "env" feature: --flag falls back to a same-named
+# environment variable when not given (see src/cli.rs) -- not on by
+# default in clap 4.x.
+clap = { version = "4", features = ["derive", "env"] }
 
 # recvmsg/sendmsg with SCM_RIGHTS ancillary data -- tokio's UnixStream
 # read/write don't carry file descriptors at all, which is exactly the bug
