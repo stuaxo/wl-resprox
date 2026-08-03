@@ -51,18 +51,31 @@ PRIVATE_DISPLAY=wl-res-gnome-shell-direct-0
 
 echo "$(date -Iseconds) wrapper starting"
 
-# Periodically re-assert WAYLAND_DISPLAY/XDG_SESSION_DESKTOP in the
-# background, for this whole script's lifetime -- same defensive pattern
-# as the labwc wrapper (found there that Xwayland's own lazy, delayed
-# activation-environment export can clobber a one-shot export well after
-# the fact). Untested whether gnome-shell itself does anything
-# equivalent when run this way (it might, given it has its own D-Bus
-# session-registration code) -- kept as a cheap, harmless safeguard
-# either way rather than assuming it's unnecessary.
+# Periodically re-assert WAYLAND_DISPLAY/XDG_SESSION_DESKTOP/
+# XDG_CURRENT_DESKTOP in the background, for this whole script's
+# lifetime -- same defensive pattern as the labwc wrapper (found there
+# that Xwayland's own lazy, delayed activation-environment export can
+# clobber a one-shot export well after the fact). Untested whether
+# gnome-shell itself does anything equivalent when run this way (it
+# might, given it has its own D-Bus session-registration code) -- kept
+# as a cheap, harmless safeguard either way rather than assuming it's
+# unnecessary.
+#
+# XDG_CURRENT_DESKTOP found live 2026-08-03, and load-bearing: nothing
+# else sets it for this session at all (gnome-session normally does),
+# so the SHARED systemd --user activation environment (what
+# D-Bus-activated services like xdg-desktop-portal-gnome actually see --
+# confirmed via /proc/<gnome-shell-pid>/environ having the *correct*
+# value while `systemctl --user show-environment` didn't) was stuck on
+# whatever a PREVIOUS session (e.g. wl-res-labwc) last set it to.
+# Portal/D-Bus-activated components checking "am I in a real GNOME
+# session" against this variable would see stale garbage. Value matches
+# what this session's own .desktop DesktopNames= would produce
+# naturally for a normal login.
 (
     while :; do
         sleep 3
-        dbus-update-activation-environment --systemd WAYLAND_DISPLAY=wayland-0 XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct 2>/dev/null
+        dbus-update-activation-environment --systemd WAYLAND_DISPLAY=wayland-0 XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct XDG_CURRENT_DESKTOP=wl-res-gnome-shell-direct:ubuntu:GNOME 2>/dev/null
     done
 ) &
 
@@ -71,7 +84,7 @@ while :; do
     SHELL_PID=$!
     echo "$(date -Iseconds) gnome-shell started, pid=$SHELL_PID"
 
-    dbus-update-activation-environment --systemd WAYLAND_DISPLAY=wayland-0 XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct
+    dbus-update-activation-environment --systemd WAYLAND_DISPLAY=wayland-0 XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct XDG_CURRENT_DESKTOP=wl-res-gnome-shell-direct:ubuntu:GNOME
     systemctl --user start wayland-proxy-gnome-shell-direct.service
 
     wait "$SHELL_PID"

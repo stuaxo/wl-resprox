@@ -18,10 +18,26 @@
 # Testing against a plain build (no .deb installed): point ExecStart at
 # the build output directly, same substitution
 # packaging/wayland-proxy.service's own header documents.
+#
+# Wants=/After=graphical-session.target: found live 2026-08-03 --
+# graphical-session.target (a standard systemd unit, not GNOME-specific)
+# has RefuseManualStart=yes, so it's never reached in this
+# gnome-session-bypassing session unless something else pulls it in as a
+# dependency. Nothing did. Root cause behind xdg-desktop-portal-gnome.service
+# (Requisite=graphical-session.target) failing outright, and very likely
+# also the DING/File-roller D-Bus-activation-timeout gaps noted in
+# plan-desktop-resilience.md -- both are D-Bus-activated components that
+# would hit the identical gap. Since this unit is already what the
+# wrapper explicitly starts once gnome-shell is up, having it pull in
+# graphical-session.target as an allowed dependency (not a direct manual
+# start, which is refused) fixes the gap for every
+# graphical-session.target-gated component at once, not just the portal.
 
 [Unit]
 Description=Crash-resilient Wayland proxy for the wl-res-gnome-shell-direct session
 Conflicts=wayland-proxy-gnome-shell.service wayland-proxy-labwc.service
+Wants=graphical-session.target
+After=graphical-session.target
 
 [Service]
 Type=simple

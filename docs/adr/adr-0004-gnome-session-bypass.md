@@ -158,13 +158,27 @@ future session to rediscover from scratch.
 
 Negative
 
-`wl-res-gnome-shell-direct` has real, already-observed gaps from skipping
+`wl-res-gnome-shell-direct` had real, observed gaps from skipping
 `gnome-session`'s orchestration of the settings daemon/portal/keyring
-layer -- `org.freedesktop.portal.IBus` failing to start, the DING
-(desktop icons) extension retrying its own launch repeatedly. Not yet
-characterized how much of this matters for actual daily use; not
-recommended as a daily-driver replacement for the normal session without
-further work.
+layer -- `xdg-desktop-portal`/`xdg-desktop-portal-gnome` failing outright,
+DING (desktop icons) retrying its own launch repeatedly, File-roller's
+D-Bus service timing out. **Root cause found and fixed, 2026-08-03**:
+`graphical-session.target` (a standard systemd unit, not GNOME-specific)
+has `RefuseManualStart=yes` and was never reached in this session at all
+-- nothing pulled it in as a dependency, and several
+`graphical-session.target`-gated components (`xdg-desktop-portal-gnome.service`
+has `Requisite=graphical-session.target`) failed as a direct result. Fix:
+`wayland-proxy-gnome-shell-direct.service` (already explicitly started by
+the wrapper once gnome-shell is up) now declares
+`Wants=graphical-session.target`, which correctly pulls the target in as
+an allowed dependency rather than a refused direct start. Confirmed live
+this resolved all three symptoms at once from one fix, not three separate
+ones. A separate, real gap remains around stale pre-crash `wl_buffer`
+references causing outright client disconnects on some crashes (not
+`gnome-session`-bypass-specific -- see `plan-desktop-resilience.md`'s own
+TODO on this), and gnome-shell's own "Log Out" does nothing in this
+session (expected, no `gnome-session` to receive the `SessionManager.Logout`
+D-Bus call) -- neither characterized or fixed yet.
 
 The long-term fix is genuinely nontrivial: up to eight independent
 `OnFailure=` tripwires to potentially address (more, if any of them

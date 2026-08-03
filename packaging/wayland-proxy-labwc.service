@@ -25,10 +25,22 @@
 # Testing against a plain build (no .deb installed): point ExecStart at
 # the build output directly, same substitution
 # packaging/wayland-proxy.service's own header documents.
+#
+# Wants=/After=graphical-session.target: same fix as
+# wayland-proxy-gnome-shell-direct.service, applied here for consistency
+# -- see that file's own comment for the full reasoning
+# (RefuseManualStart=yes on graphical-session.target means nothing
+# reaches it in a gnome-session-bypassing session unless something pulls
+# it in as a dependency). Not yet confirmed live specifically for labwc
+# the way it was for wl-res-gnome-shell-direct's portal gap, but the
+# same structural issue applies to any graphical-session.target-gated
+# component (e.g. xdg-desktop-portal-gtk) this session might use.
 
 [Unit]
 Description=Crash-resilient Wayland proxy for the wl-res-labwc session
 Conflicts=wayland-proxy-gnome-shell.service wayland-proxy-gnome-shell-direct.service
+Wants=graphical-session.target
+After=graphical-session.target
 
 [Service]
 Type=simple

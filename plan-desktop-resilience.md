@@ -211,6 +211,16 @@ the settings daemon/portal/keyring layer. Not yet characterized how much
 this matters in practice for daily use; worth doing before treating this
 as more than an interim/testing session.
 
+**TODO, found live 2026-08-03**: gnome-shell's own "Log Out" does nothing
+in this session -- confirmed live by the user clicking it. Expected,
+given it normally talks to `gnome-session` (`SessionManager.Logout` over
+D-Bus) to end things cleanly, and there's no `gnome-session` here to
+receive that call. Not yet checked what it actually does under the hood
+(silently no-ops vs. gnome-shell exiting on its own, which the wrapper's
+restart loop would just treat as a crash and immediately relaunch,
+masking the attempt entirely). A real gap for daily use, separate from
+the crash-recovery goal itself.
+
 **TODO, found live 2026-08-03 during real interactive use (not yet
 fixed)**: a real crash test with `tilix` and `gtk4-demo` already open
 (not freshly launched right before the crash, unlike every automated
@@ -221,19 +231,31 @@ other side -- dropping`. Root cause: `recreation.rs` deliberately excludes
 `wl_buffer` (and thus `zwp_linux_dmabuf_feedback_v1`, which hangs off it)
 from the recreation graph -- correct for a client that allocates fresh
 buffers every frame, but not for one reusing a small buffer pool across
-frames (common for GPU-accelerated rendering), which is far more likely
-once a client has been open for a while rather than just-launched. A
-dropped message referencing a stale buffer id can leave the *real*
-compositor's own object-graph view inconsistent with the client's,
-which Wayland's strict protocol-violation handling can turn into an
-outright disconnect. Not a simple "recreate buffers too" fix -- a
-dmabuf-backed buffer's actual pixel data lives in the old compositor
-process's GPU import and is genuinely gone after a real crash regardless
-(unlike `wl_shm` buffers, where the memory itself isn't tied to the old
-process). The achievable fix is likely making the *drop* graceful (e.g.
-synthesizing the `delete_id` the client would otherwise wait for
-forever) rather than resurrecting buffer content. Deferred, not
-forgotten -- flagged by the user explicitly as real future work.
+frames (common for GPU-accelerated rendering). A dropped message
+referencing a stale buffer id can leave the *real* compositor's own
+object-graph view inconsistent with the client's, which Wayland's strict
+protocol-violation handling can turn into an outright disconnect. Not a
+simple "recreate buffers too" fix -- a dmabuf-backed buffer's actual
+pixel data lives in the old compositor process's GPU import and is
+genuinely gone after a real crash regardless (unlike `wl_shm` buffers,
+where the memory itself isn't tied to the old process). The achievable
+fix is likely making the *drop* graceful (e.g. synthesizing the
+`delete_id` the client would otherwise wait for forever) rather than
+resurrecting buffer content. Deferred, not forgotten -- flagged by the
+user explicitly as real future work.
+
+**Mechanism confirmed live 2026-08-03, with the exact compositor error**
+(during `wl-res-gnome-shell-direct` testing, unrelated to that session's
+fixes -- same gap, clearer evidence): `wl_surface.attach references
+untranslatable object 67 (ClientToHost) -- dropping` immediately followed
+by `COMPOSITOR ERROR: object=1 code=1 message="invalid arguments for
+wl_surface#8.frame"` -- the *real* gnome-shell instance detecting the
+surface never got a valid buffer (because the attach was dropped) and
+sending a fatal protocol error, exactly as theorized. Also corrects an
+earlier assumption: this hit a `gtk4-demo` that had only been running
+~2s, not one open "for a while" -- GPU-accelerated clients apparently
+allocate/reuse buffers from their very first frame, so this is a more
+commonly-hit path than initially thought, not a rare edge case.
 
 ## The actual problem
 
