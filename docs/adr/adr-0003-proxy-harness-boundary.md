@@ -6,7 +6,7 @@ Accepted
 
 Context
 
-plan-test-harness.md's next phases (packaging the proxy, testing it against a matrix of per-WM containers) need a clear line between "the proxy" and "the test harness." Today both live undistinguished in one repo: src/ and Cargo.toml (the proxy) sit alongside scripts/, Containerfile, and scripts/labwc-config/ (containers, WM installers, the crash-inducer, diagnostics, VNC wiring) with no formal boundary between them.
+`docs/plan/plan-0002-test-harness-and-packaging.md`'s next phases (packaging the proxy, testing it against a matrix of per-WM containers) need a clear line between "the proxy" and "the test harness." Today both live undistinguished in one repo: src/ and Cargo.toml (the proxy) sit alongside scripts/, Containerfile, and scripts/labwc-config/ (containers, WM installers, the crash-inducer, diagnostics, VNC wiring) with no formal boundary between them.
 
 Without a stated boundary, packaging work (Phase 7/8) has no clear target, and per-WM testing (Phase 9) has no clear rule for how the proxy gets into each container.
 

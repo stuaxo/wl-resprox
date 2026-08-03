@@ -1,32 +1,32 @@
 # Wayland Crash Resilience Proxy
 
-> **Status: AI/slop-coded spike.** Built largely with an AI coding
-> assistant, exploratory in nature. Live-verified against a real
-> compositor (see below), but not yet independently reviewed. Treat
-> accordingly.
+> **Status: spike.** Built largely with an AI coding assistant.
+> Live-verified against real compositors (see below), but not yet
+> independently reviewed. Treat accordingly.
 
-A crash-resilient Wayland proxy (Rust): relays a client to a compositor
-via direct wire-protocol translation, and survives the compositor
-crashing and restarting without the client noticing.
+A crash-resilient Wayland proxy, written in Rust. Sits between a client
+and a compositor, relaying the wire protocol directly. If the
+compositor crashes and restarts, the proxy reconnects and rebuilds
+enough server-side state that the client never notices.
 
 ## Status
 
-Phases 1-5 done: proxy core, Shadow Table (guest/host id translation),
-full crash recovery, live-verified against real `labwc`. See
-`docs/plan/plan-0001-proxy-core-and-crash-recovery.md` for the build
-history. Current plan: [`plan-test-harness.md`](plan-test-harness.md)
-(multi-WM verification, packaging) — Phases 6-10 all done: all four WMs
-pass an automated L1 matrix (`./harness/wayland-headless-harness test matrix`),
-and the test harness is now also its own installable, general-purpose
-package (`wayland-headless-harness`), independent of this project's own
-git checkout -- see `scripts/README.md`. Both tools also got a real CLI
-since: `wayland-proxy` via `clap`, the harness's own CLI/orchestration
-rewritten from Bash to Python/Typer (container-side scripts stay Bash).
+Proxy core and crash recovery: done, including cross-compositor
+recovery (e.g. labwc crashes, sway takes over the same socket).
+Verified live against labwc, sway, kwin and gnome-shell.
+
+Both the proxy and its test harness have a proper CLI (`clap` for the
+proxy, Python/Typer for the harness). The harness is also its own
+installable package, `wayland-headless-harness`, independent of this
+repo — a general-purpose tool for reproducing Wayland client/compositor
+issues, not just for testing this proxy. See `scripts/README.md`.
+
+Not done: desktop integration (auto-starting under a real session,
+systemd unit lifecycle management) and independent review.
 
 ## Documentation
 
-- `docs/plan/` — phase-by-phase build history, one file per plan
-- `plan-test-harness.md` — next phase: harness packaging + multi-WM matrix
+- `docs/plan/` — build history, one file per phase of work
 - `docs/architecture-context.md`, `docs/architecture-notes.md` — design
 - `docs/adr/` — accepted architecture decisions
 - `docs/implementation-constraints.md` — binding spec for crash recovery
@@ -34,17 +34,17 @@ rewritten from Bash to Python/Typer (container-side scripts stay Bash).
 
 ## Development
 
-See `scripts/README.md`: building/running the dev container, testing
-against a nested compositor, watching over VNC.
+See `scripts/README.md`: building the test containers, running against
+a nested compositor, watching over VNC.
 
 Enable the pre-commit hook once per clone:
 ```bash
 git config core.hooksPath .githooks
 ```
 Runs `cargo test`, `shellcheck` on `scripts/*.sh`/`packaging/*.sh`, a
-`py_compile` sanity check on `harness/`, and an environment sanity check
-on every commit — silent on success, see `.githooks/pre-commit` for
-details. Needs `shellcheck` on the host:
+`py_compile` check on `harness/`, and an environment sanity check —
+silent on success, see `.githooks/pre-commit` for details. Needs
+`shellcheck` on the host:
 ```bash
 sudo apt install shellcheck   # Ubuntu/Debian
 ```

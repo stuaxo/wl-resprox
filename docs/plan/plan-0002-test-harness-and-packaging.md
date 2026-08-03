@@ -1,5 +1,14 @@
 # Plan: Test Harness Packaging & Multi-WM Verification
 
+**Done.** Phases 6-10 complete; moved here from the repo root
+(`plan-test-harness.md`) once finished, per this project's plan-file
+convention. Two items stayed deferred rather than blocking completion:
+`postinst`/`postrm` for the proxy's systemd unit (tied to future L3
+desktop-integration work) and a repo split for proxy vs. harness (a
+standing decision to revisit, not a scheduled task -- see
+`docs/adr/adr-0003-proxy-harness-boundary.md`). See
+`docs/debugging-notes.md` for everything found live while doing this.
+
 Follows `docs/plan/plan-0001-proxy-core-and-crash-recovery.md` (Phases
 1-5, done: proxy core + Shadow Table + crash recovery, live-verified
 against one labwc instance). Separate file: different kind of work

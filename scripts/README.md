@@ -33,7 +33,6 @@ from any particular checkout).
 
 ```
 .
-├── plan-test-harness.md  # harness packaging + multi-WM plan
 ├── docs/
 │   ├── plan/             # phase-by-phase build history, one file per plan
 │   └── ...                # design notes, ADRs, debugging log
@@ -173,8 +172,8 @@ Or from the HOST, without entering the container at all:
 ./harness/wayland-headless-harness test crash --wm=sway --verify-recovery
 ```
 Self-contained; doesn't use step 3's nested compositor. See
-`plan-test-harness.md` for the fuller testing-levels picture and the
-per-WM results recorded there.
+`docs/plan/plan-0002-test-harness-and-packaging.md` for the fuller
+testing-levels picture and the per-WM results recorded there.
 
 ### 5. Full matrix check (optional, replaces steps 1-4 per WM)
 

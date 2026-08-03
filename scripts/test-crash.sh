@@ -20,7 +20,7 @@
 # connection down -- i.e. that Phase 5's "freeze the client socket, don't
 # forward the error" rule (docs/implementation-constraints.md) holds.
 # Doesn't restart the compositor either, so it doesn't exercise
-# reconnect/recreation -- see plan-test-harness.md for the fuller
+# reconnect/recreation -- see docs/plan/plan-0002-test-harness-and-packaging.md for the fuller
 # testing-levels picture and why this stays a narrow L0 check by default.
 #
 # Pass --l1 to go further: after confirming the client survives the
@@ -33,7 +33,7 @@
 # RUST_LOG=debug-and-grep check that's been run by hand for every Phase 9
 # container and swap pair so far (see docs/debugging-notes.md); --l1
 # automates it as the per-WM unit Phase 10's matrix runner needs, since
-# "L0-only doesn't count as verified" per plan-test-harness.md. Default
+# "L0-only doesn't count as verified" per docs/plan/plan-0002-test-harness-and-packaging.md. Default
 # (no --l1) behavior is unchanged, so existing "L0 pass (N/N)" results
 # elsewhere in this project's docs stay meaningful as exactly what they
 # say -- L0 only.
