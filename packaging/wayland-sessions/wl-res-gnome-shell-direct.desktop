@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=GNOME (crash-resilient, direct -- bypasses gnome-session)
+Comment=gnome-shell run directly, no gnome-session -- interim crash-resilient session, see plan-desktop-resilience.md and docs/adr/adr-0004-gnome-session-bypass.md. wl-res-gnome-shell (with gnome-session) stays available for the long-term-fix investigation.
+Exec=/home/stu/projects/mine/wayland-resilliance-proxy/packaging/wl-res-gnome-shell-direct-session-wrapper.sh
+TryExec=/usr/bin/gnome-shell
+Type=Application
+DesktopNames=wl-res-gnome-shell-direct;ubuntu;GNOME
+X-GDM-SessionRegisters=true
+X-GDM-CanRunHeadless=true

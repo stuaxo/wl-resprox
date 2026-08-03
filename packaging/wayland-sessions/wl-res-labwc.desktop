@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=labwc (crash-resilient, via wayland-proxy)
+Comment=labwc on Wayland, routed through wayland-proxy so a compositor crash doesn't end the session -- a simpler comparison point against wl-res-gnome-shell, see plan-desktop-resilience.md
+Exec=/home/stu/projects/mine/wayland-resilliance-proxy/packaging/wl-res-labwc-session-wrapper.sh
+TryExec=/usr/bin/labwc
+Type=Application
+DesktopNames=wl-res-labwc;labwc;wlroots
+X-GDM-SessionRegisters=true
+X-GDM-CanRunHeadless=true

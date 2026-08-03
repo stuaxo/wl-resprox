@@ -1,0 +1,34 @@
+# Session-specific proxy unit for wl-res-gnome-shell-direct -- mirrors
+# wayland-proxy-labwc.service (see that file's own comments): started by
+# the session wrapper script itself, not via After=/dependency ordering
+# on a compositor unit (there isn't one -- gnome-shell runs as the
+# wrapper's own direct child, see
+# wl-res-gnome-shell-direct-session-wrapper.sh's header for why).
+#
+# Target is wl-res-gnome-shell-direct-0, a fixed name (unlike labwc, no
+# symlink indirection needed -- gnome-shell supports
+# --wayland-display=<name> directly, so the wrapper pins it upfront).
+#
+# Conflicts= with BOTH other session proxy units: three sessions can now
+# each claim the public name "wayland-0", each unconditionally
+# unlink-then-bind on their own startup (src/main.rs) -- see
+# wayland-proxy-gnome-shell.service's own comment for the collision this
+# guards against, found live 2026-08-03 building wl-res-labwc.
+#
+# Testing against a plain build (no .deb installed): point ExecStart at
+# the build output directly, same substitution
+# packaging/wayland-proxy.service's own header documents.
+
+[Unit]
+Description=Crash-resilient Wayland proxy for the wl-res-gnome-shell-direct session
+Conflicts=wayland-proxy-gnome-shell.service wayland-proxy-labwc.service
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c 'test "$XDG_SESSION_DESKTOP" = "wl-res-gnome-shell-direct" || exit 2'
+ExecStart=/usr/bin/wayland-proxy --display=wl-res-gnome-shell-direct-0 --listen=wayland-0
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target

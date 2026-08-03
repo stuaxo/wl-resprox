@@ -1,0 +1,79 @@
+# Session-specific proxy unit for wl-res-gnome-shell (see
+# plan-desktop-resilience.md). Deliberately separate from
+# packaging/wayland-proxy.service, which is WantedBy=graphical-session.target
+# unconditionally -- that generic unit would start a stray, misconfigured
+# proxy in the regular "Ubuntu on Wayland" session too, which is not what
+# this file is for. ExecCondition= below is the same "check a
+# session-identifying env var, exit 2 to skip" idiom already found live in
+# use on this exact machine (an old, unrelated NoMachine-patched
+# org.gnome.Shell@wayland.service.backup.NX) -- precedented, not novel.
+#
+# Testing against a plain build (no .deb installed): point ExecStart at the
+# build output directly, same substitution
+# packaging/wayland-proxy.service's own header documents, e.g.:
+#   sed 's#/usr/bin/wayland-proxy#/path/to/target/release/wayland-proxy#' \
+#     packaging/wayland-proxy-gnome-shell.service > ~/.config/systemd/user/wayland-proxy-gnome-shell.service
+#
+# wl-res-gnome-shell-0 (private, gnome-shell-only) and wayland-0 (public,
+# what every other session component -- settings daemon, portals, dock,
+# apps -- should see) must match the --wayland-display= this session's
+# org.gnome.Shell@wl-res-gnome-shell.service.d/override.conf sets.
+#
+# ExecStartPost's environment re-export answers plan-desktop-resilience.md's
+# "who exports WAYLAND_DISPLAY today, and when" question -- CONFIRMED LIVE
+# 2026-08-03: gnome-shell exports its own (private) WAYLAND_DISPLAY during
+# its own startup, so ours has to run after (already true via After=
+# above -- org.gnome.Shell@.service is Type=notify, so After= genuinely
+# waits for its sd_notify READY, not just process spawn).
+#
+# Must pass an explicit VAR=VALUE here, not a bare VAR name:
+# `dbus-update-activation-environment --systemd WAYLAND_DISPLAY` (no
+# `=value`) pulls the value from ITS OWN inherited environment rather than
+# whatever was just staged with `systemctl --user set-environment` a moment
+# earlier in the same shell -- found live the hard way (the bare-name form
+# silently clobbered the export straight back to gnome-shell's private
+# socket, immediately after correctly setting it).
+#
+# Also found live: systemd --user is ONE manager shared across every login
+# on this box, not restarted per-session -- if this unit is already running
+# from an earlier (e.g. failed) session attempt, ExecStartPost never re-runs
+# on a fresh login and this drifts stale again. `systemctl --user restart
+# wayland-proxy-gnome-shell` after logging in is the manual recovery; no
+# permanent fix applied yet (would need BindsTo=/PartOf= tying this unit's
+# lifecycle to the session target, not just After=/WantedBy=).
+#
+# Found live 2026-08-03, more importantly: this ExecStartPost only covers
+# THIS unit's own (rare) startup -- it does nothing on gnome-shell's OWN
+# restarts within an already-running session (there were 3 in a single
+# crash-recovery cycle), each of which re-exports gnome-shell's private
+# WAYLAND_DISPLAY again and wins the race. The real fix now lives on
+# org.gnome.Shell@wl-res-gnome-shell.service.d/override.conf's own
+# ExecStartPost instead, which fires on every one of ITS restarts, not
+# just this unit's. This copy is kept as a harmless, idempotent belt-and
+# -braces for the very first session bring-up, not the primary defense
+# anymore.
+#
+# Conflicts=wayland-proxy-labwc.service: found live 2026-08-03 building
+# the labwc comparison session -- without this, switching sessions
+# doesn't stop the OTHER session's long-lived proxy unit at all (nothing
+# is session-change-aware), and both units bind the identical public
+# name "wayland-0", each unconditionally unlink-then-bind on their own
+# startup (src/main.rs) -- starting one can silently steal the other
+# session's live public socket. Conflicts= makes starting either stop
+# the other first.
+
+[Unit]
+Description=Crash-resilient Wayland proxy for the wl-res-gnome-shell session
+After=org.gnome.Shell@wl-res-gnome-shell.service
+Conflicts=wayland-proxy-labwc.service wayland-proxy-gnome-shell-direct.service
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c 'test "$XDG_SESSION_DESKTOP" = "wl-res-gnome-shell" || exit 2'
+ExecStart=/usr/bin/wayland-proxy --display=wl-res-gnome-shell-0 --listen=wayland-0
+ExecStartPost=/bin/sh -c 'dbus-update-activation-environment --systemd WAYLAND_DISPLAY=wayland-0'
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target

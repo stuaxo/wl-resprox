@@ -1,0 +1,41 @@
+# Session-specific proxy unit for wl-res-labwc -- mirrors
+# wayland-proxy-gnome-shell.service, see that file's own comments for the
+# reasoning behind ExecCondition= and the explicit-value
+# dbus-update-activation-environment requirement, both unchanged here.
+#
+# Target is wl-res-labwc-0, a SYMLINK created by
+# wl-res-labwc-session-wrapper.sh (labwc has no --wayland-display
+# equivalent, so unlike gnome-shell we can't pin its private socket name
+# directly; the symlink gives this unit a stable target despite that).
+# NOT started via After=/systemd dependency ordering on a labwc unit --
+# there isn't one anymore (see the wrapper script's own header for why
+# labwc has to run as GDM's direct child, not a systemd --user unit).
+# The wrapper starts this unit itself, explicitly, once labwc's socket
+# is confirmed up.
+#
+# Conflicts= with wayland-proxy-gnome-shell.service: found live
+# 2026-08-03 that without this, switching sessions doesn't stop the
+# OTHER session's long-lived proxy unit (nothing does -- it's not aware
+# sessions changed at all), and both units listen on the identical
+# public name "wayland-0", each unconditionally unlink-then-bind on
+# their own startup (see src/main.rs) -- meaning starting this one could
+# silently steal the other session's live public socket right out from
+# under it. Conflicts= makes starting either one stop the other first.
+#
+# Testing against a plain build (no .deb installed): point ExecStart at
+# the build output directly, same substitution
+# packaging/wayland-proxy.service's own header documents.
+
+[Unit]
+Description=Crash-resilient Wayland proxy for the wl-res-labwc session
+Conflicts=wayland-proxy-gnome-shell.service wayland-proxy-gnome-shell-direct.service
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c 'test "$XDG_SESSION_DESKTOP" = "wl-res-labwc" || exit 2'
+ExecStart=/usr/bin/wayland-proxy --display=wl-res-labwc-0 --listen=wayland-0
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target
