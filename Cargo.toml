@@ -28,6 +28,7 @@ priority = "optional"
 depends = "$auto"
 assets = [
     ["target/release/wayland-proxy", "usr/bin/", "755"],
+    ["target/release/socket-handoff", "usr/bin/", "755"],
     ["packaging/wayland-proxy.service", "usr/lib/systemd/user/", "644"],
 ]
 
@@ -82,4 +83,4 @@ clap = { version = "4", features = ["derive", "env"] }
 # read/write don't carry file descriptors at all, which is exactly the bug
 # that motivated moving off a raw byte pipe originally. Same crate
 # sommelier-rs and waypipe both use for this.
-nix = { version = "0.31.3", features = ["socket", "fs", "uio"] }
+nix = { version = "0.31.3", features = ["socket", "fs", "uio", "inotify", "signal", "poll"] }

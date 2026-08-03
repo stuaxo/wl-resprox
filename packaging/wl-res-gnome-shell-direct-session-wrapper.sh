@@ -45,12 +45,13 @@
 # socket, which every app it directly spawns (Super key search, dock,
 # Activities -- NOT covered by the dbus-update-activation-environment
 # calls below, which only reach D-Bus-activated services) then inherits
-# normally. Immediately after gnome-shell's socket appears, this script
-# renames it out from under that name to $HOST_DISPLAY (the proxy's own
-# --display= target, unchanged across every restart, so the proxy's
-# existing reconnect_with_backoff logic needs no awareness of any of
-# this) and tells the proxy to reclaim the now-vacant public name --
-# `systemctl ... start` the first time, `... kill --signal=SIGUSR1`
+# normally. Immediately after gnome-shell's socket appears, socket-handoff
+# (src/bin/socket-handoff.rs, see its own module doc comment) renames it
+# out from under that name to $HOST_DISPLAY (the proxy's own --display=
+# target, unchanged across every restart, so the proxy's existing
+# reconnect_with_backoff logic needs no awareness of any of this) and
+# this script then tells the proxy to reclaim the now-vacant public name
+# -- `systemctl ... start` the first time, `... kill --signal=SIGUSR1`
 # every restart after that, since the proxy stays running across
 # gnome-shell crashes and only needs its LISTENER rebound in place, not
 # a full process restart (which would drop every already-connected
@@ -59,6 +60,23 @@
 # socket-claiming (wl_socket_lock) has no liveness check beyond a lock
 # file, so a freshly-restarted gnome-shell will always successfully
 # steal $PUBLIC_DISPLAY back, including from the proxy.
+#
+# A plain shell polling loop (`while [ ! -S path ]; ... sleep 0.05`) was
+# tried here first and found live 2026-08-03 to have a real bug, not just
+# a speed problem: it matched a STALE leftover socket file from a
+# PREVIOUS cycle (the proxy doesn't unlink its own socket on shutdown)
+# instead of gnome-shell's own fresh bind, confirmed by comparing the
+# renamed file's birth time against gnome-shell's own reported bind
+# timestamp -- over a minute apart. That let every one of gnome-shell's
+# own startup helpers (DING, notification daemon, ...) connect directly
+# to it, completely unprotected, for the rest of the session.
+# socket-handoff fixes this at the root (inotify's IN_CREATE only fires
+# for a file created *after* the watch starts, plus it removes any stale
+# file before watching as a second line of defense) and additionally
+# SIGSTOPs gnome-shell the instant its socket appears, before the rename,
+# closing the *remaining* race (gnome-shell's own children connecting
+# before the swap completes) -- see that binary's own doc comment for
+# the full detail on both fixes.
 #
 # Logs to $XDG_RUNTIME_DIR/wl-res-gnome-shell-direct-wrapper.log, same
 # reasoning as the labwc wrapper's own header comment.
@@ -112,20 +130,19 @@ while :; do
     SHELL_PID=$!
     echo "$(date -Iseconds) gnome-shell started, pid=$SHELL_PID"
 
-    # Wait for gnome-shell's own socket to appear at $PUBLIC_DISPLAY --
+    # Blocks until gnome-shell's own socket appears at $PUBLIC_DISPLAY --
     # it always binds there (see the header comment), stealing whatever
-    # was previously there (including a prior cycle's now-orphaned
-    # proxy listener) unconditionally. Bails out of the wait (not the
-    # whole script) if gnome-shell itself already died first, so a
-    # broken gnome-shell doesn't spin this loop forever.
-    while [ ! -S "$RUNTIME_DIR/$PUBLIC_DISPLAY" ]; do
-        kill -0 "$SHELL_PID" 2>/dev/null || break
-        sleep 0.05
-    done
-
-    if [ -S "$RUNTIME_DIR/$PUBLIC_DISPLAY" ]; then
-        mv -f "$RUNTIME_DIR/$PUBLIC_DISPLAY" "$RUNTIME_DIR/$HOST_DISPLAY"
-        echo "$(date -Iseconds) renamed $PUBLIC_DISPLAY -> $HOST_DISPLAY, reclaiming $PUBLIC_DISPLAY for the proxy"
+    # was previously there (including a prior cycle's now-orphaned proxy
+    # listener) unconditionally -- then SIGSTOPs gnome-shell, renames the
+    # socket to $HOST_DISPLAY, and SIGCONTs it. See socket-handoff's own
+    # doc comment for why this replaced a plain polling loop. Non-zero
+    # exit (gnome-shell died before ever creating the socket, or a real
+    # I/O error) means there's nothing to hand off this cycle.
+    if /home/stu/projects/mine/wayland-resilliance-proxy/target/release/socket-handoff \
+        --dir "$RUNTIME_DIR" --watch-name "$PUBLIC_DISPLAY" --rename-to "$HOST_DISPLAY" \
+        --freeze-pid "$SHELL_PID"
+    then
+        echo "$(date -Iseconds) handed off $PUBLIC_DISPLAY -> $HOST_DISPLAY, reclaiming $PUBLIC_DISPLAY for the proxy"
 
         if [ "$proxy_started" = 0 ]; then
             systemctl --user start "$PROXY_UNIT"
@@ -134,7 +151,7 @@ while :; do
             systemctl --user kill --signal=SIGUSR1 "$PROXY_UNIT"
         fi
     else
-        echo "$(date -Iseconds) gnome-shell exited before ever creating $PUBLIC_DISPLAY -- nothing to rename this cycle"
+        echo "$(date -Iseconds) socket-handoff failed this cycle (see above) -- nothing to hand off"
     fi
 
     dbus-update-activation-environment --systemd XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct XDG_CURRENT_DESKTOP=wl-res-gnome-shell-direct:ubuntu:GNOME
