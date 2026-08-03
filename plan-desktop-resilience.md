@@ -398,6 +398,63 @@ successfully steal `wayland-0` back). Status: designed, not yet
 implemented -- see the ADR for the full reasoning, source citations, and
 rejected alternatives.
 
+**ADR-0005 implemented and live-verified 2026-08-03, same day.** The
+rename-after-bind design, `SIGUSR1` listener rebind (`src/main.rs`), and
+the native `socket-handoff` helper (`src/bin/socket-handoff.rs`, using
+`inotify` via `nix` -- not a shell polling loop, not `inotifywait`) all
+landed and were confirmed working live: Shell-launched apps (Super key,
+dock) now correctly route through the proxy, not gnome-shell directly.
+Three further bugs found chasing this live, all fixed and covered by new
+tests, not just patched ad hoc:
+
+- **Stale-file false match**: the session wrapper's original plain
+  `while [ ! -S path ]` poll loop matched a stale leftover socket file
+  from a previous cycle instead of gnome-shell's fresh bind (the proxy
+  doesn't unlink its own socket on shutdown). `socket-handoff` fixes this
+  at the root via `inotify`'s `IN_CREATE` (only fires for files created
+  *after* the watch starts) plus removing any stale file before
+  watching, and additionally `SIGSTOP`s gnome-shell the instant its
+  socket appears -- before the rename -- closing the *remaining* race
+  (gnome-shell's own startup helpers, e.g. DING, connecting before the
+  swap completes).
+- **Wrapper login-state bug**: the wrapper decided `systemctl start` vs.
+  `kill --signal=SIGUSR1` using a local shell variable that resets on
+  every fresh login, while the proxy unit itself correctly stays running
+  *across* logins -- so the first handoff after every login called
+  `start` against an already-active unit (silent no-op), leaving
+  `wayland-0` with nothing listening on it. Looked exactly like a HiDPI
+  bug (gtk4-demo/tilix launched tiny) until `strace` on gnome-shell's own
+  `execve`/`connect` calls showed `ENOENT` connecting to `wayland-0`.
+  Fixed by querying `systemctl --user is-active` instead of trusting
+  local memory.
+- **Dropped `wl_surface.frame` stalls the client forever**: a real
+  gtk4-demo caught mid-render at the exact moment of a crash never
+  redrew again, even though its surface/`xdg_toplevel` otherwise
+  recovered fully seconds later. `gtk.fill()` in `run_connection`'s
+  select loop has no `if !frozen` guard, so client requests keep getting
+  processed the whole time frozen -- including the gap between a failed
+  reconnect attempt and the next one succeeding, during which
+  `bump_generation()` has already run but the client's objects aren't
+  remapped yet. A `frame()` request landing there hit the same drop path
+  as a *permanently* stale object like `wl_buffer`, except a surface
+  comes back seconds later -- the client was just never told, since the
+  `wl_callback.done` its frame clock was blocking on was silently
+  dropped along with the request. Fixed by synthesizing `done` (+ the
+  `delete_id` a one-shot callback is owed) instead of dropping silently,
+  same pattern as the `wl_buffer.destroy`/`delete_id` fix.
+
+Also added `tests/socket_handoff_integration.rs` and
+`tests/proxy_binary_lifecycle.rs`, spawning the actual compiled binaries
+across multiple restart/rebind cycles rather than just once -- per the
+explicit ask to check lifecycle assumptions with real tests instead of
+ad hoc shell commands, since the wrapper login-state bug above was
+exactly that shape of bug (worked the first time a path was exercised,
+silently wrong the second time a *different* path hit it).
+
+Still to verify: a full crash test with the frame-callback fix live,
+confirming a mid-render gtk4-demo actually keeps rendering after
+recovery, not just that the proxy-side mechanics are correct.
+
 ## The actual problem
 
 gnome-shell sometimes crashes while the screen is **locked**. Since
