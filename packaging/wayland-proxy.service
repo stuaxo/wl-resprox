@@ -4,20 +4,27 @@
 # PAMName= or similar to get it for a specific logged-in user). This
 # matches how session components like xdg-desktop-portal are run.
 #
-# ExecStart assumes /usr/bin/wayland-proxy -- the eventual Phase 7 .deb
-# install path, not yet real (no package exists yet). For manual testing
-# before that exists, install a copy of this file with ExecStart pointed
-# at the actual build output instead, e.g.:
-#   sed 's#/usr/bin/wayland-proxy#/path/to/target-host/release/wayland-proxy#' \
-#     packaging/wayland-proxy.service > ~/.config/systemd/user/wayland-proxy.service
+# ExecStart assumes /usr/bin/wayland-proxy -- true once the .deb (`cargo
+# deb`, Phase 7, done) is installed via `dpkg -i`. This file is shipped
+# as a plain asset in that .deb, at /usr/lib/systemd/user/ -- see
+# Cargo.toml's [package.metadata.deb] assets list. `postinst`/`postrm`
+# enable/disable wiring is deliberately not done yet (see ADR-0003's
+# plan for why); until then, install/enable it yourself:
+#   cp /usr/lib/systemd/user/wayland-proxy.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user start wayland-proxy
+#   systemctl --user enable --now wayland-proxy
 #   journalctl --user -u wayland-proxy -f
 #
-# WAYLAND_DISPLAY: not set here -- src/main.rs already falls back to
-# "wayland-1" if unset, which is wrong for most real setups. Override via
-# an environment file (optional -- the leading "-" means systemd won't
-# fail if it's missing) rather than editing this unit directly.
+# Testing against a plain build (no .deb installed) instead: point
+# ExecStart at the build output directly, e.g.:
+#   sed 's#/usr/bin/wayland-proxy#/path/to/target/release/wayland-proxy#' \
+#     packaging/wayland-proxy.service > ~/.config/systemd/user/wayland-proxy.service
+#
+# --display/WAYLAND_DISPLAY: not set here -- the proxy itself falls back
+# to "wayland-1" if neither is given, which is wrong for most real
+# setups. Override via an environment file (optional -- the leading "-"
+# means systemd won't fail if it's missing) rather than editing this
+# unit directly.
 
 [Unit]
 Description=Crash-resilient Wayland proxy

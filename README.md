@@ -24,6 +24,29 @@ issues, not just for testing this proxy. See `scripts/README.md`.
 Not done: desktop integration (auto-starting under a real session,
 systemd unit lifecycle management) and independent review.
 
+## Usage
+
+```bash
+cargo build --release
+```
+Builds `target/release/wayland-proxy`. Run it pointed at an existing
+compositor socket:
+```bash
+wayland-proxy --display wayland-0
+```
+It listens on `wayland-proxy-0` by default. Point a client at it:
+```bash
+WAYLAND_DISPLAY=wayland-proxy-0 gtk4-demo
+```
+`--display`/`--listen` fall back to `WAYLAND_DISPLAY`/`WAYLAND_PROXY_LISTEN`
+if not given; `--log-level` to `RUST_LOG`. See `wayland-proxy --help`
+for the rest (`--record` for wire-traffic capture).
+
+For a persistent, restart-on-crash instance under your own session, use
+the systemd `--user` unit: `packaging/wayland-proxy.service` (see its
+own header comment for enabling it — not yet wired into the `.deb`'s
+install/remove hooks, so that's a manual step for now).
+
 ## Documentation
 
 - `docs/plan/` — build history, one file per phase of work
