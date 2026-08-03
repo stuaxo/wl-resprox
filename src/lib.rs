@@ -718,6 +718,72 @@ async fn relay_ready_messages(
                         }
                         objects.remove_guest(guest_sender_id);
                         graph.remove(guest_sender_id);
+                    } else if matches!(direction, Direction::ClientToHost)
+                        && interface.name == "wl_surface"
+                        && desc.name == "frame"
+                    {
+                        // Found live 2026-08-03 (see plan-desktop-resilience.md):
+                        // wl_surface.frame registers a promise the
+                        // compositor must keep -- "tell me (via
+                        // wl_callback.done) when it's a good time to draw
+                        // again" -- which GTK's own frame clock blocks on.
+                        // Unlike wl_buffer/wl_shm (permanently outside the
+                        // recreation graph), wl_surface DOES come back
+                        // after a reconnect; this branch fires for a
+                        // frame() request that merely arrived in the
+                        // narrow window between bump_generation() and the
+                        // surface being remapped by
+                        // recover_state_after_reconnect, not because the
+                        // surface is gone for good. Dropping the request
+                        // without answering it leaves the client waiting
+                        // forever on a callback that will never fire,
+                        // since the request that would have triggered it
+                        // never reached the real compositor -- a real
+                        // gtk4-demo caught mid-render at the moment of a
+                        // crash stalled exactly this way, its window never
+                        // redrawing again despite the surface/toplevel
+                        // otherwise recovering fully seconds later. Losing
+                        // the frame's own attach/commit is fine (matches
+                        // implementation-constraints.md's "tell the client
+                        // the display went away" design -- one frame's
+                        // pixel content is acceptable loss); the callback
+                        // specifically must still be answered, or the
+                        // stall is permanent, not just a skipped frame.
+                        if let Some(callback_guest_id) = newly_mapped_guest_id {
+                            if let Some(callback_iface) = objects.interface(callback_guest_id) {
+                                if let Some(done_opcode) = event_opcode(callback_iface, "done") {
+                                    let mut done_payload = Vec::new();
+                                    wire::put_u32(&mut done_payload, 0); // callback_data: no real presentation timestamp to give
+                                    if let Err(e) = src
+                                        .write_message(&wire::build_message(callback_guest_id, done_opcode, &done_payload), &[])
+                                        .await
+                                    {
+                                        warn!("failed to synthesize wl_callback.done for a dropped wl_surface.frame: {e}");
+                                    }
+                                }
+                                // wl_callback is a one-shot object -- a real
+                                // compositor frees it immediately after
+                                // done, and the client waits on delete_id
+                                // before reusing the id (same reasoning as
+                                // the destructor branch above).
+                                if let Some(delete_id_opcode) =
+                                    objects.interface(1).and_then(|wl_display| event_opcode(wl_display, "delete_id"))
+                                {
+                                    let mut delete_id_payload = Vec::new();
+                                    wire::put_u32(&mut delete_id_payload, callback_guest_id);
+                                    if let Err(e) = src
+                                        .write_message(&wire::build_message(1, delete_id_opcode, &delete_id_payload), &[])
+                                        .await
+                                    {
+                                        warn!("failed to synthesize delete_id for a dropped frame callback: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        warn!(
+                            "wl_surface.frame sender has no translation on the other side -- \
+                             synthesized done+delete_id instead of dropping silently"
+                        );
                     } else {
                         warn!(
                             "{}.{} sender has no translation on the other side -- dropping",

@@ -828,6 +828,189 @@ async fn create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping() {
     host_listener_task.abort();
 }
 
+/// Found live 2026-08-03 (see plan-desktop-resilience.md): a real
+/// gtk4-demo caught mid-render at the exact moment of a crash never
+/// redrew again, even though its surface/xdg_toplevel otherwise recovered
+/// fully seconds later. Root cause: `wl_surface.frame` registers a
+/// promise the compositor must keep -- deliver `wl_callback.done` when
+/// it's a good time to draw again -- which GTK's own frame clock blocks
+/// on. `gtk.fill()` in `run_connection`'s select loop has no `if !frozen`
+/// guard (unlike `host.fill()`), so client requests keep getting read and
+/// processed the whole time the connection is frozen, including during
+/// the window between `bump_generation()` (which runs synchronously,
+/// immediately on reconnect, before `recover_state_after_reconnect` even
+/// starts) and the client's own surface actually being remapped by it. A
+/// `frame()` request landing in exactly that window hits the same
+/// "sender has no translation" path as a permanently-stale object like
+/// `wl_buffer` -- except a `wl_surface` isn't permanently stale, it's
+/// just not remapped *yet*, and the old code dropped the request without
+/// ever answering the promise it represented, stalling the client's
+/// frame clock forever. This test proves the fix: synthesize
+/// `wl_callback.done` (+ the `delete_id` a one-shot callback object is
+/// owed) instead of silently dropping it.
+#[tokio::test]
+async fn frame_request_during_the_recovery_window_gets_a_synthesized_done() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6), ("xdg_wm_base", 6)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-frame-during-recovery-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
+        .await
+        .expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (first_sink, _first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    // get_registry(2), sync(3), bind wl_compositor->4, create_surface->6 --
+    // same guest-id scheme as the other full-chain reconnect tests, but
+    // this test only needs the surface itself (wl_surface.frame is a
+    // request on the surface directly), not the full xdg_surface/toplevel
+    // chain.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p));
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+    read_n_messages(&mut gtk_test_side, 2).await; // global(wl_compositor) + callback.done
+
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 1); // name
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 4); // new_id (guest) -- wl_compositor
+    out.clear();
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 6); // new_id (guest) -- wl_surface
+    out.extend(wire::build_message(4, 0, &p)); // wl_compositor(4).create_surface -> wl_surface(6)
+    gtk_test_side.write_all(&out).await.expect("write bind+create_surface");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Crash. Reaching the actual bug requires reproducing exactly how
+    // `run_connection`'s select loop schedules things (see this test's
+    // own module-level doc comment): while `recover_state_after_reconnect`
+    // is itself running (as the BODY of the `reconnect_with_backoff, if
+    // frozen` arm), the select loop is not back at its own top level, so
+    // `gtk.fill()` -- despite having no `if !frozen` guard -- isn't being
+    // polled at all during that specific window. It's the GAP *between*
+    // reconnect attempts (back at the top-level select!, frozen still
+    // true, a fresh `reconnect_with_backoff(...)` racing against
+    // `gtk.fill()`) where a client message can win and get processed
+    // against now-stale (bump_generation() already ran once) but
+    // not-yet-remapped objects. So: force the FIRST reconnect attempt to
+    // fail partway (accept, then drop without responding, so
+    // recover_state_after_reconnect's very first write fails) and close
+    // the listener entirely for a moment, guaranteeing
+    // reconnect_with_backoff's next connect() attempt genuinely fails and
+    // backs off -- a real ~250ms window, not a hopeful race.
+    first_life_task.abort();
+    let (second_host_accepted, _) =
+        tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+            .await
+            .expect("proxy should reconnect within 3s")
+            .expect("accept second host conn");
+    drop(second_host_accepted); // closed with nothing written -- recovery's first write fails
+    drop(host_listener);
+    std::fs::remove_file(&host_socket_path).expect("remove socket file so the next connect() genuinely fails");
+
+    // Wait for the proxy to notice the failed attempt and go back to
+    // retrying -- confirmed via its own log line from the frozen-recovery
+    // fix earlier tonight, but here just give it a moment rather than
+    // parsing logs. Comfortably longer than reconnect_with_backoff's own
+    // fixed 250ms retry interval (see reconnect_with_backoff's source),
+    // so this reliably lands in the gap between attempts even under
+    // parallel test-suite load rather than racing it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Now, while genuinely back at the top-level select loop (frozen,
+    // reconnect_with_backoff mid-backoff since nothing is listening yet),
+    // the client sends wl_surface(6).frame(new_id=50) -- exactly what a
+    // real gtk4-demo mid-render does every frame. Guest id 6 is already
+    // stale (bump_generation() ran when the first, failed reconnection
+    // was accepted) but not yet remapped (recovery hasn't succeeded yet).
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 50); // new_id (guest) -- the wl_callback
+    gtk_test_side.write_all(&wire::build_message(6, 3, &p)).await.expect("write frame()"); // opcode 3 = wl_surface.frame
+    tokio::time::sleep(Duration::from_millis(150)).await; // let the select loop actually pick it up
+
+    // Now provide the real, working host connection.
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("rebind host");
+    // serve_fake_compositor_life handles get_registry/sync/globals
+    // automatically and forwards anything else it receives to this sink --
+    // the clean way to prove frame() specifically never got forwarded,
+    // without confusing it for recovery's own (expected) traffic on the
+    // same connection.
+    let (second_sink, mut second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) =
+            tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+                .await
+                .expect("proxy should reconnect within 3s")
+                .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
+    });
+
+    // The client must get wl_callback.done for guest id 50, then
+    // wl_display.delete_id(50) -- the promise wl_surface.frame made, even
+    // though the real request never reached any compositor.
+    let mut synthesized = read_n_messages(&mut gtk_test_side, 2).await.into_iter();
+    let done = synthesized.next().unwrap();
+    let done_header = wire::MessageHeader::parse(&done).expect("valid header");
+    assert_eq!(done_header.sender_id, 50, "done should be sent from the callback's own guest id");
+    assert_eq!(done_header.opcode, 0, "wl_callback.done event opcode");
+
+    let delete_id = synthesized.next().unwrap();
+    let delete_id_header = wire::MessageHeader::parse(&delete_id).expect("valid header");
+    assert_eq!(delete_id_header.sender_id, 1, "delete_id is always sent from wl_display");
+    assert_eq!(delete_id_header.opcode, 1, "delete_id event opcode");
+    let deleted_id = wire::read_u32(&delete_id[wire::HEADER_LEN..], 0).expect("deleted id");
+    assert_eq!(deleted_id, 50, "should free the callback's own guest id, matching a real compositor's one-shot lifecycle");
+
+    // Recovery replays exactly 2 requests against this life: bind
+    // (wl_compositor) and create_surface -- if the dropped frame() had
+    // instead been forwarded, it would show up here as an unexpected
+    // extra message.
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+            .await
+            .expect("timed out waiting for a recreation request")
+            .expect("sink closed early");
+    }
+    let unexpected = tokio::time::timeout(Duration::from_millis(300), second_sink_rx.recv()).await;
+    assert!(
+        unexpected.is_err(),
+        "frame() on a stale-generation surface must never be forwarded, but the fake compositor \
+         received something extra: {unexpected:?}"
+    );
+
+    host_listener_task.abort();
+}
+
 /// Proves just the reconnect *trigger* mechanism (`reconnect_with_backoff`
 /// wired into `run_connection`'s select loop): a dropped compositor
 /// connection freezes as before, and once the compositor socket accepts a
