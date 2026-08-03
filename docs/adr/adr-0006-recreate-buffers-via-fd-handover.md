@@ -152,3 +152,32 @@ completed change. Next session should start from `scripts/gtk/dmabuf_gl.py`
 crash-tested against `wl-res-gnome-shell-direct` as the concrete
 reproduction to fix, rather than gtk4-demo's own more complex,
 harder-to-instrument behavior.
+
+Checked against other prior art for this class of problem (2026-08-03):
+PipeWire's own buffer/stream renegotiation, CRIU's documented GPU/DRM
+fd-restore limitations, VFIO/QEMU device-state migration, and sommelier
+(this project's own `ShadowTable` is already modeled on sommelier-rs).
+Two items came up worth naming here, deliberately as "verify empirically
+if it turns out to matter" rather than designed for now -- neither has
+any evidence behind it yet, this project's own retained-context reasoning
+should carry more weight than an external, project-blind opinion once
+either is actually tested:
+
+- **Retained fds must be closed when their guest object is legitimately
+  destroyed** (`wl_buffer.destroy`, or the client recycling its own
+  buffer pool), not just held forever -- otherwise the proxy itself
+  becomes a GPU-memory leak source. Mechanically simple: the same
+  `remove_guest`/`graph.remove` call already made for `delete_id` today
+  is the natural place to also close the retained fd, not a separate
+  new lifecycle path.
+- **GPU fence state on the recreated buffer** -- whether a dma_fence
+  attached to a buffer the old (crashed) compositor was mid-operation on
+  could ever fail to signal, blocking the new compositor's own GPU work
+  against it. The kernel's dma-fence framework is specifically designed
+  to guarantee signaling even on context teardown (a driver that doesn't
+  is considered buggy), and this project's crash scenario has the
+  *compositor* dying, not the buffer-owning client -- mutter's own GPU
+  context teardown should trigger that guarantee. Nothing observed live
+  so far points at a GPU-level hang (every failure found this session
+  was protocol-level: a dropped `attach`, a dropped `frame`), so treat
+  this as a "watch for it, don't build for it yet" item.
