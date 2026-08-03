@@ -123,8 +123,6 @@ echo "$(date -Iseconds) wrapper starting"
     done
 ) &
 
-proxy_started=0
-
 while :; do
     gnome-shell --mode=ubuntu --wayland-display="$PUBLIC_DISPLAY" &
     SHELL_PID=$!
@@ -144,11 +142,25 @@ while :; do
     then
         echo "$(date -Iseconds) handed off $PUBLIC_DISPLAY -> $HOST_DISPLAY, reclaiming $PUBLIC_DISPLAY for the proxy"
 
-        if [ "$proxy_started" = 0 ]; then
-            systemctl --user start "$PROXY_UNIT"
-            proxy_started=1
-        else
+        # Query the unit's ACTUAL current state, not a local variable --
+        # found live 2026-08-03: a local "have I started it yet" flag
+        # resets to unset every time this SCRIPT restarts (i.e. every
+        # fresh login), but the proxy unit itself is a separate,
+        # longer-lived systemd --user service that stays running ACROSS
+        # logins (that's the whole point -- it survives gnome-shell
+        # crashes without itself restarting). A flag blind to that meant
+        # the first handoff after every fresh login called `start`
+        # against an ALREADY-active unit -- a silent no-op -- instead of
+        # the SIGUSR1 rebind it actually needed, leaving nothing
+        # listening on $PUBLIC_DISPLAY at all until the next crash cycle
+        # (or later, an explicit unit restart) happened to trigger a real
+        # rebind. Confirmed live: gtk4-demo/tilix launched via Super key
+        # in that state got ENOENT connecting to wayland-0 and silently
+        # fell back to X11 -- looked like a HiDPI bug, wasn't.
+        if systemctl --user is-active --quiet "$PROXY_UNIT"; then
             systemctl --user kill --signal=SIGUSR1 "$PROXY_UNIT"
+        else
+            systemctl --user start "$PROXY_UNIT"
         fi
     else
         echo "$(date -Iseconds) socket-handoff failed this cycle (see above) -- nothing to hand off"
