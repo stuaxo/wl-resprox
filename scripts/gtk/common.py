@@ -67,6 +67,7 @@ class TestWindow(Gtk.ApplicationWindow):
     LOG_EVERY_N_FRAMES = 30  # roughly once a second at the ~30fps timer below
     STALL_THRESHOLD_SECONDS = 5  # found live 2026-08-03: silence alone is ambiguous -- say so instead
     STALL_REMINDER_SECONDS = 5  # re-log while still stalled, so the log itself doesn't look dead
+    STALL_QUIT_SECONDS = 30  # give up and exit rather than sit stalled indefinitely
 
     def __init__(self, app, title):
         super().__init__(application=app, title=title, default_width=320, default_height=240)
@@ -124,6 +125,13 @@ class TestWindow(Gtk.ApplicationWindow):
                     "that will never arrive",
                     since_last_tick,
                 )
+            elif since_last_tick >= self.STALL_QUIT_SECONDS:
+                # Give up rather than sit stalled indefinitely -- nothing
+                # about a dead render loop is going to fix itself, and a
+                # human doesn't need to come back and Ctrl-C it by hand.
+                log.warning("GIVING UP: stalled for %.1fs, quitting", since_last_tick)
+                self.get_application().quit()
+                return GLib.SOURCE_REMOVE
             elif time.monotonic() - self._last_stall_reminder_time >= self.STALL_REMINDER_SECONDS:
                 self._last_stall_reminder_time = time.monotonic()
                 log.warning("STILL STALLED: no frame tick for %.1fs", since_last_tick)
