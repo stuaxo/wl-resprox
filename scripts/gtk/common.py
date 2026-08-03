@@ -31,7 +31,10 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+    # %(name)s -- the label run() is given -- so two of these running in
+    # the same terminal (the common way to compare SHM vs. dmabuf
+    # side by side) can still be told apart line by line.
+    format="%(asctime)s.%(msecs)03d [%(name)s/%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
@@ -128,7 +131,9 @@ class TestWindow(Gtk.ApplicationWindow):
         return False
 
 
-def run(app_id, title):
+def run(app_id, title, label):
+    global log
+    log = logging.getLogger(label)  # see the %(name)s format set up above
     log_startup_environment()
 
     def on_activate(app):

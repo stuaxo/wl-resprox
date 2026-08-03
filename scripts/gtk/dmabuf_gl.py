@@ -19,4 +19,4 @@ os.environ["GSK_RENDERER"] = "gl"  # must be set before gi/Gtk is imported -- se
 import common  # noqa: E402
 
 if __name__ == "__main__":
-    raise SystemExit(common.run("org.wlresproxy.test.DmabufGl", "wl-res test: dmabuf (GL)"))
+    raise SystemExit(common.run("org.wlresproxy.test.DmabufGl", "wl-res test: dmabuf (GL)", "dmabuf_gl"))

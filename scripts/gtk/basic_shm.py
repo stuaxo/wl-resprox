@@ -18,4 +18,4 @@ os.environ["GSK_RENDERER"] = "cairo"  # must be set before gi/Gtk is imported --
 import common  # noqa: E402
 
 if __name__ == "__main__":
-    raise SystemExit(common.run("org.wlresproxy.test.BasicShm", "wl-res test: basic (SHM/cairo)"))
+    raise SystemExit(common.run("org.wlresproxy.test.BasicShm", "wl-res test: basic (SHM/cairo)", "basic_shm"))
