@@ -5,9 +5,21 @@
 # wrapper's own direct child, see
 # wl-res-gnome-shell-direct-session-wrapper.sh's header for why).
 #
-# Target is wl-res-gnome-shell-direct-0, a fixed name (unlike labwc, no
-# symlink indirection needed -- gnome-shell supports
-# --wayland-display=<name> directly, so the wrapper pins it upfront).
+# Target is wl-res-gnome-shell-direct-host-0, a fixed private name the
+# wrapper renames gnome-shell's own socket to on every single startup and
+# restart -- gnome-shell itself is actually started with
+# --wayland-display=wayland-0 (this unit's own --listen= name!), not a
+# private one. See docs/adr/adr-0005-route-shell-launched-clients-through-the-proxy.md
+# for the full reasoning: this is deliberate, so that apps GNOME Shell
+# spawns directly (Super key search, dock, Activities) -- which inherit
+# WAYLAND_DISPLAY from mutter's own one-time setenv() on itself, not from
+# any environment this unit or the wrapper controls -- end up pointed at
+# this proxy instead of at gnome-shell directly. Only the FIRST cycle
+# gets `systemctl ... start`ed by the wrapper; every gnome-shell restart
+# after that sends this unit SIGUSR1 instead (`systemctl ... kill
+# --signal=SIGUSR1`), which src/main.rs handles by rebinding its public
+# listener in place -- deliberately not a full restart of this unit,
+# which would drop every already-connected client.
 #
 # Conflicts= with BOTH other session proxy units: three sessions can now
 # each claim the public name "wayland-0", each unconditionally
@@ -42,7 +54,7 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecCondition=/bin/sh -c 'test "$XDG_SESSION_DESKTOP" = "wl-res-gnome-shell-direct" || exit 2'
-ExecStart=/usr/bin/wayland-proxy --display=wl-res-gnome-shell-direct-0 --listen=wayland-0
+ExecStart=/usr/bin/wayland-proxy --display=wl-res-gnome-shell-direct-host-0 --listen=wayland-0
 Restart=on-failure
 RestartSec=1
 
