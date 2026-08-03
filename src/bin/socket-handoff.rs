@@ -65,6 +65,28 @@ struct Cli {
     timeout_secs: u64,
 }
 
+/// Whether `pid` is still meaningfully alive -- exited (not just zombie)
+/// counts as dead. `kill(pid, None)` (signal 0) alone isn't enough: a
+/// zombie process (exited, not yet reaped by its parent) still holds its
+/// PID table entry, so signal-0 existence checks keep succeeding against
+/// it. Found via this binary's own integration test, not live: the
+/// session wrapper calls socket-handoff *before* its own `wait
+/// "$SHELL_PID"`, so a gnome-shell that crashes during exactly this
+/// window would sit as an unreaped zombie for the same reason, fooling a
+/// signal-0-only check in real use too, not just in a test harness that
+/// forgot to reap its own dummy target.
+fn target_is_alive(pid: Pid) -> bool {
+    if kill(pid, None).is_err() {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => !status.lines().any(|line| line.starts_with("State:") && line.contains('Z')),
+        // Can't read /proc for it at all -- treat as gone rather than
+        // risking an infinite wait on something we can no longer see.
+        Err(_) => false,
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let target_path = cli.dir.join(&cli.watch_name);
@@ -92,10 +114,7 @@ fn main() -> Result<()> {
         if Instant::now() >= deadline {
             bail!("timed out after {}s waiting for {}", cli.timeout_secs, target_path.display());
         }
-        // Signal 0 (None): never actually signals the process, just checks
-        // it still exists -- so a crashed target doesn't leave us blocked
-        // here until the timeout for no reason.
-        if kill(pid, None).is_err() {
+        if !target_is_alive(pid) {
             bail!("pid {pid} exited before creating {}", target_path.display());
         }
 
