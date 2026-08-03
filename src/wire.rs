@@ -148,6 +148,18 @@ pub fn read_str(payload: &[u8], offset: usize) -> Option<(String, usize)> {
     Some((s, start + padded))
 }
 
+/// Hex-encodes bytes for diagnostic output -- shared so a live `warn!` log
+/// line and `recorder::Recorder::record`'s on-disk format use the exact
+/// same representation of the same bytes.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

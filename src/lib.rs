@@ -298,10 +298,24 @@ async fn relay_ready_messages(
             // recognize are simply not usable), just now enforced
             // per-message instead of by never advertising the global in
             // the first place.
-            warn!(
-                "unknown object {} opcode {} ({:?}) -- dropping",
-                header.sender_id, header.opcode, direction
-            );
+            // sender_id is only guest-space for ClientToHost (see the
+            // guest_sender_id match above) -- only look up a remembered
+            // name in that direction, not against a host-space id.
+            let known_interface = match direction {
+                Direction::ClientToHost => objects.unresolvable_interface_name(header.sender_id),
+                Direction::HostToClient => None,
+            };
+            let hex = wire::hex_encode(&src.read_buf[..consumed]);
+            match known_interface {
+                Some(name) => warn!(
+                    "unknown object {} ({name}) opcode {} ({:?}) -- dropping (bytes={hex})",
+                    header.sender_id, header.opcode, direction
+                ),
+                None => warn!(
+                    "unknown object {} opcode {} ({:?}) -- dropping (bytes={hex})",
+                    header.sender_id, header.opcode, direction
+                ),
+            }
             if let Some(rec) = recorder() {
                 rec.record(
                     &format!("{direction:?}"),
@@ -439,6 +453,19 @@ async fn relay_ready_messages(
                                 "{}.{} would create an object with unresolvable interface {:?} -- dropping",
                                 interface.name, desc.name, walk.dynamic_interface_name
                             );
+                            // Client-space only: `original_new_id` is the
+                            // guest id here (the client chose it), so a
+                            // later message referencing it as a
+                            // ClientToHost sender_id can name the interface
+                            // instead of just showing a bare number -- see
+                            // the "unknown object" warning below. Not
+                            // meaningful for HostToClient (original_new_id
+                            // is a host id there, a different space).
+                            if matches!(direction, Direction::ClientToHost) {
+                                if let Some(name) = &walk.dynamic_interface_name {
+                                    objects.remember_unresolvable_interface(original_new_id, name.clone());
+                                }
+                            }
                             if let Some(rec) = recorder() {
                                 rec.record(
                                     &format!("{direction:?}"), "DROPPED_UNRESOLVABLE_CHILD", interface.name, desc.name,

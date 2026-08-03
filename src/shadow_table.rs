@@ -59,6 +59,16 @@ pub struct ShadowTable {
     ///    that number.
     generation: u64,
     mapped_in_generation: HashMap<u32, u64>,
+    /// Diagnostic-only: the interface *name* a guest id would have had, for
+    /// ids whose `wl_registry.bind` (or other new_id request) was dropped
+    /// because we have no compiled-in signature table for that interface
+    /// (e.g. `gtk_shell1`) -- see the `None` branch in `lib.rs` where a
+    /// `new_id` can't be tracked. Never used for translation/correctness,
+    /// only to make a later "unknown object" warning name the interface
+    /// instead of a bare id -- so unlike `interfaces`, no generation
+    /// tracking: a stale name in a rare diagnostic line is a cosmetic
+    /// non-issue, not worth the bookkeeping the real mapping needs.
+    unresolvable_interfaces: HashMap<u32, String>,
 }
 
 impl ShadowTable {
@@ -70,6 +80,7 @@ impl ShadowTable {
             next_guest_server_id: 0xff000000,
             generation: 0,
             mapped_in_generation: HashMap::new(),
+            unresolvable_interfaces: HashMap::new(),
         };
         // wl_display is id 1 on both sides unconditionally, by protocol
         // convention -- no bind/create_registry dance produces it, so
@@ -97,6 +108,10 @@ impl ShadowTable {
         self.generation += 1;
         self.next_host_id = 2;
         self.map(1, 1, &wayland_client::protocol::__interfaces::WL_DISPLAY_INTERFACE);
+        // Ids from a previous generation may be reallocated to unrelated
+        // objects by the new connection -- an old, unrelated name lingering
+        // here would be actively misleading rather than just stale.
+        self.unresolvable_interfaces.clear();
     }
 
     /// Whether `guest_id` was mapped (or re-mapped) against the *current*
@@ -163,6 +178,22 @@ impl ShadowTable {
         self.interfaces.get(&guest_id).copied()
     }
 
+    /// Records the interface name a guest id *would* have had, had its
+    /// `new_id` request not been dropped for referencing an interface we
+    /// have no compiled-in signature table for. Diagnostic-only -- see the
+    /// `unresolvable_interfaces` field doc comment.
+    pub fn remember_unresolvable_interface(&mut self, guest_id: u32, interface_name: String) {
+        self.unresolvable_interfaces.insert(guest_id, interface_name);
+    }
+
+    /// Looks up a name recorded by `remember_unresolvable_interface`, for
+    /// enriching an "unknown object" warning when the id matches an
+    /// interface bind we watched get dropped rather than a truly
+    /// never-seen id.
+    pub fn unresolvable_interface_name(&self, guest_id: u32) -> Option<&str> {
+        self.unresolvable_interfaces.get(&guest_id).map(String::as_str)
+    }
+
     /// Finds the guest id of the (normally singular) object of a given
     /// interface -- used on reconnect to find the client's own original
     /// `wl_registry` guest id, so a freshly-fetched registry on the new
@@ -180,6 +211,7 @@ impl ShadowTable {
         self.guest_to_host.remove_by_left(&guest_id);
         self.interfaces.remove(&guest_id);
         self.mapped_in_generation.remove(&guest_id);
+        self.unresolvable_interfaces.remove(&guest_id);
     }
 }
 

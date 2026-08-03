@@ -70,11 +70,7 @@ impl Recorder {
         bytes: &[u8],
     ) {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        let mut hex = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{b:02x}");
-        }
+        let hex = crate::wire::hex_encode(bytes);
         let mut w = self.writer.lock().unwrap();
         let _ = writeln!(
             w,
