@@ -375,11 +375,28 @@ wrapper patches (which only affects D-Bus/systemd-activated apps, e.g.
 DING, portals). Only apps launched from a shell with the correct
 `WAYLAND_DISPLAY=wayland-0` (confirmed via `ss -xp` cross-referencing
 socket inodes against the proxy's own fds, not just the env var) actually
-exercise the proxy. Flagged by the user as worth a dedicated
-investigation later (where each launch path actually sources
-`WAYLAND_DISPLAY` from -- Shell's own spawn code vs. the systemd
-activation environment vs. an inherited terminal shell), not resolved
-here.
+exercise the proxy.
+
+Root-caused (source-confirmed, not guessed) and a design proposed:
+`docs/adr/adr-0005-route-shell-launched-clients-through-the-proxy.md`.
+Mutter's `set_gnome_env("WAYLAND_DISPLAY", compositor->display_name)`
+(`src/wayland/meta-wayland.c`) does a one-time `setenv()` on its own
+process right after creating its compositor socket, using the literal
+`--wayland-display=` string -- every child gnome-shell later forks
+inherits that normally, no GDK app-launch-context involved at all
+(checked and ruled out). Proposed fix: start gnome-shell with
+`--wayland-display=wayland-0` itself (so its own self-belief/export
+becomes the name the proxy wants to own), immediately rename the
+resulting socket file to a fixed private path before anything can connect
+to it, and have the proxy rebind its own listener at the now-vacant
+`wayland-0` -- in place, without restarting the proxy process itself,
+since that would drop every already-connected client, the one thing this
+whole project exists to prevent. Needs redoing on every gnome-shell
+restart, not just once (confirmed via source: mutter's own socket-claim
+logic has no liveness check, so a restarting gnome-shell will always
+successfully steal `wayland-0` back). Status: designed, not yet
+implemented -- see the ADR for the full reasoning, source citations, and
+rejected alternatives.
 
 ## The actual problem
 
