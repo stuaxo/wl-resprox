@@ -65,11 +65,16 @@ class TestWindow(Gtk.ApplicationWindow):
     """
 
     LOG_EVERY_N_FRAMES = 30  # roughly once a second at the ~30fps timer below
+    STALL_THRESHOLD_SECONDS = 5  # found live 2026-08-03: silence alone is ambiguous -- say so instead
+    STALL_REMINDER_SECONDS = 5  # re-log while still stalled, so the log itself doesn't look dead
 
     def __init__(self, app, title):
         super().__init__(application=app, title=title, default_width=320, default_height=240)
         self._frame_count = 0
         self._start_time = time.monotonic()
+        self._last_tick_time = self._start_time
+        self._stalled = False
+        self._last_stall_reminder_time = None
 
         self.drawing_area = Gtk.DrawingArea()
         self.drawing_area.set_draw_func(self._on_draw)
@@ -90,9 +95,38 @@ class TestWindow(Gtk.ApplicationWindow):
         # plan-desktop-resilience.md), not to drive redraws itself.
         self.drawing_area.add_tick_callback(self._on_tick)
         GLib.timeout_add(33, self._periodic_redraw)  # ~30fps
+        GLib.timeout_add(1000, self._check_stall)  # independent of the tick/redraw path on purpose -- see its own doc comment
 
     def _periodic_redraw(self):
         self.drawing_area.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def _check_stall(self):
+        # Deliberately its own timer, not piggybacked on _on_tick or
+        # _periodic_redraw -- if the frame clock itself has stopped
+        # ticking (e.g. waiting forever on a wl_callback.done that will
+        # never arrive, the exact stall found live 2026-08-03 before
+        # this session's frame() fix landed), anything driven BY the tick
+        # would also be stuck and could never report that. This one is
+        # driven by GLib's own main-loop timer, independent of Wayland
+        # frame callbacks entirely, so it keeps running (and can keep
+        # logging) even while the render loop itself is completely dead --
+        # the whole point of this check is to make silence itself an
+        # observable, timestamped event instead of nothing at all.
+        since_last_tick = time.monotonic() - self._last_tick_time
+        if since_last_tick >= self.STALL_THRESHOLD_SECONDS:
+            if not self._stalled:
+                self._stalled = True
+                self._last_stall_reminder_time = time.monotonic()
+                log.warning(
+                    "STALLED: no frame tick for %.1fs (expected roughly every ~33ms) -- "
+                    "render loop appears stuck, possibly waiting on a wl_callback.done "
+                    "that will never arrive",
+                    since_last_tick,
+                )
+            elif time.monotonic() - self._last_stall_reminder_time >= self.STALL_REMINDER_SECONDS:
+                self._last_stall_reminder_time = time.monotonic()
+                log.warning("STILL STALLED: no frame tick for %.1fs", since_last_tick)
         return GLib.SOURCE_CONTINUE
 
     def _on_realize(self, *_):
@@ -108,9 +142,14 @@ class TestWindow(Gtk.ApplicationWindow):
         )
 
     def _on_tick(self, widget, frame_clock):
+        now = time.monotonic()
+        if self._stalled:
+            log.warning("RECOVERED: frame tick resumed after %.1fs stall", now - self._last_tick_time)
+            self._stalled = False
+        self._last_tick_time = now
         self._frame_count += 1
         if self._frame_count % self.LOG_EVERY_N_FRAMES == 0:
-            elapsed = time.monotonic() - self._start_time
+            elapsed = now - self._start_time
             log.info("frame tick #%d (t+%.1fs)", self._frame_count, elapsed)
         return GLib.SOURCE_CONTINUE
 
