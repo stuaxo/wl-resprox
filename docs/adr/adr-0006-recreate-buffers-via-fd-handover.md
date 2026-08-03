@@ -129,10 +129,18 @@ indefinite period between a buffer's creation and either its destruction
 or a reconnect, rather than passing them through immediately).
 
 Assumes the new compositor instance supports the same dmabuf
-format/modifier combination the old one advertised. Expected to hold in
-practice (same GPU, same driver, same session, a crash-restart of the
-same compositor binary) but not verified, and not guaranteed by anything
-this ADR's design enforces.
+format/modifier combination the old one advertised. Judged low-risk on
+reflection, not just hopeful: tiling/modifier support is a property of
+the GPU driver's own capabilities, queried from the kernel/DRM/GBM stack,
+not something a compositor process chooses or negotiates independently --
+a fresh gnome-shell restarting on the same machine (same kernel, same
+driver, same hardware) will query and advertise the identical modifier
+set every time. This is exactly the constraint that makes this problem
+easier than the cross-host device-migration case (VFIO/QEMU live
+migration) it otherwise resembles -- that one's hard specifically because
+the *target* can be genuinely different hardware; this one's target is
+always the same GPU. Still not verified live, but no longer an open
+question about *whether* it holds, just about confirming it.
 
 Doesn't address `wl_shm`'s own memfd lifetime the same careful way yet --
 worth confirming the pool's backing memfd is *also* retained/replayed
