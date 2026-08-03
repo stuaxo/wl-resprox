@@ -29,8 +29,13 @@ pub enum Recreatable {
     /// A `wl_registry.bind` for a specific interface. The two roots
     /// (`wl_compositor`, `xdg_wm_base`) are recreated this way, against
     /// whatever name the *new* compositor happens to advertise them as --
-    /// never assumed to match the pre-crash name.
-    Global { interface: &'static Interface },
+    /// never assumed to match the pre-crash name. `version` is the version
+    /// the *client itself* originally requested in its own bind call, not
+    /// our compiled-in `interface.version` (its static maximum) or the new
+    /// compositor's own advertised maximum -- see the version-mismatch
+    /// hazard documented where this is replayed, in
+    /// `recover_state_after_reconnect`.
+    Global { interface: &'static Interface, version: u32 },
     /// `wl_compositor(parent).create_surface(new_id)`.
     Surface { parent_guest_id: u32 },
     /// `xdg_wm_base(parent).get_xdg_surface(new_id, surface)`.
@@ -107,7 +112,7 @@ mod tests {
     #[test]
     fn remove_forgets_the_recipe() {
         let mut graph = RecreationGraph::new();
-        graph.record(5, Recreatable::Global { interface: &FAKE_INTERFACE });
+        graph.record(5, Recreatable::Global { interface: &FAKE_INTERFACE, version: 1 });
         graph.remove(5);
         assert!(graph.recipe_for(5).is_none());
     }

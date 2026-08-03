@@ -257,6 +257,130 @@ earlier assumption: this hit a `gtk4-demo` that had only been running
 allocate/reuse buffers from their very first frame, so this is a more
 commonly-hit path than initially thought, not a rare edge case.
 
+**Direction chosen with the user 2026-08-03**: instead of resurrecting
+buffer content (not achievable -- see above), tell clients the display
+went away and came back, the same way an unplugged/replugged monitor
+would, and lean on each client's own normal resize-handling code (which
+typically reallocates buffers) to recover on its own. Two pieces, both
+implemented and unit/integration-tested (not yet validated against a real
+crash -- see below):
+
+1. **Force a repaint through the real resize path, not just an ack.**
+   `recover_state_after_reconnect`'s `xdg_toplevel` recreation now
+   synthesizes `xdg_toplevel.configure(width=0, height=0, states=[])`
+   *before* the existing `xdg_surface.configure`, so a client goes through
+   its normal configure-driven resize/repaint code (which usually
+   reallocates buffers) instead of just ack'ing a bare `xdg_surface`
+   configure and potentially reusing a stale buffer regardless. Covered by
+   `full_reconnect_recreates_surface_chain_and_synthesizes_configure` and
+   the new `stale_wl_buffer_attach_is_dropped_not_forwarded_after_reconnect`
+   in `tests/integration.rs`.
+2. **Close the loop on requests the new configure doesn't prevent.** The
+   configure above narrows the race window but doesn't close it (a client
+   mid-frame with a buffer already attached/committed doesn't necessarily
+   wait for it). When a client sends a request *on* a stale (pre-reconnect,
+   never-recreated) object -- most commonly `wl_buffer.destroy()` from
+   ordinary buffer-pool cleanup, but the same code path covers any
+   destructor request on any object outside the narrow recreation graph,
+   e.g. the `zwp_linux_dmabuf_feedback_v1.destroy` warning seen above --
+   the host side genuinely has nothing to forward it to, but the client is
+   still waiting on `wl_display.delete_id` before it can reuse that numeric
+   id (`wl_proxy_destroy` in libwayland-client parks it as a zombie
+   otherwise). `relay_ready_messages`'s "sender has no translation on the
+   other side" branch (`src/lib.rs`) now synthesizes that `delete_id` and
+   cleans up the shadow table's own tracking of the id, for any
+   `ClientToHost` destructor request hitting this path, rather than just
+   dropping it silently. Covered by the new
+   `stale_wl_buffer_destroy_synthesizes_delete_id_after_reconnect` in
+   `tests/integration.rs`.
+
+**Validated live 2026-08-03, 3/3 clean runs**: repeated the original
+"already-open client, `pkill -9 gnome-shell`" scenario against
+`wl-res-gnome-shell-direct` with both `gtk4-demo` and a real `tilix`
+launched directly (not via GDM's Shell-spawn path, which turned out to
+bypass the proxy entirely -- see the session note on that below), each run
+letting them sit a few seconds first so they'd allocated their normal
+buffer pools. Both survived all 3 runs, full ~20s observation window each
+-- the first fully-confirmed *multi-client* crash survival this project
+has produced. Getting there required finding and fixing three more real
+bugs beyond the two pieces above, found by chasing tilix's repeated deaths
+through `WAYLAND_DEBUG=1`, `strace -f`, and `coredumpctl`'s crash
+backtrace (not guesswork):
+
+3. **Version mismatch causing a fatal client-side `wl_abort`.**
+   `recover_state_after_reconnect` re-bound `wl_compositor`/`xdg_wm_base`
+   at whatever version the *new* compositor's registry advertised, not the
+   version the client itself originally requested (and whose compiled
+   listener structs it's actually prepared to handle) --
+   `recreation.rs`'s `Recreatable::Global` didn't even record the
+   client's requested version at all. A real tilix hit this every single
+   time it crashed today (8 coredumps, `SIGABRT`, confirmed via
+   `coredumpctl info`'s backtrace: `wl_abort` inside
+   `wl_closure_invoke`/`dispatch_event`, called from GDK's Wayland
+   dispatch) while processing an ordinary `wl_surface.preferred_buffer_scale`
+   event -- added in `wl_surface` v6, which tilix's own (older-negotiated)
+   listener had no slot for once the recreated surface's parent
+   `wl_compositor` got rebound at a higher version than originally
+   negotiated. Fixed: the recipe now records the version from the
+   client's own original bind request (read directly off the wire, not
+   `interface.version`, our compiled-in static maximum) and replays at
+   `min(originally_requested, new_compositor's_current_max)`. Covered by
+   the new `reconnect_rebinds_globals_at_the_clients_originally_requested_version`.
+4. **A dropped message could still leave a phantom object mapping.**
+   Any request carrying a `new_id` (e.g. `wl_shm.create_pool`, called on a
+   stale `wl_shm` -- outside the recreation graph, same as `wl_buffer`)
+   gets its new_id mapped/allocated *before* the later "sender has no
+   translation" check runs. Dropping the message there (correctly) still
+   left the shadow table believing the new object existed on the host,
+   which it never did (the message that would have created it was never
+   forwarded). A later request against that phantom id got happily
+   translated to a bogus host id and forwarded -- which is exactly what
+   killed tilix immediately after the version fix above: `wl_shm.create_pool
+   sender has no translation... -- dropping` followed instantly by the
+   real compositor's `wl_display.error(..., "invalid object 19")`, a fatal
+   protocol violation that closes the whole connection. Fixed: roll the
+   phantom mapping back when the message ends up dropped. Covered by the
+   new `create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping`.
+5. **A failed partial recovery still resumed relaying.** Found while
+   chasing an early, more chaotic version of this race (a burst of several
+   freeze/reconnect cycles within milliseconds): when
+   `recover_state_after_reconnect` fails (every error it can return means
+   the connection itself is dead -- a failed write, a failed read, or the
+   compositor closing the connection outright while fetching its
+   registry, never just "recovery came up short"), the old code logged a
+   warning but unfroze anyway, resuming relay on a connection already
+   known to be broken. Fixed: stay frozen on failure and let the existing
+   `reconnect_with_backoff` retry arm handle it, with a short sleep to
+   avoid hot-looping the same stale-socket race that triggers this.
+6. **An untracked `delete_id` was forwarded with an untranslated payload.**
+   `recover_state_after_reconnect` allocates host id 3 for its own
+   internal `wl_display.sync` (used only to detect "all globals have
+   arrived"), deliberately never mapped to a guest id. The real
+   compositor's later `delete_id(3)` for that callback hit the shadow
+   table's "untracked host id" branch, which logged a warning but still
+   forwarded the message with its *host-space* payload untouched --
+   telling the client "your own guest-space id 3 is now free", where
+   guest id 3 is whatever unrelated (and very possibly still-live) object
+   the client itself happened to allocate third. Caught live via
+   `WAYLAND_DEBUG=1` against a real tilix, landing immediately before an
+   otherwise-unexplained clean exit. Fixed: never forward it. Covered by
+   the new `delete_id_for_an_untracked_host_id_is_dropped_not_forwarded`.
+
+**Session note on test methodology**: apps launched via GNOME Shell's own
+UI (Super key search, dock, Activities) turned out to bypass the proxy
+entirely -- gnome-shell (as the Wayland compositor) exports
+`WAYLAND_DISPLAY` pointing at *itself* to anything it directly spawns,
+independent of the systemd `--user` activation environment the session
+wrapper patches (which only affects D-Bus/systemd-activated apps, e.g.
+DING, portals). Only apps launched from a shell with the correct
+`WAYLAND_DISPLAY=wayland-0` (confirmed via `ss -xp` cross-referencing
+socket inodes against the proxy's own fds, not just the env var) actually
+exercise the proxy. Flagged by the user as worth a dedicated
+investigation later (where each launch path actually sources
+`WAYLAND_DISPLAY` from -- Shell's own spawn code vs. the systemd
+activation environment vs. an inherited terminal shell), not resolved
+here.
+
 ## The actual problem
 
 gnome-shell sometimes crashes while the screen is **locked**. Since

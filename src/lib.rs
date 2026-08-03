@@ -383,6 +383,7 @@ async fn relay_ready_messages(
                     }
                 }
 
+                let mut newly_mapped_guest_id: Option<u32> = None;
                 if let Some(offset) = walk.new_id_offset {
                     let abs = wire::HEADER_LEN + offset;
                     let original_new_id = u32::from_ne_bytes(msg[abs..abs + 4].try_into().unwrap());
@@ -400,6 +401,14 @@ async fn relay_ready_messages(
                                 Direction::HostToClient => (objects.allocate_guest_server_id(), original_new_id),
                             };
                             objects.map(guest_new_id, host_new_id, child_iface);
+                            // Remembered so the "sender has no translation"
+                            // check below can roll this back if the message
+                            // ends up dropped there -- see that check's own
+                            // comment for why this specific ordering
+                            // (new_id mapped before the sender itself is
+                            // known to be forwardable) is a real hazard, not
+                            // just theoretical.
+                            newly_mapped_guest_id = Some(guest_new_id);
 
                             // Recipe capture for the deliberately narrow
                             // recreatable set (see recreation.rs's doc
@@ -411,7 +420,39 @@ async fn relay_ready_messages(
                                         if child_iface.name == "wl_compositor"
                                             || child_iface.name == "xdg_wm_base" =>
                                     {
-                                        Some(Recreatable::Global { interface: child_iface })
+                                        // The version the CLIENT itself
+                                        // requested, not child_iface.version
+                                        // (our own compiled-in static
+                                        // maximum) -- found live 2026-08-03
+                                        // (see plan-desktop-resilience.md):
+                                        // recovery previously re-bound at
+                                        // whatever version the *new*
+                                        // compositor's registry advertised,
+                                        // which can exceed what the
+                                        // client's own compiled listener
+                                        // structs understand. A real tilix
+                                        // then hit libwayland-client's own
+                                        // fatal `wl_abort` (confirmed via a
+                                        // coredump backtrace through
+                                        // wl_closure_invoke) processing a
+                                        // newer wl_surface event
+                                        // (preferred_buffer_scale, added in
+                                        // wl_surface v6) its older stub had
+                                        // no listener slot for. For a
+                                        // dynamic new_id (bind is the only
+                                        // such request -- see
+                                        // resolve_child_interface's doc
+                                        // comment), the wire layout is
+                                        // always [..][interface_name:string]
+                                        // [version:uint][new_id:uint], so
+                                        // the version sits exactly 4 bytes
+                                        // before new_id's own offset.
+                                        let requested_version = msg
+                                            .get(abs.saturating_sub(4)..abs)
+                                            .and_then(|b| b.try_into().ok())
+                                            .map(u32::from_ne_bytes)
+                                            .unwrap_or(child_iface.version);
+                                        Some(Recreatable::Global { interface: child_iface, version: requested_version })
                                     }
                                     ("wl_compositor", "create_surface") => {
                                         Some(Recreatable::Surface { parent_guest_id: guest_sender_id })
@@ -513,7 +554,42 @@ async fn relay_ready_messages(
                                 msg[wire::HEADER_LEN..wire::HEADER_LEN + 4]
                                     .copy_from_slice(&guest_deleted_id.to_ne_bytes());
                             }
-                            None => warn!("delete_id for untracked host id {host_deleted_id} -- ignoring"),
+                            None => {
+                                // Confirmed live 2026-08-03 (see
+                                // plan-desktop-resilience.md): this is NOT
+                                // just diagnostic-only. host id 3 is always
+                                // `recover_state_after_reconnect`'s own
+                                // internal wl_display.sync callback (used
+                                // solely to detect "all globals have
+                                // arrived"), deliberately never mapped to a
+                                // guest id -- so the real compositor's
+                                // later delete_id for it always lands here,
+                                // on EVERY reconnect. The old code warned
+                                // but still fell through and forwarded the
+                                // message with its host-space payload
+                                // UNTRANSLATED -- telling the client
+                                // "your own guest-space id 3 is now free",
+                                // except guest id 3 is whatever unrelated,
+                                // very-possibly-still-live object the
+                                // client itself allocated third. Caught
+                                // live via WAYLAND_DEBUG=1 against a real
+                                // tilix: this landed immediately before an
+                                // unexplained clean client exit with no
+                                // error output, consistent with a corrupted
+                                // client-side id table. Never forward it --
+                                // same "untracked, drop" contract as every
+                                // other untranslatable-id case in this
+                                // function.
+                                warn!("delete_id for untracked host id {host_deleted_id} -- dropping");
+                                if let Some(rec) = recorder() {
+                                    rec.record(
+                                        &format!("{direction:?}"), "DROPPED_UNTRACKED_DELETE_ID", interface.name, desc.name,
+                                        header.sender_id, header.opcode, 0, &msg,
+                                    );
+                                }
+                                src.read_buf.drain(..consumed);
+                                continue 'relay;
+                            }
                         }
                     }
                 }
@@ -610,12 +686,65 @@ async fn relay_ready_messages(
                     Direction::HostToClient => Some(guest_sender_id),
                 };
                 let Some(other_side_sender_id) = other_side_sender_id else {
-                    // guest_sender_id came from a successful `interface()`
-                    // lookup, which only ever succeeds for ids `map`ped
-                    // together with a host_id at the same time -- this
-                    // should be unreachable, but fail safe (drop) rather
-                    // than forward a message addressed to nothing.
-                    warn!("{}.{} sender has no translation on the other side -- dropping", interface.name, desc.name);
+                    // Reachable, despite `guest_sender_id` coming from a
+                    // successful `interface()` lookup: `interface()` isn't
+                    // generation-checked (only `host_id`/`guest_id` are --
+                    // see ShadowTable's `generation` doc comment), so this
+                    // fires for a request the client sends on an object
+                    // that predates the last reconnect and was never
+                    // refreshed (anything outside the narrow recreation
+                    // graph -- wl_buffer, wl_seat, wl_shm_pool, ...). The
+                    // host side genuinely never heard of this id; there's
+                    // nothing to forward the request to. For a destructor
+                    // request specifically (e.g. wl_buffer.destroy), the
+                    // client is still waiting on wl_display.delete_id
+                    // before it can reuse this numeric id --
+                    // wl_proxy_destroy parks it as a zombie otherwise --
+                    // so synthesize that ourselves, mirroring what a real
+                    // compositor would eventually send, rather than
+                    // leaking the id out of the client's own allocator.
+                    if matches!(direction, Direction::ClientToHost) && desc.is_destructor {
+                        if let Some(delete_id_opcode) =
+                            objects.interface(1).and_then(|wl_display| event_opcode(wl_display, "delete_id"))
+                        {
+                            let mut delete_id_payload = Vec::new();
+                            wire::put_u32(&mut delete_id_payload, guest_sender_id);
+                            if let Err(e) = src
+                                .write_message(&wire::build_message(1, delete_id_opcode, &delete_id_payload), &[])
+                                .await
+                            {
+                                warn!("failed to synthesize delete_id for stale {}: {e}", interface.name);
+                            }
+                        }
+                        objects.remove_guest(guest_sender_id);
+                        graph.remove(guest_sender_id);
+                    } else {
+                        warn!(
+                            "{}.{} sender has no translation on the other side -- dropping",
+                            interface.name, desc.name
+                        );
+                    }
+                    // Found live 2026-08-03 (see plan-desktop-resilience.md):
+                    // if THIS message also carried a new_id (e.g.
+                    // wl_shm.create_pool on a stale, never-recreated
+                    // wl_shm), the new_id handling above already mapped and
+                    // allocated a host id for it -- before this check ever
+                    // ran, since the sender itself is only validated at the
+                    // very end. Dropping the message here without undoing
+                    // that leaves the shadow table believing an object
+                    // exists on the host that was never actually created
+                    // there (the request that would have created it never
+                    // got forwarded). A real tilix hit exactly this: a
+                    // later request against that phantom id got happily
+                    // translated and forwarded, and the real compositor
+                    // killed the whole connection with a fatal
+                    // `wl_display.error` ("invalid object"). Roll the
+                    // mapping back so the id is genuinely untracked again,
+                    // matching what actually happened on the host.
+                    if let Some(phantom_guest_id) = newly_mapped_guest_id {
+                        objects.remove_guest(phantom_guest_id);
+                        graph.remove(phantom_guest_id);
+                    }
                     src.read_buf.drain(..consumed);
                     continue 'relay;
                 };
@@ -816,7 +945,7 @@ async fn recover_state_after_reconnect(
 
     for (guest_id, recipe) in graph.iter() {
         match recipe {
-            Recreatable::Global { interface } => {
+            Recreatable::Global { interface, version: requested_version } => {
                 let found = match interface.name {
                     "wl_compositor" => wl_compositor_global,
                     "xdg_wm_base" => xdg_wm_base_global,
@@ -825,10 +954,20 @@ async fn recover_state_after_reconnect(
                         None
                     }
                 };
-                let Some((name, version)) = found else {
+                let Some((name, fresh_max_version)) = found else {
                     warn!("compositor didn't re-advertise {} after reconnect -- can't recreate it", interface.name);
                     continue;
                 };
+                // Bind at whatever the client originally requested, same as
+                // a real client would itself -- never our own compiled-in
+                // static maximum, and never blindly the new compositor's
+                // own advertised maximum either (see this recipe's own doc
+                // comment in recreation.rs for the wl_abort hazard that
+                // caused). Capped by the new compositor's current
+                // advertised max on the off chance it's now lower than
+                // what was originally negotiated (a real client bind can
+                // never exceed the registry's advertised version either).
+                let version = (*requested_version).min(fresh_max_version);
                 let host_id = objects.allocate_host_id();
                 let mut payload = Vec::new();
                 wire::put_u32(&mut payload, name);
@@ -919,6 +1058,43 @@ async fn recover_state_after_reconnect(
                 }
                 objects.map(guest_id, host_id, child_interface);
                 info!("recreated xdg_toplevel (guest={guest_id}, host={host_id})");
+
+                // Synthesize xdg_toplevel.configure(0, 0, []) BEFORE the
+                // xdg_surface.configure below -- found live 2026-08-03 (see
+                // plan-desktop-resilience.md): a bare xdg_surface.configure
+                // alone doesn't reliably say anything about client state
+                // being invalid, so a client can ack it and keep using its
+                // existing (now stale-generation) buffers, which then get
+                // silently dropped on the next attach and can trigger a
+                // real, fatal compositor protocol error ("invalid arguments
+                // for wl_surface#N.frame") that kills the connection --
+                // exactly the failure this proxy exists to prevent.
+                // xdg_toplevel.configure is the event real compositors send
+                // on an actual resize/state change, which clients' already
+                // -tested resize-handling code reacts to by reallocating
+                // buffers -- width=0/height=0 is the protocol's own "you
+                // decide the size" convention (no forced resize, avoids any
+                // visible jump), states=[] (empty array) since none of the
+                // tracked states (maximized/fullscreen/etc.) are known to
+                // have changed. Not yet confirmed this alone is sufficient
+                // against a real client (there's likely still a race window
+                // for a client already mid-frame with pooled buffers) --
+                // see task #7's graceful-stale-reference handling for the
+                // remaining gap this doesn't close.
+                if let Some(toplevel_configure_opcode) = event_opcode(child_interface, "configure") {
+                    let mut toplevel_configure_payload = Vec::new();
+                    wire::put_u32(&mut toplevel_configure_payload, 0); // width: 0 = no suggested size
+                    wire::put_u32(&mut toplevel_configure_payload, 0); // height: 0 = no suggested size
+                    wire::put_u32(&mut toplevel_configure_payload, 0); // states: empty array (length 0)
+                    if let Err(e) = gtk
+                        .write_message(&wire::build_message(guest_id, toplevel_configure_opcode, &toplevel_configure_payload), &[])
+                        .await
+                    {
+                        warn!("failed to synthesize xdg_toplevel.configure for {guest_id}: {e}");
+                    }
+                } else {
+                    warn!("xdg_toplevel has no configure event -- can't force a buffer-reallocating repaint for {guest_id}");
+                }
 
                 // Force a repaint: synthesize xdg_surface.configure straight
                 // to the client on the PARENT xdg_surface's guest id (gtk
@@ -1087,22 +1263,49 @@ pub async fn run_connection(
                 // stays behind in the old generation, which is exactly what
                 // marks it stale for the wl_buffer.release check below.
                 objects.bump_generation();
-                if let Err(e) = recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks).await {
-                    // Best-effort: a failure here means recovery is
-                    // incomplete (see that function's doc comment for why
-                    // individual steps already degrade gracefully), not
-                    // that the connection itself is unusable -- resume
-                    // relaying regardless rather than freezing forever.
-                    warn!("state recovery after reconnect failed partway: {e:?}");
+                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks).await {
+                    Ok(()) => {
+                        // Must happen before traffic resumes (frozen =
+                        // false, below) -- implementation-constraints.md is
+                        // explicit that a stuck grab is worse than a
+                        // dropped click.
+                        if let Err(e) = synthesize_grab_releases(&mut gtk, &objects, &mut grabs).await {
+                            warn!("failed to synthesize grab releases after reconnect: {e:?}");
+                        }
+                        frozen = false;
+                        info!("connection unfrozen, relaying resumed");
+                    }
+                    Err(e) => {
+                        // Every error this function can return -- a failed
+                        // write, a failed read, or the compositor closing
+                        // the connection outright while fetching its
+                        // registry -- means the *connection itself* is
+                        // dead, not just that recovery came up short (see
+                        // that function's own doc comment on individual
+                        // steps degrading gracefully instead of returning
+                        // Err). Found live 2026-08-03 (see
+                        // plan-desktop-resilience.md): the old code
+                        // unfroze anyway here, resuming relaying on a
+                        // connection already known to be broken -- the
+                        // next poll would immediately see another EOF and
+                        // re-freeze, but real client traffic could race
+                        // into that brief unfrozen window and get
+                        // silently dropped/misrouted instead of safely
+                        // buffered. Stay frozen; the select loop's own
+                        // `reconnect_with_backoff, if frozen` arm retries
+                        // on the next iteration. This is also exactly the
+                        // race a fresh compositor's stale-socket cleanup
+                        // window can trigger: `reconnect_with_backoff`'s
+                        // `connect()` can succeed against a socket file
+                        // the new compositor hasn't finished
+                        // unlinking/rebinding yet, so a short sleep here
+                        // (matching reconnect_with_backoff's own 250ms
+                        // between failed connect() attempts) avoids
+                        // hot-looping through that same window.
+                        warn!("state recovery after reconnect failed partway, staying frozen and retrying: {e:?}");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                 }
-                // Must happen before traffic resumes (frozen = false,
-                // below) -- implementation-constraints.md is explicit that
-                // a stuck grab is worse than a dropped click.
-                if let Err(e) = synthesize_grab_releases(&mut gtk, &objects, &mut grabs).await {
-                    warn!("failed to synthesize grab releases after reconnect: {e:?}");
-                }
-                frozen = false;
-                info!("connection unfrozen, relaying resumed");
             }
         }
     }

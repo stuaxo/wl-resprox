@@ -6,7 +6,7 @@ use std::env;
 use std::path::PathBuf;
 
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{error, info};
+use tracing::{error, info, Instrument};
 
 use cli::Cli;
 use wayland_proxy::run_connection;
@@ -45,20 +45,34 @@ async fn main() -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((gtk_stream, _addr)) => {
-                info!("New Wayland client connected!");
+                // Best-effort: the connecting process's own pid, purely for
+                // tagging every log line this connection's task ever emits
+                // (via the span below) -- with several clients each
+                // independently reconnecting after a compositor crash (see
+                // plan-desktop-resilience.md's 2026-08-03 entries on the
+                // reconnect race), the proxy's log otherwise interleaves
+                // multiple clients' recovery sequences with no way to tell
+                // which lines belong to which real process. `None` (peer_cred
+                // failing) just means "unknown", never fatal.
+                let client_pid = gtk_stream.peer_cred().ok().and_then(|c| c.pid());
+                let span = tracing::info_span!("client", pid = client_pid);
+                info!(parent: &span, "New Wayland client connected!");
                 let target_path = target_socket_path.clone();
-                tokio::spawn(async move {
-                    match UnixStream::connect(&target_path).await {
-                        Ok(compositor_stream) => {
-                            if let Err(e) =
-                                run_connection(gtk_stream, compositor_stream, target_path).await
-                            {
-                                error!("proxy session ended with error: {e:?}");
+                tokio::spawn(
+                    async move {
+                        match UnixStream::connect(&target_path).await {
+                            Ok(compositor_stream) => {
+                                if let Err(e) =
+                                    run_connection(gtk_stream, compositor_stream, target_path).await
+                                {
+                                    error!("proxy session ended with error: {e:?}");
+                                }
                             }
+                            Err(e) => error!("failed to connect to compositor socket {target_path:?}: {e}"),
                         }
-                        Err(e) => error!("failed to connect to compositor socket {target_path:?}: {e}"),
                     }
-                });
+                    .instrument(span),
+                );
             }
             Err(e) => error!("failed to accept incoming client connection: {e}"),
         }
