@@ -33,7 +33,7 @@ use buffer_flow::BufferFlowTracker;
 use grab_state::GrabTracker;
 use interfaces::lookup_interface;
 use pending_frames::PendingFrameTracker;
-use recreation::{DmabufPlane, Recreatable, RecreationGraph};
+use recreation::{DmabufPlane, Recreatable, RecreationGraph, SeatDeviceKind};
 use shadow_table::ShadowTable;
 
 /// Which direction a message is travelling. Determines whether we look its
@@ -433,7 +433,10 @@ async fn relay_ready_messages(
                                         if child_iface.name == "wl_compositor"
                                             || child_iface.name == "xdg_wm_base"
                                             || child_iface.name == "wl_shm"
-                                            || child_iface.name == "zwp_linux_dmabuf_v1" =>
+                                            || child_iface.name == "zwp_linux_dmabuf_v1"
+                                            || child_iface.name == "wl_seat"
+                                            || child_iface.name == "wp_viewporter"
+                                            || child_iface.name == "wp_fractional_scale_manager_v1" =>
                                     {
                                         // The version the CLIENT itself
                                         // requested, not child_iface.version
@@ -481,7 +484,7 @@ async fn relay_ready_messages(
                                         })
                                     }
                                     ("xdg_surface", "get_toplevel") => {
-                                        Some(Recreatable::XdgToplevel { parent_guest_id: guest_sender_id })
+                                        Some(Recreatable::XdgToplevel { parent_guest_id: guest_sender_id, title: None, app_id: None })
                                     }
                                     ("wl_shm_pool", "create_buffer") => {
                                         // offset/width/height/stride/format
@@ -566,6 +569,46 @@ async fn relay_ready_messages(
                                             }
                                             _ => None,
                                         }
+                                    }
+                                    // See Recreatable::SeatDevice's doc
+                                    // comment (found live 2026-08-04):
+                                    // wl_seat's derived input devices need
+                                    // exactly the same "re-map this
+                                    // existing guest id onto a fresh host
+                                    // id" replay every other recipe here
+                                    // gets, or the client's pointer/
+                                    // keyboard/touch objects go silently,
+                                    // permanently dead after a crash.
+                                    ("wl_seat", "get_pointer") => {
+                                        Some(Recreatable::SeatDevice { seat_guest_id: guest_sender_id, kind: SeatDeviceKind::Pointer })
+                                    }
+                                    ("wl_seat", "get_keyboard") => {
+                                        Some(Recreatable::SeatDevice { seat_guest_id: guest_sender_id, kind: SeatDeviceKind::Keyboard })
+                                    }
+                                    ("wl_seat", "get_touch") => {
+                                        Some(Recreatable::SeatDevice { seat_guest_id: guest_sender_id, kind: SeatDeviceKind::Touch })
+                                    }
+                                    // See Recreatable::Viewport's doc
+                                    // comment (found live 2026-08-04,
+                                    // right after the wl_seat fix above):
+                                    // same missing-root shape, this time
+                                    // causing a recovered window to render
+                                    // 1.25x too big on a 125%-DPI output.
+                                    // `surface` is the request's only
+                                    // object argument, so it's
+                                    // original_object_values[0].
+                                    ("wp_viewporter", "get_viewport") => {
+                                        original_object_values.first().map(|&surface_guest_id| Recreatable::Viewport {
+                                            viewporter_guest_id: guest_sender_id,
+                                            surface_guest_id,
+                                            destination: None,
+                                        })
+                                    }
+                                    ("wp_fractional_scale_manager_v1", "get_fractional_scale") => {
+                                        original_object_values.first().map(|&surface_guest_id| Recreatable::FractionalScale {
+                                            manager_guest_id: guest_sender_id,
+                                            surface_guest_id,
+                                        })
                                     }
                                     _ => None,
                                 };
@@ -740,6 +783,40 @@ async fn relay_ready_messages(
                 if matches!(direction, Direction::ClientToHost) && interface.name == "wl_shm_pool" && desc.name == "resize" {
                     if let Some(size) = wire::read_u32(&msg[wire::HEADER_LEN..], 0).map(|v| v as i32) {
                         graph.update_shm_pool_size(guest_sender_id, size);
+                    }
+                }
+
+                // xdg_toplevel.set_title(title)/set_app_id(app_id) --
+                // same reasoning as wl_shm_pool.resize just above: neither
+                // creates a new object, so neither goes through the new_id
+                // recipe-capture block. See RecreationGraph::update_toplevel_title's
+                // own doc comment (found live 2026-08-04) for why keeping
+                // these current matters: a real client only ever sends
+                // them once, right after get_toplevel(), so without this
+                // observation a replayed toplevel is recreated with no
+                // title/app_id at all.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "xdg_toplevel" && desc.name == "set_title" {
+                    if let Some((title, _)) = wire::read_str(&msg[wire::HEADER_LEN..], 0) {
+                        graph.update_toplevel_title(guest_sender_id, title);
+                    }
+                } else if matches!(direction, Direction::ClientToHost) && interface.name == "xdg_toplevel" && desc.name == "set_app_id" {
+                    if let Some((app_id, _)) = wire::read_str(&msg[wire::HEADER_LEN..], 0) {
+                        graph.update_toplevel_app_id(guest_sender_id, app_id);
+                    }
+                }
+
+                // wp_viewport.set_destination(width, height) -- same
+                // reasoning as set_title/set_app_id just above. See
+                // Recreatable::Viewport's doc comment (found live
+                // 2026-08-04) for why this is the piece that actually
+                // fixes a recovered window rendering oversized on a
+                // fractionally-scaled output.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "wp_viewport" && desc.name == "set_destination" {
+                    let payload = &msg[wire::HEADER_LEN..];
+                    if let (Some(width), Some(height)) =
+                        (wire::read_u32(payload, 0).map(|v| v as i32), wire::read_u32(payload, 4).map(|v| v as i32))
+                    {
+                        graph.update_viewport_destination(guest_sender_id, width, height);
                     }
                 }
 
@@ -1227,6 +1304,14 @@ async fn recover_state_after_reconnect(
     let mut xdg_wm_base_global: Option<(u32, u32)> = None;
     let mut wl_shm_global: Option<(u32, u32)> = None;
     let mut zwp_linux_dmabuf_v1_global: Option<(u32, u32)> = None;
+    // Joined the roots 2026-08-04 -- see Recreatable::SeatDevice's doc
+    // comment for why wl_seat needs to be a real recreation root now,
+    // not just left for the client to naturally re-obtain.
+    let mut wl_seat_global: Option<(u32, u32)> = None;
+    // Joined the roots 2026-08-04 too, same call site -- see
+    // Recreatable::Viewport's doc comment.
+    let mut wp_viewporter_global: Option<(u32, u32)> = None;
+    let mut wp_fractional_scale_manager_v1_global: Option<(u32, u32)> = None;
     'collect: loop {
         // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention
         // -- see its own doc comment), which the `?` below does NOT catch
@@ -1255,6 +1340,9 @@ async fn recover_state_after_reconnect(
                                 "xdg_wm_base" => xdg_wm_base_global = Some((name, version)),
                                 "wl_shm" => wl_shm_global = Some((name, version)),
                                 "zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1_global = Some((name, version)),
+                                "wl_seat" => wl_seat_global = Some((name, version)),
+                                "wp_viewporter" => wp_viewporter_global = Some((name, version)),
+                                "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global = Some((name, version)),
                                 _ => {}
                             }
                         }
@@ -1280,6 +1368,9 @@ async fn recover_state_after_reconnect(
                     "xdg_wm_base" => xdg_wm_base_global,
                     "wl_shm" => wl_shm_global,
                     "zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1_global,
+                    "wl_seat" => wl_seat_global,
+                    "wp_viewporter" => wp_viewporter_global,
+                    "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global,
                     other => {
                         warn!("recreation graph tracked an unexpected global {other} -- skipping");
                         None
@@ -1365,7 +1456,7 @@ async fn recover_state_after_reconnect(
                 objects.map(guest_id, host_id, child_interface);
                 info!("recreated xdg_surface (guest={guest_id}, host={host_id})");
             }
-            Recreatable::XdgToplevel { parent_guest_id } => {
+            Recreatable::XdgToplevel { parent_guest_id, title, app_id } => {
                 let Some(parent_interface) = objects.interface(*parent_guest_id) else {
                     warn!("can't recreate xdg_toplevel {guest_id}: parent {parent_guest_id} was never recreated");
                     continue;
@@ -1389,6 +1480,37 @@ async fn recover_state_after_reconnect(
                 }
                 objects.map(guest_id, host_id, child_interface);
                 info!("recreated xdg_toplevel (guest={guest_id}, host={host_id})");
+
+                // Replay set_title/set_app_id -- see
+                // RecreationGraph::update_toplevel_title's doc comment
+                // (found live 2026-08-04): without this, the freshly
+                // recreated host-side toplevel has never been told its
+                // title or app_id at all, and GNOME Shell's own window
+                // list showed "Unknown" for it after a real crash-recovery
+                // test. Sent before the synthesized configure below, same
+                // ordering a real client uses (identity established before
+                // the surface is treated as mapped).
+                if let Some(title) = title {
+                    if let Some(set_title_opcode) = request_opcode(child_interface, "set_title") {
+                        let mut set_title_payload = Vec::new();
+                        wire::put_str(&mut set_title_payload, title);
+                        if let Err(e) = host.write_message(&wire::build_message(host_id, set_title_opcode, &set_title_payload), &[]).await
+                        {
+                            warn!("failed to replay set_title for xdg_toplevel {guest_id}: {e}");
+                        }
+                    }
+                }
+                if let Some(app_id) = app_id {
+                    if let Some(set_app_id_opcode) = request_opcode(child_interface, "set_app_id") {
+                        let mut set_app_id_payload = Vec::new();
+                        wire::put_str(&mut set_app_id_payload, app_id);
+                        if let Err(e) =
+                            host.write_message(&wire::build_message(host_id, set_app_id_opcode, &set_app_id_payload), &[]).await
+                        {
+                            warn!("failed to replay set_app_id for xdg_toplevel {guest_id}: {e}");
+                        }
+                    }
+                }
 
                 // Synthesize xdg_toplevel.configure(0, 0, []) BEFORE the
                 // xdg_surface.configure below -- found live 2026-08-03 (see
@@ -1587,6 +1709,102 @@ async fn recover_state_after_reconnect(
                 }
                 objects.map(guest_id, buffer_host_id, wl_buffer_interface);
                 info!("recreated dmabuf buffer (guest={guest_id}, host={buffer_host_id}, planes={})", planes.len());
+            }
+            Recreatable::SeatDevice { seat_guest_id, kind } => {
+                let Some(seat_interface) = objects.interface(*seat_guest_id) else {
+                    warn!("can't recreate {:?} {guest_id}: wl_seat {seat_guest_id} was never recreated", kind);
+                    continue;
+                };
+                let Some(seat_host_id) = objects.host_id(*seat_guest_id) else {
+                    warn!("can't recreate {:?} {guest_id}: wl_seat {seat_guest_id} has no host id", kind);
+                    continue;
+                };
+                let Some(opcode) = request_opcode(seat_interface, kind.request_name()) else {
+                    warn!("can't recreate {:?} {guest_id}: wl_seat has no {} request", kind, kind.request_name());
+                    continue;
+                };
+                let child_interface = seat_interface.requests[opcode as usize]
+                    .child_interface
+                    .expect("get_pointer/get_keyboard/get_touch always have a static child interface");
+                let host_id = objects.allocate_host_id();
+                let mut payload = Vec::new();
+                wire::put_u32(&mut payload, host_id);
+                if let Err(e) = host.write_message(&wire::build_message(seat_host_id, opcode, &payload), &[]).await {
+                    warn!("failed to recreate {:?} {guest_id}: {e}", kind);
+                    continue;
+                }
+                objects.map(guest_id, host_id, child_interface);
+                info!("recreated wl_seat {:?} (guest={guest_id}, host={host_id})", kind);
+            }
+            Recreatable::Viewport { viewporter_guest_id, surface_guest_id, destination } => {
+                let Some(manager_interface) = objects.interface(*viewporter_guest_id) else {
+                    warn!("can't recreate viewport {guest_id}: wp_viewporter {viewporter_guest_id} was never recreated");
+                    continue;
+                };
+                let (Some(manager_host_id), Some(surface_host_id)) =
+                    (objects.host_id(*viewporter_guest_id), objects.host_id(*surface_guest_id))
+                else {
+                    warn!("can't recreate viewport {guest_id}: manager or surface has no host id");
+                    continue;
+                };
+                let Some(opcode) = request_opcode(manager_interface, "get_viewport") else {
+                    warn!("can't recreate viewport {guest_id}: wp_viewporter has no get_viewport request");
+                    continue;
+                };
+                let child_interface =
+                    manager_interface.requests[opcode as usize].child_interface.expect("get_viewport always has a static child interface");
+                let host_id = objects.allocate_host_id();
+                let mut payload = Vec::new();
+                wire::put_u32(&mut payload, host_id);
+                wire::put_u32(&mut payload, surface_host_id);
+                if let Err(e) = host.write_message(&wire::build_message(manager_host_id, opcode, &payload), &[]).await {
+                    warn!("failed to recreate viewport {guest_id}: {e}");
+                    continue;
+                }
+                objects.map(guest_id, host_id, child_interface);
+                info!("recreated wp_viewport (guest={guest_id}, host={host_id})");
+
+                if let Some((width, height)) = destination {
+                    if let Some(set_destination_opcode) = request_opcode(child_interface, "set_destination") {
+                        let mut set_destination_payload = Vec::new();
+                        wire::put_u32(&mut set_destination_payload, *width as u32);
+                        wire::put_u32(&mut set_destination_payload, *height as u32);
+                        if let Err(e) =
+                            host.write_message(&wire::build_message(host_id, set_destination_opcode, &set_destination_payload), &[]).await
+                        {
+                            warn!("failed to replay set_destination for viewport {guest_id}: {e}");
+                        }
+                    }
+                }
+            }
+            Recreatable::FractionalScale { manager_guest_id, surface_guest_id } => {
+                let Some(manager_interface) = objects.interface(*manager_guest_id) else {
+                    warn!("can't recreate fractional scale {guest_id}: wp_fractional_scale_manager_v1 {manager_guest_id} was never recreated");
+                    continue;
+                };
+                let (Some(manager_host_id), Some(surface_host_id)) =
+                    (objects.host_id(*manager_guest_id), objects.host_id(*surface_guest_id))
+                else {
+                    warn!("can't recreate fractional scale {guest_id}: manager or surface has no host id");
+                    continue;
+                };
+                let Some(opcode) = request_opcode(manager_interface, "get_fractional_scale") else {
+                    warn!("can't recreate fractional scale {guest_id}: manager has no get_fractional_scale request");
+                    continue;
+                };
+                let child_interface = manager_interface.requests[opcode as usize]
+                    .child_interface
+                    .expect("get_fractional_scale always has a static child interface");
+                let host_id = objects.allocate_host_id();
+                let mut payload = Vec::new();
+                wire::put_u32(&mut payload, host_id);
+                wire::put_u32(&mut payload, surface_host_id);
+                if let Err(e) = host.write_message(&wire::build_message(manager_host_id, opcode, &payload), &[]).await {
+                    warn!("failed to recreate fractional scale {guest_id}: {e}");
+                    continue;
+                }
+                objects.map(guest_id, host_id, child_interface);
+                info!("recreated wp_fractional_scale_v1 (guest={guest_id}, host={host_id})");
             }
         }
     }
