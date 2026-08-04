@@ -84,3 +84,6 @@ clap = { version = "4", features = ["derive", "env"] }
 # that motivated moving off a raw byte pipe originally. Same crate
 # sommelier-rs and waypipe both use for this.
 nix = { version = "0.31.3", features = ["socket", "fs", "uio", "inotify", "signal", "poll"] }
+
+[dev-dependencies]
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }

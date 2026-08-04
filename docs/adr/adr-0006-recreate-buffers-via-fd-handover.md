@@ -5,11 +5,20 @@ Status
 wl_shm half implemented, tested, and live-validated 2026-08-04 (see the
 "wl_shm implementation, tested and live-validated" section near the end).
 dmabuf's `create_immed()` path also implemented and unit/integration
-tested 2026-08-04 (see "dmabuf create_immed() implementation" below) --
-NOT yet live-validated against `scripts/gtk/dmabuf_gl.py`. `create()`
-(the async, server-replies-later variant) remains deliberately deferred,
-per the sketch's own reasoning -- still no evidence either path is what
-real clients actually use.
+tested 2026-08-04 (see "dmabuf create_immed() implementation" below).
+
+Everything in this ADR that was still open (dmabuf live validation
+against a real client, and the deferred `create()`/`created()` async
+path) has moved to
+[ADR-0008](adr-0008-live-validate-dmabuf-recreation.md) rather than
+being tracked as further dated entries in this file -- live-validating
+dmabuf turned up a genuine new bug (the recreated client's own process
+wedging post-recovery, not a protocol-level error), which is its own
+investigation with its own scope, not a continuation of the work this
+ADR already finished. This ADR now documents only the wl_shm half (fully
+done) and the dmabuf `create_immed()` mechanism as implemented and unit/
+integration tested (mechanically correct, per those tests) -- its live
+behavior against a real GPU client is ADR-0008's subject, not this one's.
 
 The `wl_shm.create_pool` "invalid arguments" bug found during wl_shm's
 live validation (see "Open issue found live 2026-08-04" below for the
