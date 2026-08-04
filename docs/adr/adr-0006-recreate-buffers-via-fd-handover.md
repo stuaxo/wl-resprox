@@ -428,14 +428,83 @@ successful, at that point) forward. The message's own byte layout
 dump. So whatever's wrong isn't in the *content* this ADR's code
 constructs.
 
-Not yet tested: whether this is a proxy bug at all, versus a
-pre-existing GTK4/mutter interaction limitation that nothing before this
-session's fixes ever got far enough, fast enough, to trigger (the
-failing sequence is a destroy+create+resize burst all happening within
-milliseconds of a compositor reconnect, a pace normal user-driven
-resizing never produces). The clean way to settle this: a minimal
-reproduction connecting *directly* to gnome-shell's own private socket
-(bypassing the proxy) that fires the same rapid destroy/create_pool
-burst, independent of any crash/reconnect. Not attempted yet -- this is
-the natural next step before writing any more proxy-side code for it,
-per this project's own "verify, don't guess" discipline.
+**2026-08-04, later the same day: extensive isolation via three new
+diagnostic tools, all live on the real laptop.** Four increasingly
+faithful reproductions of the failing sequence (destroy old
+pool/buffer, immediately create a differently-sized new pool), each
+adding back one variable at a time, ALL passed cleanly -- none
+reproduced the failure:
+
+1. `examples/probe_create_pool_resize.rs`: the bare destroy+create_pool
+   burst (exact live sizes: 584640 -> 1056096, 579x456 buffer) sent
+   *directly to gnome-shell's own private socket*, no proxy involved at
+   all, no crash. **3/3 clean.** Rules out a pre-existing GTK4/mutter
+   limitation independent of this proxy entirely.
+2. Same burst, same tool, pointed at the *proxy's* public socket
+   instead, still no crash involved. **3/3 clean.** Rules out the
+   proxy's relay/fd-retention machinery being inherently broken for
+   this message shape, independent of any reconnect.
+3. `examples/probe_reconnect_resize.rs`: a minimal raw client (no
+   surface, no xdg-shell at all) that creates pool A/buffer A, actually
+   crashes gnome-shell itself (`pkill -9`), waits for the proxy to
+   reconnect and replay pool A/buffer A via its own retained fd (the
+   exact mechanism this ADR built), THEN does the destroy+create_pool B
+   burst against the *recreated* pool. **2/2 clean.** Rules out "a pool
+   recreated via the proxy's retained fd taints later live traffic
+   through it" as the sole cause.
+4. `examples/probe_reconnect_resize_with_surface.rs`: same as #3, but
+   with a real `wl_surface`/`xdg_surface`/`xdg_toplevel` chain, mapped
+   for real (initial commit, real `configure`/`ack_configure`), and the
+   post-crash destroy+create_pool burst followed by a real
+   attach+damage+frame+commit on the new buffer -- as close to GTK's own
+   traffic shape as a hand-rolled client reasonably gets. **1/1 clean.**
+
+A same-day re-run of the original `basic_shm.py` scenario, immediately
+after building tool #4, still failed exactly as before (confirmed via
+the proxy's own log: recreate completes cleanly, ~300ms later the
+client's own live `create_pool` gets `invalid arguments`) -- so this
+isn't something that's stopped happening; the four synthetic
+reproductions above just haven't found the missing variable yet.
+
+Building tool #3 also surfaced a real, separate, now-understood-and-not-
+a-bug behavior worth recording: a request sent to the proxy *during* the
+frozen window (e.g. a `sync()` fired immediately after `pkill`, before
+the proxy has even noticed the compositor died) is silently **dropped**,
+not queued -- `gtk.fill()` has no `if !frozen` guard, so the request is
+read and reaches `relay_ready_messages`, but with `dst: None`, and
+`sync()` isn't one of the specially-handled synthesis cases (unlike
+`wl_surface.frame()` or a destructor). A caller expecting a delayed-but-
+eventual answer (as tool #3 initially did) will hang forever on it. Not
+a defect in the proxy -- this is the documented `DROPPED_FROZEN`
+behavior working as designed -- but a real trap for any test tooling
+(or, in principle, a real client) that assumes a frozen connection
+merely *delays* answers rather than dropping some of them outright.
+
+Remaining candidate explanations, in rough order of plausibility, none
+yet tested:
+
+- **Real multi-client load specifically from a whole-desktop crash**,
+  not just "some other traffic exists" (all four synthetic
+  reproductions above ran on a live desktop with its own normal
+  background clients already reconnecting, and still didn't reproduce).
+  The live trace's own ~80ms gap between sending the destroy+create_pool
+  burst and getting *any* response (delete_id/error) is consistent with
+  mutter processing a real backlog under the specific load of an entire
+  desktop's worth of clients reconnecting within the same few hundred
+  milliseconds -- a scale none of the synthetic tools above attempt to
+  recreate (they're always the only, or nearly the only, client doing
+  anything interesting at that exact moment).
+- **Some GTK-specific request this ADR's reproductions don't send** --
+  the real trace shows `wp_viewport`/`wp_presentation` traffic
+  interleaved with the failing sequence that none of the four probe
+  tools replicate at all.
+- Something timing-sensitive enough that four attempts at
+  "mostly the same sequence, faster or slower" haven't hit the window.
+
+Suggested next step, if picked back up: capture the proxy's own
+built-in wire recorder (`src/recorder.rs`, `--record` /
+`WAYLAND_PROXY_RECORD`) across a live failing run, for a byte-for-byte
+diff against a clean run instead of more guess-and-check reproductions
+-- the recorder already exists and logs every relayed/dropped message
+with full context, unlike the ad hoc `tracing::debug!` lines used to
+investigate so far.

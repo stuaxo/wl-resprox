@@ -511,12 +511,35 @@ resumed rendering after reconnect for the first time this project has
 achieved. It then hit a NEW, separate, NOT-YET-ROOT-CAUSED bug on its
 own following resize (`invalid arguments for wl_shm#N.create_pool` from
 the real compositor, on an entirely ordinary, non-recovery `create_pool`)
--- ruled out an fd-size mismatch via `fstat`, not yet determined whether
-this is a proxy bug or a pre-existing GTK4/mutter interaction limitation
-nothing before these fixes ever got far enough, fast enough, to trigger.
-Next step: a minimal direct-to-gnome-shell (bypassing the proxy)
-reproduction of the same rapid destroy+create_pool-on-resize burst, to
-settle which it is before writing more proxy-side code.
+-- ruled out an fd-size mismatch via `fstat`.
+
+**Also implemented and unit/integration tested 2026-08-04, later the
+same day**: ADR-0006's dmabuf `create_immed()` half
+(`Recreatable::DmabufBuffer`, `examples/probe_dmabuf.rs` to verify wire
+signatures first). Deliberately not yet live-validated -- held back
+until the create_pool issue below is settled.
+
+**create_pool bug investigation, 2026-08-04, same day**: built four
+increasingly faithful reproductions (`examples/probe_create_pool_resize.rs`,
+`probe_reconnect_resize.rs`, `probe_reconnect_resize_with_surface.rs` --
+bare burst direct-to-compositor, same burst through the proxy, through a
+*real* crash+reconnect+recreation cycle with a minimal client, then with
+a full real surface/xdg_toplevel/configure/ack_configure chain). **All
+four passed cleanly** -- none reproduced the failure, while `basic_shm.py`
+itself still fails the same way on the same day. Ruled out: pre-existing
+GTK4/mutter limitation (fails clean without the proxy), proxy relay/fd-
+retention being broken in general (fails clean through the proxy without
+a crash), and "a pool recreated via the proxy's retained fd taints later
+traffic" as the sole cause (fails clean through a real reconnect too).
+Remaining candidates: real whole-desktop concurrent-client load during
+an actual crash (none of the synthetic repros run alongside that scale
+of simultaneous reconnection), or a GTK-specific request
+(`wp_viewport`/`wp_presentation` traffic seen interleaved in the real
+trace) none of the repros send. Suggested next step: use the proxy's own
+built-in wire recorder (`src/recorder.rs`, `WAYLAND_PROXY_RECORD=`) to
+capture a full byte-for-byte trace of a live failing run for comparison,
+rather than more guess-and-check reproductions. Full detail in
+ADR-0006's own "Open issue" section.
 
 ## The actual problem
 
