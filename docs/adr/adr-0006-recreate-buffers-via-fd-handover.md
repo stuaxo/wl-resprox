@@ -6,22 +6,17 @@ wl_shm half implemented, tested, and live-validated 2026-08-04 (see the
 "wl_shm implementation, tested and live-validated" section near the end).
 dmabuf's `create_immed()` path also implemented and unit/integration
 tested 2026-08-04 (see "dmabuf create_immed() implementation" below) --
-NOT yet live-validated against `scripts/gtk/dmabuf_gl.py` (the wl_shm
-open issue below needs settling first; live-testing dmabuf on top of an
-already-open wl_shm question would conflate two unknowns). `create()`
+NOT yet live-validated against `scripts/gtk/dmabuf_gl.py`. `create()`
 (the async, server-replies-later variant) remains deliberately deferred,
 per the sketch's own reasoning -- still no evidence either path is what
-real clients actually use. A new, separate, NOT-YET-ROOT-CAUSED bug was
-found during wl_shm's live validation -- see "Open issue found live
-2026-08-04" below -- real Wayland traffic now gets further than ever
-before, then hits a genuine `wl_shm.create_pool` rejection from the real
-compositor on an ordinary (non-recovery) resize, unrelated to anything
-this ADR's recreation logic touches. That bug's mechanism is now fully
-understood at the source level and the proxy's own send path is proven
-correct at the syscall level (see the same section's later, same-day
-update) -- what's left is outside this proxy's own code entirely: real
-concurrent-client load or something mutter-side during the ~100ms
-between our send and its rejection.
+real clients actually use.
+
+The `wl_shm.create_pool` "invalid arguments" bug found during wl_shm's
+live validation (see "Open issue found live 2026-08-04" below for the
+full investigation) is **ROOT-CAUSED AND FIXED**, same day, via
+`ShadowTable::unallocate_host_id` -- see that section's final update.
+Live-validated with a real client surviving three consecutive crashes
+cleanly (previously it died on the first, usually within seconds).
 
 Context
 
@@ -599,3 +594,80 @@ synthetically (all reproductions so far, per the section above, are
 effectively single-client). Given the proxy's own correctness is now
 about as thoroughly settled as it can be from this side of the socket,
 that's the natural next place to look if this is picked back up again.
+
+**ROOT-CAUSED AND FIXED, 2026-08-04, later the same day.** The 101.5ms
+gap and concurrent-load theory above turned out to be a red herring --
+real, measured, but not the actual mechanism. The decisive step was
+looking at mutter's own stderr, which this whole investigation had
+never actually done (everything so far came from *our* logs, the wire
+recorder, or strace on *our* process) -- it was already being captured,
+unmodified, in the session wrapper's own log
+(`$XDG_RUNTIME_DIR/wl-res-gnome-shell-direct-wrapper.log`, since
+`gnome-shell ... &` inherits that file's redirected stdout/stderr; no
+`G_MESSAGES_DEBUG` or other extra flag needed at all). It contains
+mutter's own, far more specific diagnostic for the exact failure
+moment:
+
+```
+libmutter-WARNING **: WL: not a valid new object id (17), message create_pool(nhi)
+libmutter-WARNING **: WL: error in client communication (pid 132172)
+```
+
+Not a missing fd -- a **rejected new_id**. Reading `wl_map_reserve_new`
+in the same libwayland source already pulled for the earlier
+investigation (`src/wayland-util.c`) shows exactly why: a server-side
+`wl_map` only accepts a client's new_id if it's either the *next*
+sequential slot (extending the array by one) or an *existing, freed*
+slot -- anything else (a gap beyond the array's current size) is
+rejected outright as invalid, since real Wayland servers require a
+client's own object ids to be strictly gapless.
+
+Reconstructing the exact host-id sequence from the proxy's own log for
+the failing run made the mechanism obvious: recovery replay consumed
+host ids 4 through 14 (compositor, wl_shm, dmabuf, three surfaces,
+xdg_wm_base, xdg_surface, xdg_toplevel, the replayed pool, the replayed
+buffer). Immediately afterward, TWO `wp_presentation.feedback` requests
+-- on stale, not-yet-recreated `wp_presentation` surfaces left over from
+before the crash -- hit the existing "sender has no translation" drop
+path (`relay_ready_messages`, the same one
+`create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping`
+already covers). That path *does* roll back the dropped message's
+guest-side mapping (exactly what that existing test proves) -- but it
+never gave back the **host id** `allocate_host_id()` had already
+consumed for it. Two such drops advanced `next_host_id` from 15 to 17
+without the real host ever seeing ids 15 or 16 used by anything --
+so the client's next, entirely ordinary `create_pool` landed on host id
+17 against a compositor whose own bookkeeping still expected 15 next.
+Exactly `wl_map_reserve_new`'s gap-rejection case, exactly matching the
+observed id.
+
+**Fix**: `ShadowTable::unallocate_host_id(id)` (`src/shadow_table.rs`)
+gives back a host id if (and only if) it's the single most recently
+allocated one -- true by construction at its one call site, since
+`relay_ready_messages` always allocates a new_id's host id and then
+immediately either forwards the message or rolls it back, within that
+same message's own processing, before any other allocation on the same
+connection can happen. Wired into the existing phantom-mapping rollback
+in `relay_ready_messages` (`src/lib.rs`), gated to `Direction::ClientToHost`
+specifically -- the only direction that ever consumes this counter in
+the first place (`HostToClient` allocates a guest id from a completely
+independent counter instead).
+
+New unit tests (`ShadowTable`: gives back the most recent allocation;
+a no-op for anything else) and a new integration test
+(`dropped_new_id_message_does_not_burn_a_host_id`) reproduce the exact
+scenario end to end: a dropped stale-sender `create_pool` followed by a
+legitimate `wl_compositor` bind, asserting the bind lands on the host
+id the drop *would* have used. Confirmed the test is meaningful, not
+just plausible, by reverting the fix and watching it fail exactly as
+predicted (`left: 5, right: 4`) before restoring it.
+
+**Live-validated on the real laptop**: three consecutive
+`pkill -9 gnome-shell` crashes against a running `basic_shm.py`, all
+survived cleanly -- no stall, no fatal `Gdk-Message`, frame ticks
+continuing through and past every recovery. The proxy's own log across
+those three crashes shows **1,118** dropped `wp_presentation.feedback`
+messages (i.e. 1,118 host-id burns that would have occurred without the
+fix -- previously enough of a gap to guarantee the bug almost
+immediately) and zero `COMPOSITOR ERROR`/`invalid arguments` lines --
+about as thorough a live confirmation as this bug is likely to get.

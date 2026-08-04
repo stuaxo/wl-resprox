@@ -948,6 +948,28 @@ async fn relay_ready_messages(
                     // mapping back so the id is genuinely untracked again,
                     // matching what actually happened on the host.
                     if let Some(phantom_guest_id) = newly_mapped_guest_id {
+                        // Found live 2026-08-04, the actual root cause of a
+                        // SEPARATE fatal disconnect than the one above
+                        // (`wl_display.error "invalid arguments for
+                        // wl_shm#N.create_pool"`, see ADR-0006's "Open
+                        // issue" section for the full investigation, and
+                        // ShadowTable::unallocate_host_id's own doc comment
+                        // for the mechanism): only a ClientToHost message
+                        // burns one of *our* host ids via allocate_host_id
+                        // in the first place (HostToClient allocates a
+                        // guest id instead, from a completely independent
+                        // counter never subject to this) -- give it back
+                        // before forgetting the mapping, or *this*
+                        // connection's own next legitimate new_id
+                        // eventually gets rejected by the host as
+                        // out-of-sequence once the gap is reached, an
+                        // entirely different failure from the one this
+                        // rollback was originally written for.
+                        if matches!(direction, Direction::ClientToHost) {
+                            if let Some(phantom_host_id) = objects.host_id(phantom_guest_id) {
+                                objects.unallocate_host_id(phantom_host_id);
+                            }
+                        }
                         objects.remove_guest(phantom_guest_id);
                         graph.remove(phantom_guest_id);
                     }

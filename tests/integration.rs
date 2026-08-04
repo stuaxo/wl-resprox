@@ -2909,3 +2909,146 @@ async fn dmabuf_buffer_recipe_replays_correctly_after_reconnect() {
 
     host_listener_task.abort();
 }
+
+/// Found live 2026-08-04: the phantom-mapping rollback proven by
+/// `create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping`
+/// above was itself incomplete -- it correctly forgets the GUEST-side
+/// mapping for a dropped new_id-bearing message, but left the HOST id
+/// counter permanently advanced past a number the real host never
+/// actually saw. A real desktop crash test hit exactly this: two
+/// dropped `wp_presentation.feedback` requests (stale surfaces, the
+/// same "sender has no translation" path) right after a reconnect
+/// burned two host ids, and the client's next entirely ordinary
+/// `wl_shm.create_pool` -- landing on a host id two past what the real
+/// compositor's own bookkeeping expected -- got rejected with a fatal
+/// `wl_display.error("invalid arguments for wl_shm#N.create_pool")`.
+/// `apt-get source wayland` + `strace` (see
+/// docs/adr/adr-0006-recreate-buffers-via-fd-handover.md's "Open issue"
+/// section for the full investigation) confirmed this precisely:
+/// libwayland-server's own `wl_map_reserve_new` requires a client's own
+/// new_ids to be gapless, rejecting anything else as "not a valid new
+/// object id". This test proves the fix (`ShadowTable::unallocate_host_id`):
+/// a legitimate new_id-bearing request sent right after a dropped one
+/// gets the host id the dropped one *would* have used, not one past it.
+#[tokio::test]
+async fn dropped_new_id_message_does_not_burn_a_host_id() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_shm", 1)];
+    const SECOND_LIFE_GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-host-id-gap-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
+        .await
+        .expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (first_sink, mut first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    // get_registry(2), sync(3), then bind wl_shm(name=1) -> guest id 4.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p));
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+    read_n_messages(&mut gtk_test_side, 2).await;
+
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 1); // name
+    wire::put_str(&mut p, "wl_shm");
+    wire::put_u32(&mut p, 1); // version
+    wire::put_u32(&mut p, 4); // new_id (guest) -- wl_shm
+    gtk_test_side.write_all(&wire::build_message(2, 0, &p)).await.expect("write bind");
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), first_sink_rx.recv())
+        .await
+        .expect("timed out waiting for the bind to reach the first life")
+        .expect("sink closed early");
+
+    // Crash and reconnect. Second life advertises wl_compositor (NOT
+    // wl_shm) -- wl_shm stays stale, same as the phantom-mapping test
+    // above, but this time there's something legitimate to bind
+    // afterward to observe the host id it actually lands on.
+    first_life_task.abort();
+    let (second_sink, mut second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) =
+            tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+                .await
+                .expect("proxy should reconnect within 3s")
+                .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, SECOND_LIFE_GLOBALS, 101, second_sink).await;
+    });
+
+    // Give recover_state_after_reconnect time to finish its own
+    // get_registry/sync round trip (registry_host_id=2, sync_host_id=3,
+    // wl_shm's own Global recipe fails to recreate since this life
+    // never advertises it -- so next_host_id is 4 once this settles,
+    // matching the live bug's own first-allocation-after-reconnect
+    // value) before sending anything.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // wl_shm(4).create_pool(new_id=5, size) on the now-stale wl_shm --
+    // dropped, same as the phantom-mapping test above, but THIS time
+    // proving the host id it allocated (would have been 4) gets given
+    // back, not burned.
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 5); // new_id (guest) -- would-be wl_shm_pool
+    wire::put_u32(&mut p, 4096); // size
+    gtk_test_side.write_all(&wire::build_message(4, 0, &p)).await.expect("write create_pool");
+
+    let forwarded = tokio::time::timeout(Duration::from_millis(300), second_sink_rx.recv()).await;
+    assert!(forwarded.is_err(), "create_pool on a stale wl_shm must never reach the new compositor, but got: {forwarded:?}");
+
+    // The actual proof: bind wl_compositor (legitimate, guest 6) via the
+    // freshly re-fetched registry -- if the earlier drop burned a host
+    // id, this bind lands on host id 5; if it was correctly given back,
+    // this bind reuses host id 4.
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 101); // name -- SECOND_LIFE_GLOBALS' first (and only) entry
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 6); // new_id (guest) -- wl_compositor
+    gtk_test_side.write_all(&wire::build_message(2, 0, &p)).await.expect("write bind wl_compositor");
+
+    let (_sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+        .await
+        .expect("timed out waiting for the wl_compositor bind to reach the second life")
+        .expect("sink closed early");
+    assert_eq!(opcode, 0, "bind opcode");
+    fn bind_new_id(payload: &[u8]) -> u32 {
+        let (_, next) = wire::read_str(payload, 4).expect("interface string");
+        wire::read_u32(payload, next + 4).expect("new_id") // next+4 skips version
+    }
+    assert_eq!(
+        bind_new_id(&payload),
+        4,
+        "the dropped create_pool's host id (4) should have been given back, not burned -- \
+         a real desktop crash hit exactly this gap once live, see ShadowTable::unallocate_host_id's own doc comment"
+    );
+
+    host_listener_task.abort();
+}

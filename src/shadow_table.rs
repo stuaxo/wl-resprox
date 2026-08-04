@@ -128,6 +128,33 @@ impl ShadowTable {
         id
     }
 
+    /// Gives back a host id that was allocated via `allocate_host_id`
+    /// but never actually sent to the host -- e.g. the message carrying
+    /// it as a `new_id` argument got dropped (its own sender turned out
+    /// untranslatable) before ever being forwarded. Found live
+    /// 2026-08-04 as the root cause of a real fatal disconnect
+    /// (`wl_display.error "invalid arguments for wl_shm#N.create_pool"`,
+    /// see docs/adr/adr-0006-recreate-buffers-via-fd-handover.md's "Open
+    /// issue" section for the full investigation): without this, this
+    /// table's own `next_host_id` counter permanently drifts ahead of
+    /// what the host has actually seen -- and libwayland-server's own
+    /// new_id validation (`wl_map_reserve_new`, confirmed by reading its
+    /// actual source) rejects the NEXT legitimate `new_id` outright once
+    /// the resulting gap is reached, since a real Wayland server
+    /// requires a client's own object ids to be gapless. Silently a
+    /// no-op unless `id` is exactly the most recently allocated one
+    /// (`next_host_id - 1`) -- true by construction at every call site
+    /// this exists for today (`relay_ready_messages` always allocates,
+    /// then immediately either forwards or rolls back, within the same
+    /// message's processing, before any other allocation on this same
+    /// table can happen), but a guard against ever silently corrupting
+    /// the counter if that invariant stops holding somewhere new.
+    pub fn unallocate_host_id(&mut self, id: u32) {
+        if id == self.next_host_id - 1 {
+            self.next_host_id -= 1;
+        }
+    }
+
     pub fn allocate_guest_server_id(&mut self) -> u32 {
         let id = self.next_guest_server_id;
         self.next_guest_server_id += 1;
@@ -356,5 +383,29 @@ mod tests {
         assert_eq!(table.allocate_host_id(), 3);
         assert_eq!(table.allocate_guest_server_id(), 0xff000000);
         assert_eq!(table.allocate_guest_server_id(), 0xff000001);
+    }
+
+    #[test]
+    fn unallocate_host_id_gives_back_the_most_recent_allocation() {
+        let mut table = ShadowTable::new();
+        assert_eq!(table.allocate_host_id(), 2);
+        assert_eq!(table.allocate_host_id(), 3);
+        table.unallocate_host_id(3);
+        // 3 was given back -- the next allocation should reuse it, not
+        // leave a gap at 3 by jumping straight to 4.
+        assert_eq!(table.allocate_host_id(), 3);
+    }
+
+    #[test]
+    fn unallocate_host_id_is_a_no_op_for_anything_but_the_most_recent_allocation() {
+        let mut table = ShadowTable::new();
+        table.allocate_host_id(); // 2
+        table.allocate_host_id(); // 3
+        table.allocate_host_id(); // 4 -- next_host_id is now 5
+        // Not the most recent (4) -- must not silently rewind the
+        // counter past ids that may already be legitimately in use.
+        table.unallocate_host_id(2);
+        table.unallocate_host_id(3);
+        assert_eq!(table.allocate_host_id(), 5);
     }
 }

@@ -556,11 +556,36 @@ at the syscall level that the proxy's own `sendmsg()` for the exact
 failing message was fully correct -- complete 16-byte write, `SCM_RIGHTS`
 fd correctly attached -- ruling out the proxy's send path entirely. Also
 measured, precisely: **101.5ms** between that send and mutter's
-rejection arriving back, the strongest evidence yet that something
-mutter-side (most likely genuine concurrent-client load) during that
-window is where the actual cause lives, not anything on this side of
-the socket. Full detail, including the exact `sendmsg()` capture, in
-ADR-0006.
+rejection arriving back -- turned out to be a real but misleading
+number; the actual mechanism was found separately (below).
+
+**ROOT-CAUSED AND FIXED, same day, later still.** The decisive step was
+finally reading mutter's own stderr (already captured, unmodified, in
+the session wrapper's own log -- never actually looked at until this
+point). It names the exact reason: `WL: not a valid new object id (17),
+message create_pool(nhi)` -- not a missing fd at all. Reading
+libwayland's `wl_map_reserve_new` source confirms real Wayland servers
+require a client's own object ids to be strictly gapless. The actual
+bug: the existing "sender has no translation" drop path
+(`relay_ready_messages`, already covered by
+`create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping`)
+correctly rolls back a dropped message's *guest*-side mapping, but
+never gave back the *host* id `allocate_host_id()` had already consumed
+for it -- so every such drop permanently burns one host id, and enough
+of them (two, in the live failing run; the client's own stale
+`wp_presentation.feedback` traffic right after a reconnect routinely
+produces several) open a gap the real compositor then rejects the next
+legitimate `create_pool`/`create_buffer`/bind through. Fixed via
+`ShadowTable::unallocate_host_id` (`src/shadow_table.rs`), wired into
+that same rollback in `src/lib.rs`. New unit tests plus a new
+integration test (`dropped_new_id_message_does_not_burn_a_host_id`)
+reproduce it end to end, confirmed meaningful by reverting the fix and
+watching it fail exactly as predicted. **Live-validated**: three
+consecutive `pkill -9 gnome-shell` crashes against a real
+`basic_shm.py`, all survived cleanly (previously died on the first,
+usually within seconds) -- 1,118 host-id-burning drops logged across
+the three crashes, zero compositor errors. Full detail, including the
+exact mutter log lines and the id-sequence reconstruction, in ADR-0006.
 
 ## The actual problem
 
