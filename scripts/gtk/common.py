@@ -86,6 +86,14 @@ class TestWindow(Gtk.ApplicationWindow):
         self.connect("unmap", lambda *_: log.info("window unmapped"))
         self.connect("close-request", self._on_close_request)
 
+        # Quitting a recovered-after-crash window by clicking its own
+        # titlebar close button is exactly the interaction most worth
+        # doubting after a crash-recovery test -- Escape is a reliable
+        # fallback that doesn't depend on window-manager chrome working.
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_controller)
+
         # add_tick_callback alone, self-chained via queue_draw() from
         # inside the callback, was found live NOT to reliably keep the
         # frame clock in continuous-update mode (fired once, then never
@@ -175,6 +183,13 @@ class TestWindow(Gtk.ApplicationWindow):
 
     def _on_close_request(self, *_):
         log.info("close requested, total frames rendered: %d", self._frame_count)
+        return False
+
+    def _on_key_pressed(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            log.info("Escape pressed, closing")
+            self.close()
+            return True
         return False
 
 
