@@ -1093,7 +1093,7 @@ async fn serve_fake_compositor_life(
     first_name: u32,
     sink: tokio::sync::mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use wayland_proxy::wire;
 
     let mut buf = Vec::new();
@@ -1126,9 +1126,35 @@ async fn serve_fake_compositor_life(
             }
             buf.drain(..consumed);
         }
-        match stream.read(&mut tmp).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        // Deliberately NOT a plain `stream.read()`: once a real test sends
+        // an fd via SCM_RIGHTS (see wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect,
+        // the first test here to do so), a plain read() on an AF_UNIX
+        // SOCK_STREAM socket stops exactly at the end of whatever skb
+        // carried the ancillary data -- confirmed empirically: a read()
+        // here returned every byte up through a create_pool message's
+        // payload and no further, even though the next message
+        // (create_buffer, no fd) had already been written by the proxy and
+        // was sitting in the kernel receive buffer. The kernel won't merge
+        // a later skb into the same read() as an ancillary-bearing one,
+        // and -- unlike a raw `recvmsg` retrieving (and here, discarding)
+        // the ancillary data itself -- a plain `read()`/`recv()` next call
+        // never got woken for the remainder, hanging the test. Exactly the
+        // class of hazard `Conn::fill()` (src/lib.rs) already documents and
+        // works around the same way: `recv_with_fds` (which properly
+        // retrieves, and here simply drops, any fds) via `try_io` so
+        // tokio's readiness tracking stays correct across the boundary.
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&stream);
+        if stream.readable().await.is_err() {
+            return;
+        }
+        let result = stream.try_io(tokio::io::Interest::READABLE, || {
+            wayland_proxy::fdsocket::recv_with_fds(raw_fd, &mut tmp).map_err(std::io::Error::from)
+        });
+        match result {
+            Ok((0, _fds)) => return,
+            Ok((n, _fds)) => buf.extend_from_slice(&tmp[..n]), // _fds (if any) close on drop, unused by this fake compositor
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => return,
         }
     }
 }
@@ -2137,4 +2163,228 @@ async fn grab_state_is_released_before_traffic_resumes_after_reconnect() {
     let payload = &messages[1][wire::HEADER_LEN..];
     assert_eq!(wire::read_u32(payload, 8), Some(272), "released button should match the one pressed pre-crash");
     assert_eq!(wire::read_u32(payload, 12), Some(0), "state should be Released");
+}
+
+/// ADR-0006, wl_shm half: the class of fatal crash-recovery gap this
+/// closes is a client re-attaching its own pre-crash `wl_buffer` after a
+/// reconnect, which used to hit "references untranslatable object N --
+/// dropping" followed by the real compositor killing the connection
+/// outright (confirmed live 2026-08-03 against a real gtk4-demo -- see
+/// plan-desktop-resilience.md). This test proves the mechanism the fix
+/// depends on, end to end: `wl_shm.create_pool` carries a REAL fd via
+/// SCM_RIGHTS (unlike `create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping`,
+/// which only needed to prove shadow-table bookkeeping and skipped real fd
+/// passing) which the proxy must retain -- not just forward and forget --
+/// and on reconnect replay both `create_pool` (using its own retained copy
+/// of that fd) and `create_buffer` against the fresh compositor, chaining
+/// host ids correctly, before a client's subsequent `attach()` could ever
+/// depend on it.
+#[tokio::test]
+async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use std::os::fd::AsRawFd;
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6), ("xdg_wm_base", 6), ("wl_shm", 1)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-shm-buffer-reconnect-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
+        .await
+        .expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (first_sink, _first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    // get_registry(2), sync(3).
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p));
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let mut wl_compositor_name = None;
+    let mut xdg_wm_base_name = None;
+    let mut wl_shm_name = None;
+    'collect: loop {
+        use tokio::io::AsyncReadExt;
+        let n = tokio::time::timeout(Duration::from_secs(3), gtk_test_side.read(&mut tmp))
+            .await
+            .expect("timed out collecting globals")
+            .expect("read error");
+        assert_ne!(n, 0);
+        buf.extend_from_slice(&tmp[..n]);
+        while let Some((msg, consumed)) = wire::take_message(&buf) {
+            let header = wire::MessageHeader::parse(msg).unwrap();
+            let payload = &msg[wire::HEADER_LEN..];
+            if header.sender_id == 2 && header.opcode == 0 {
+                if let (Some(name), Some((iface, _))) = (wire::read_u32(payload, 0), wire::read_str(payload, 4)) {
+                    match iface.as_str() {
+                        "wl_compositor" => wl_compositor_name = Some(name),
+                        "xdg_wm_base" => xdg_wm_base_name = Some(name),
+                        "wl_shm" => wl_shm_name = Some(name),
+                        _ => {}
+                    }
+                }
+            } else if header.sender_id == 3 && header.opcode == 0 {
+                buf.drain(..consumed);
+                break 'collect;
+            }
+            buf.drain(..consumed);
+        }
+    }
+    let wl_compositor_name = wl_compositor_name.expect("wl_compositor advertised");
+    let xdg_wm_base_name = xdg_wm_base_name.expect("xdg_wm_base advertised");
+    let wl_shm_name = wl_shm_name.expect("wl_shm advertised");
+
+    // bind wl_compositor->4, xdg_wm_base->5, wl_shm->9; create_surface->6,
+    // get_xdg_surface->7, get_toplevel->8 -- same guest-id scheme as the
+    // other full-chain reconnect tests, wl_shm bound alongside the other
+    // two roots.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, wl_compositor_name);
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 4);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, xdg_wm_base_name);
+    wire::put_str(&mut p, "xdg_wm_base");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 5);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, wl_shm_name);
+    wire::put_str(&mut p, "wl_shm");
+    wire::put_u32(&mut p, 1);
+    wire::put_u32(&mut p, 9);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(4, 0, &p)); // wl_compositor(4).create_surface -> wl_surface(6)
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 7);
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(5, 2, &p)); // xdg_wm_base(5).get_xdg_surface(surface=6) -> xdg_surface(7)
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 8);
+    out.extend(wire::build_message(7, 1, &p)); // xdg_surface(7).get_toplevel -> xdg_toplevel(8)
+    gtk_test_side.write_all(&out).await.expect("write bind+create chain");
+
+    // wl_shm(9).create_pool(new_id=10, fd, size=4096) -- a REAL fd this
+    // time: the whole point of ADR-0006 is that the proxy retains its own
+    // copy of this fd, so the test needs a real one to retain. tokio's
+    // plain write_all can't carry ancillary SCM_RIGHTS data (see
+    // fdsocket.rs's own doc comment) -- fdsocket::send_with_fds is used
+    // directly against the same underlying socket instead, same as
+    // Conn::write_message does internally.
+    let backing_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp_dir.join("shm_pool_backing"))
+        .expect("create backing file");
+    backing_file.set_len(4096).expect("size backing file");
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 10); // new_id (guest) -- wl_shm_pool
+    wire::put_u32(&mut p, 4096); // size
+    let create_pool_msg = wire::build_message(9, 0, &p);
+    wayland_proxy::fdsocket::send_with_fds(gtk_test_side.as_raw_fd(), &create_pool_msg, &[backing_file.as_raw_fd()])
+        .expect("send create_pool with a real fd");
+
+    // wl_shm_pool(10).create_buffer(new_id=11, offset=0, width=64,
+    // height=64, stride=256, format=0/*ARGB8888*/) -- no fd of its own,
+    // draws from the pool's already-retained backing memfd.
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 11); // new_id (guest) -- wl_buffer
+    wire::put_u32(&mut p, 0); // offset
+    wire::put_u32(&mut p, 64); // width
+    wire::put_u32(&mut p, 64); // height
+    wire::put_u32(&mut p, 256); // stride
+    wire::put_u32(&mut p, 0); // format
+    gtk_test_side.write_all(&wire::build_message(10, 0, &p)).await.expect("write create_buffer");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Crash. Second life uses different global names, same as every other
+    // reconnect test here.
+    first_life_task.abort();
+    let (second_sink, mut second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) =
+            tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+                .await
+                .expect("proxy should reconnect within 3s")
+                .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
+    });
+
+    // Recovery replays exactly 8 requests, in the order the client
+    // originally issued them: bind(wl_compositor), bind(xdg_wm_base),
+    // bind(wl_shm), create_surface, get_xdg_surface, get_toplevel,
+    // create_pool, create_buffer.
+    let mut observed = Vec::new();
+    for i in 0..8 {
+        let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for recreation request #{i}, got so far: {observed:?}"))
+            .expect("sink closed early");
+        observed.push((sender, opcode, payload));
+    }
+
+    fn bind_new_id(payload: &[u8]) -> u32 {
+        let (_, next) = wire::read_str(payload, 4).expect("interface string");
+        wire::read_u32(payload, next + 4).expect("new_id") // next+4 skips version
+    }
+
+    let iface = wire::read_str(&observed[2].2, 4).unwrap().0;
+    assert_eq!(iface, "wl_shm", "third bind should be wl_shm, matching the client's own bind order");
+    let recreated_shm_host_id = bind_new_id(&observed[2].2);
+
+    // create_pool: sent to the freshly re-bound wl_shm (not any earlier
+    // object), carrying the ORIGINAL size (4096) -- not something derived
+    // from the new compositor, which never advertised a size at all.
+    assert_eq!(observed[6].0, recreated_shm_host_id, "create_pool should target wl_shm's freshly recreated host id");
+    assert_eq!(observed[6].1, 0, "create_pool opcode");
+    let recreated_pool_host_id = wire::read_u32(&observed[6].2, 0).unwrap();
+    let replayed_size = wire::read_u32(&observed[6].2, 4).unwrap();
+    assert_eq!(replayed_size, 4096, "replayed create_pool should carry the pool's originally-recorded size");
+
+    // create_buffer: sent to the freshly recreated pool, referencing its
+    // NEW host id -- not the pool's stale first-life one -- and carrying
+    // the buffer's originally-recorded offset/width/height/stride/format.
+    assert_eq!(observed[7].0, recreated_pool_host_id, "create_buffer should target the pool's freshly recreated host id");
+    assert_eq!(observed[7].1, 0, "create_buffer opcode");
+    assert_eq!(wire::read_u32(&observed[7].2, 4), Some(0), "offset");
+    assert_eq!(wire::read_u32(&observed[7].2, 8), Some(64), "width");
+    assert_eq!(wire::read_u32(&observed[7].2, 12), Some(64), "height");
+    assert_eq!(wire::read_u32(&observed[7].2, 16), Some(256), "stride");
+    assert_eq!(wire::read_u32(&observed[7].2, 20), Some(0), "format");
+
+    host_listener_task.abort();
 }

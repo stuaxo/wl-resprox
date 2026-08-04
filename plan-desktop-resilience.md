@@ -455,6 +455,47 @@ Still to verify: a full crash test with the frame-callback fix live,
 confirming a mid-render gtk4-demo actually keeps rendering after
 recovery, not just that the proxy-side mechanics are correct.
 
+**Buffer-reuse gap found live 2026-08-03, same night, immediately after
+the frame-callback fix above.** The `done` synthesis correctly unstuck a
+real gtk4-demo's frame clock, but it then re-`attach()`ed its own
+pre-crash GPU buffer, hitting `wl_surface.attach references
+untranslatable object N -- dropping` followed by a fatal `COMPOSITOR
+ERROR: ... invalid arguments for wl_surface#8.frame` that killed the
+connection -- `wl_buffer` was deliberately never part of the recreation
+graph (see `recreation.rs`'s original doc comment). Root-caused and
+designed as `docs/adr/adr-0006-recreate-buffers-via-fd-handover.md`:
+the proxy already receives its own SCM_RIGHTS copy of any buffer-backing
+fd as a side effect of relaying `wl_shm.create_pool`/dmabuf's params
+dance, today simply forwarded and forgotten; retaining it plus a
+recorded recipe lets a buffer be replayed against the fresh compositor
+on reconnect, the same pattern every other recreated object already
+uses.
+
+**wl_shm half implemented and test-verified 2026-08-04** (not yet live
+on the real laptop): `Recreatable::ShmPool`/`ShmBuffer` (`recreation.rs`),
+recipe capture + fd retention at `wl_shm.create_pool`/
+`wl_shm_pool.create_buffer` (moving the proxy's own received `OwnedFd`
+out of the generic per-message fd vec, not a `dup()`), `wl_shm_pool
+.resize` updating the recorded size in place, and replay in
+`recover_state_after_reconnect` (`wl_shm` itself is now also a
+`Recreatable::Global`, needed so a recreated pool has a fresh `wl_shm`
+host id to attach to). New integration test
+`wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect` sends
+a REAL fd via SCM_RIGHTS (the first test here to do so) and confirms
+both `create_pool` (with the proxy's retained fd) and `create_buffer`
+replay correctly against a second fake compositor life, host-id-chained
+correctly. Caught and fixed a real bug surfaced only by writing this
+test: `tests/integration.rs`'s fake-compositor harness used a plain
+tokio `read()`, which -- once an SCM_RIGHTS-bearing message is involved --
+stops exactly at that message's boundary and never wakes for data sent
+afterward (a real AF_UNIX `SOCK_STREAM` kernel quirk, not a test-harness
+typo); fixed by switching the harness to the same `recv_with_fds`/
+`try_io` pattern `Conn::fill()` already uses and documents for exactly
+this reason. Not yet exercised against real fd-cleanup-on-destroy or the
+dmabuf half (`create_immed()`), both still per the ADR's own suggested
+order: validate this against `scripts/gtk/basic_shm.py` live next, then
+build the dmabuf path against `dmabuf_gl.py`.
+
 ## The actual problem
 
 gnome-shell sometimes crashes while the screen is **locked**. Since

@@ -418,7 +418,8 @@ async fn relay_ready_messages(
                                 let recipe = match (interface.name, desc.name) {
                                     ("wl_registry", "bind")
                                         if child_iface.name == "wl_compositor"
-                                            || child_iface.name == "xdg_wm_base" =>
+                                            || child_iface.name == "xdg_wm_base"
+                                            || child_iface.name == "wl_shm" =>
                                     {
                                         // The version the CLIENT itself
                                         // requested, not child_iface.version
@@ -467,6 +468,35 @@ async fn relay_ready_messages(
                                     }
                                     ("xdg_surface", "get_toplevel") => {
                                         Some(Recreatable::XdgToplevel { parent_guest_id: guest_sender_id })
+                                    }
+                                    ("wl_shm_pool", "create_buffer") => {
+                                        // offset/width/height/stride/format
+                                        // are plain Int/Uint args, not
+                                        // Object-typed -- not present in
+                                        // original_object_values (only
+                                        // object-argument offsets, see its
+                                        // own comment above), so read
+                                        // straight from the payload at their
+                                        // fixed positions immediately after
+                                        // the new_id (see ADR-0006's
+                                        // implementation sketch: no fd of
+                                        // its own, draws from the pool's
+                                        // already-retained backing memfd).
+                                        let payload = &msg[wire::HEADER_LEN..];
+                                        let read_i32 = |at: usize| wire::read_u32(payload, at).map(|v| v as i32);
+                                        match (read_i32(offset + 4), read_i32(offset + 8), read_i32(offset + 12), read_i32(offset + 16), read_i32(offset + 20)) {
+                                            (Some(buf_offset), Some(width), Some(height), Some(stride), Some(format)) => {
+                                                Some(Recreatable::ShmBuffer {
+                                                    pool_guest_id: guest_sender_id,
+                                                    offset: buf_offset,
+                                                    width,
+                                                    height,
+                                                    stride,
+                                                    format: format as u32,
+                                                })
+                                            }
+                                            _ => None,
+                                        }
                                     }
                                     _ => None,
                                 };
@@ -626,6 +656,21 @@ async fn relay_ready_messages(
                         }
                         "leave" => grabs.on_keyboard_leave(guest_sender_id),
                         _ => {}
+                    }
+                }
+
+                // wl_shm_pool.resize(size) doesn't create a new object (no
+                // new_id), so it never goes through the new_id recipe-
+                // capture block above -- but a pool tracked by the
+                // recreation graph (see recreation.rs's ShmPool variant,
+                // ADR-0006) still needs its recorded `size` kept accurate,
+                // or a replayed create_pool after a reconnect would recreate
+                // it at its original, now-stale size. Observation only:
+                // the request itself still forwards normally below, same as
+                // the grab-state observation above.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "wl_shm_pool" && desc.name == "resize" {
+                    if let Some(size) = wire::read_u32(&msg[wire::HEADER_LEN..], 0).map(|v| v as i32) {
+                        graph.update_shm_pool_size(guest_sender_id, size);
                     }
                 }
 
@@ -866,6 +911,31 @@ async fn relay_ready_messages(
                         other_side_sender_id, header.opcode, walk.fd_count, &msg,
                     );
                 }
+
+                // Retain our own copy of wl_shm.create_pool's backing fd for
+                // later buffer recreation (see recreation.rs's ShmPool
+                // variant and ADR-0006) -- deliberately AFTER the
+                // forward/drop above, not before: forwarding above already
+                // sent its own copy via sendmsg (which dup's the fd onto the
+                // wire), so moving this one out of `fds` here doesn't
+                // disturb what the host received, or -- while frozen --
+                // what would have been sent. Retained either way: our own
+                // replay against a fresh compositor never depends on
+                // whether the *old*, possibly-dead host ever saw this
+                // message.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "wl_shm" && desc.name == "create_pool" {
+                    if let (Some(pool_guest_id), Some(fd)) = (newly_mapped_guest_id, fds.pop()) {
+                        let payload = &msg[wire::HEADER_LEN..];
+                        let size = walk
+                            .new_id_offset
+                            .and_then(|off| wire::read_u32(payload, off + 4))
+                            .map(|v| v as i32)
+                            .unwrap_or(0);
+                        graph.record(pool_guest_id, Recreatable::ShmPool { wl_shm_guest_id: guest_sender_id, fd, size });
+                    } else {
+                        warn!("wl_shm.create_pool had no fd to retain for recreation");
+                    }
+                }
             }
             Err(e) => {
                 // We know the interface/opcode but couldn't walk its own
@@ -966,6 +1036,7 @@ async fn recover_state_after_reconnect(
     // satisfy whatever Recreatable::Global entries `graph` holds.
     let mut wl_compositor_global: Option<(u32, u32)> = None; // (name, version)
     let mut xdg_wm_base_global: Option<(u32, u32)> = None;
+    let mut wl_shm_global: Option<(u32, u32)> = None;
     'collect: loop {
         // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention
         // -- see its own doc comment), which the `?` below does NOT catch
@@ -992,6 +1063,7 @@ async fn recover_state_after_reconnect(
                             match iface_name.as_str() {
                                 "wl_compositor" => wl_compositor_global = Some((name, version)),
                                 "xdg_wm_base" => xdg_wm_base_global = Some((name, version)),
+                                "wl_shm" => wl_shm_global = Some((name, version)),
                                 _ => {}
                             }
                         }
@@ -1015,6 +1087,7 @@ async fn recover_state_after_reconnect(
                 let found = match interface.name {
                     "wl_compositor" => wl_compositor_global,
                     "xdg_wm_base" => xdg_wm_base_global,
+                    "wl_shm" => wl_shm_global,
                     other => {
                         warn!("recreation graph tracked an unexpected global {other} -- skipping");
                         None
@@ -1184,6 +1257,67 @@ async fn recover_state_after_reconnect(
                 {
                     warn!("failed to synthesize xdg_surface.configure for {parent_guest_id}: {e}");
                 }
+            }
+            Recreatable::ShmPool { wl_shm_guest_id, fd, size } => {
+                let Some(parent_interface) = objects.interface(*wl_shm_guest_id) else {
+                    warn!("can't recreate shm pool {guest_id}: wl_shm {wl_shm_guest_id} was never recreated");
+                    continue;
+                };
+                let Some(parent_host_id) = objects.host_id(*wl_shm_guest_id) else {
+                    warn!("can't recreate shm pool {guest_id}: wl_shm {wl_shm_guest_id} has no host id");
+                    continue;
+                };
+                let Some(opcode) = request_opcode(parent_interface, "create_pool") else {
+                    warn!("can't recreate shm pool {guest_id}: {} has no create_pool request", parent_interface.name);
+                    continue;
+                };
+                let child_interface =
+                    parent_interface.requests[opcode as usize].child_interface.expect("create_pool always has a static child interface");
+                let host_id = objects.allocate_host_id();
+                let mut payload = Vec::new();
+                wire::put_u32(&mut payload, host_id);
+                wire::put_u32(&mut payload, *size as u32);
+                // Our own retained copy (see recreation.rs's ShmPool doc
+                // comment) -- the new compositor gets its own independent
+                // copy via sendmsg, same as every other fd-bearing message
+                // this proxy relays; ours stays open afterward, still owned
+                // by this recipe.
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[fd.as_raw_fd()]).await {
+                    warn!("failed to recreate shm pool {guest_id}: {e}");
+                    continue;
+                }
+                objects.map(guest_id, host_id, child_interface);
+                info!("recreated wl_shm_pool (guest={guest_id}, host={host_id})");
+            }
+            Recreatable::ShmBuffer { pool_guest_id, offset, width, height, stride, format } => {
+                let Some(parent_interface) = objects.interface(*pool_guest_id) else {
+                    warn!("can't recreate shm buffer {guest_id}: pool {pool_guest_id} was never recreated");
+                    continue;
+                };
+                let Some(parent_host_id) = objects.host_id(*pool_guest_id) else {
+                    warn!("can't recreate shm buffer {guest_id}: pool {pool_guest_id} has no host id");
+                    continue;
+                };
+                let Some(opcode) = request_opcode(parent_interface, "create_buffer") else {
+                    warn!("can't recreate shm buffer {guest_id}: {} has no create_buffer request", parent_interface.name);
+                    continue;
+                };
+                let child_interface =
+                    parent_interface.requests[opcode as usize].child_interface.expect("create_buffer always has a static child interface");
+                let host_id = objects.allocate_host_id();
+                let mut payload = Vec::new();
+                wire::put_u32(&mut payload, host_id);
+                wire::put_u32(&mut payload, *offset as u32);
+                wire::put_u32(&mut payload, *width as u32);
+                wire::put_u32(&mut payload, *height as u32);
+                wire::put_u32(&mut payload, *stride as u32);
+                wire::put_u32(&mut payload, *format);
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[]).await {
+                    warn!("failed to recreate shm buffer {guest_id}: {e}");
+                    continue;
+                }
+                objects.map(guest_id, host_id, child_interface);
+                info!("recreated wl_shm buffer (guest={guest_id}, host={host_id})");
             }
         }
     }
