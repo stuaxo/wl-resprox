@@ -97,6 +97,96 @@ it. That's an acceptable, expected consequence of "tell the client the
 display went away and came back" -- the design direction chosen earlier
 this session -- not a shortcoming specific to this ADR.
 
+Concrete implementation sketch (2026-08-04, fleshed out before starting --
+the paragraph above stated the shape of the fix, this is what it actually
+touches):
+
+**New `Recreatable` variants** (`recreation.rs`), each owning any fd it
+needs rather than tracking fds separately -- see the fd-lifecycle point
+below for why:
+
+```rust
+ShmPool { fd: OwnedFd, size: i32 },
+ShmBuffer { pool_guest_id: u32, offset: i32, width: i32, height: i32, stride: i32, format: u32 },
+DmabufBuffer { width: i32, height: i32, format: u32, flags: u32, planes: Vec<DmabufPlane> },
+```
+```rust
+struct DmabufPlane { fd: OwnedFd, plane_idx: u32, offset: u32, stride: u32, modifier: u64 }
+```
+
+**wl_shm path** (do this one first -- single-request creation, no
+multi-step accumulation, closest to every existing `Recreatable`
+variant): record `ShmPool` at `wl_shm.create_pool(new_id, fd, size)`,
+record `ShmBuffer` at `wl_shm_pool.create_buffer(new_id, offset, w, h,
+stride, format)`. `wl_shm_pool.resize(size)` needs handling too --
+update the pool's already-recorded `size` in place rather than adding a
+second recipe for the same guest id.
+
+**dmabuf path, phased, do `create_immed()` first**: `zwp_linux_dmabuf_v1
+.create_params(new_id)` starts a `zwp_linux_buffer_params_v1`; one or
+more `.add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo)`
+calls accumulate per-plane data against *that* object's own guest id
+(new transient state, not yet a `Recreatable` -- the buffer doesn't
+exist until creation finishes); `.create_immed(new_id, w, h, format,
+flags)` finalizes it in one synchronous message, matching the "client
+picks the new_id, everything needed is in the one request" shape every
+other `Recreatable` already assumes.
+
+The other creation path, `.create(w, h, format, flags)` (no new_id in
+the request) followed later by a server-initiated `created(new_id
+buffer)` *event* (or a `failed()` event) on the params object, is
+*not* being ruled out -- worth noting the existing generic new_id
+machinery in `relay_ready_messages` already handles server-initiated
+new_ids generically (`Direction::HostToClient => (objects
+.allocate_guest_server_id(), original_new_id)`, already used for things
+like `wl_data_device.data_offer`), so no new wire-relay mechanism is
+needed for it, just correlating the later event back to the pending
+per-params-object state by the event's own sender_id (the params object
+itself). Deliberately deferred rather than built for now: which path
+real clients (GTK4's GL/NGL renderer specifically) actually use is
+answerable empirically with `scripts/gtk/dmabuf_gl.py` plus a look at
+the wire traffic, not something to guess at and build for speculatively
+-- same "verify, don't design for the unconfirmed case" discipline as
+the two items already listed below.
+
+**New transient per-connection state**: a `HashMap<u32, Vec<DmabufPlane>>`
+keyed by the params object's own guest id, threaded through
+`relay_ready_messages` the same way `pending_configure_acks` already is
+(see that parameter for the existing pattern to follow, not a new one to
+invent). Cleared once `create_immed()` (or, once built, `created()`)
+finalizes -- the params object is documented as single-use, the protocol
+itself doesn't expect further `add()` calls against it afterward.
+
+**FD retention mechanics**: `relay_ready_messages` already receives any
+message's fds into a local `fds: Vec<OwnedFd>` (`src.read_fds.pop_front()`
+per declared FD argument) before converting to `RawFd` for the outgoing
+`write_message` call -- today that local `Vec` simply drops (closing
+every fd) once forwarding completes. For `wl_shm.create_pool` and
+`zwp_linux_buffer_params_v1.add` specifically, move the relevant `OwnedFd`
+out of that vec into the pending-params map or the new `Recreatable`
+variant instead of letting it drop -- not a `dup()`/`try_clone()`, an
+actual ownership transfer, since the generic forwarding code already has
+its own independent copy to send onward (SCM_RIGHTS hands each receiving
+end -- including this proxy -- its own fd; keeping one doesn't affect the
+one already sent to the host).
+
+**FD cleanup falls out for free**: once retained *inside* a
+`Recreatable` variant (not tracked in a side table), `OwnedFd`'s own
+`Drop` impl closes the fd automatically whenever the recipe itself is
+dropped -- which already happens today, unconditionally, in
+`RecreationGraph::remove()` (called on every `delete_id`/destructor
+path). No new explicit close()-on-destroy bookkeeping needed; this is
+Rust's own ownership model already doing exactly what the "retained fds
+must be closed when their guest object is destroyed" item below asks
+for, essentially by construction rather than by remembering to add it.
+
+**Replay ordering**: no change needed to `RecreationGraph`'s existing
+parent-before-child guarantee (insertion order) -- a client can only
+ever create a `wl_shm_pool` before any buffer drawn from it, or finish a
+`zwp_linux_buffer_params_v1` before any surface attaches the resulting
+buffer, so the existing ordering contract already covers these new
+variants without modification.
+
 Validation tooling: `scripts/gtk/basic_shm.py` and `dmabuf_gl.py` (added
 the same night, see their own module doc comments) exist specifically to
 make testing this tractable -- minimal, self-logging GTK4 clients pinned
@@ -123,10 +213,21 @@ Negative
 
 Real, nontrivial scope: a genuinely new recipe shape (the dmabuf-params
 protocol is a multi-request sequence with per-plane fd arguments, not a
-single request like everything recreated so far), plus fd lifecycle
-management the proxy hasn't needed before (holding fds open across an
-indefinite period between a buffer's creation and either its destruction
-or a reconnect, rather than passing them through immediately).
+single request like everything recreated so far -- see the implementation
+sketch above for the transient per-params-object state this needs, which
+nothing else in `recreation.rs` currently has a shape for), plus fd
+lifecycle management the proxy hasn't needed before. The *closing* half
+of that lifecycle turned out to fall out of Rust's own ownership model
+for free once fds are held inside the `Recreatable` variant itself
+(`OwnedFd`'s `Drop` impl, triggered by the existing `RecreationGraph
+::remove()` call already made on every destroy path) -- but the *opening*
+half (moving a fd out of the generic per-message fd vec at exactly two
+specific message types, `wl_shm.create_pool` and
+`zwp_linux_buffer_params_v1.add`, without disturbing the existing
+generic-forwarding code path for every other message) still means
+touching the shared relay function's hot path with a few new special
+cases, the same category of surgery the destructor/frame-callback
+synthesis fixes already needed there tonight.
 
 Assumes the new compositor instance supports the same dmabuf
 format/modifier combination the old one advertised. Judged low-risk on
@@ -142,16 +243,21 @@ the *target* can be genuinely different hardware; this one's target is
 always the same GPU. Still not verified live, but no longer an open
 question about *whether* it holds, just about confirming it.
 
-Doesn't address `wl_shm`'s own memfd lifetime the same careful way yet --
-worth confirming the pool's backing memfd is *also* retained/replayed
-correctly (likely already is, transitively, as a side effect of
-`wl_shm.create_pool` needing its own recipe first) rather than assumed.
+`wl_shm`'s own memfd lifetime is now addressed concretely, not just
+assumed -- the implementation sketch's `ShmPool` variant owns the pool's
+fd directly, the same retain/replay/close-for-free treatment as every
+dmabuf plane fd gets, not a separate mechanism needing its own
+verification.
 
 Not yet implemented or tested -- this is a design record, not a
-completed change. Next session should start from `scripts/gtk/dmabuf_gl.py`
-crash-tested against `wl-res-gnome-shell-direct` as the concrete
-reproduction to fix, rather than gtk4-demo's own more complex,
-harder-to-instrument behavior.
+completed change. Suggested implementation order, per the sketch above:
+`ShmPool`/`ShmBuffer` first (simplest, closest to the existing pattern,
+and validate against `scripts/gtk/basic_shm.py` -- which shouldn't need
+any of this today, so it's really a test of the mechanism itself before
+trusting it on the harder path); then the dmabuf `create_immed()` path
+against `dmabuf_gl.py`; only then decide, from what that reveals about
+which creation path real clients actually use, whether `create()`/
+`created()` support is worth building at all.
 
 Checked against other prior art for this class of problem (2026-08-03):
 PipeWire's own buffer/stream renegotiation, CRIU's documented GPU/DRM
@@ -163,13 +269,13 @@ any evidence behind it yet, this project's own retained-context reasoning
 should carry more weight than an external, project-blind opinion once
 either is actually tested:
 
-- **Retained fds must be closed when their guest object is legitimately
-  destroyed** (`wl_buffer.destroy`, or the client recycling its own
-  buffer pool), not just held forever -- otherwise the proxy itself
-  becomes a GPU-memory leak source. Mechanically simple: the same
-  `remove_guest`/`graph.remove` call already made for `delete_id` today
-  is the natural place to also close the retained fd, not a separate
-  new lifecycle path.
+- ~~Retained fds must be closed when their guest object is legitimately
+  destroyed~~ -- resolved by the implementation sketch above, not just an
+  item to watch for: holding each fd *inside* its `Recreatable` variant
+  means `OwnedFd`'s own `Drop` impl closes it automatically via the
+  existing `RecreationGraph::remove()` call, already made on every
+  destroy path today. No separate lifecycle mechanism needed, so nothing
+  left here to verify empirically.
 - **GPU fence state on the recreated buffer** -- whether a dma_fence
   attached to a buffer the old (crashed) compositor was mid-operation on
   could ever fail to signal, blocking the new compositor's own GPU work
