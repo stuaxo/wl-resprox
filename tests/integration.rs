@@ -2388,3 +2388,318 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
 
     host_listener_task.abort();
 }
+
+/// Found live 2026-08-04 validating the test above against a REAL
+/// gtk4-demo-like client (`scripts/gtk/basic_shm.py`) on the real laptop:
+/// recreating a wl_buffer's protocol identity (the test above) isn't
+/// enough on its own. A client attaches a buffer, commits, and then waits
+/// for the compositor's own `wl_buffer.release` before it's willing to
+/// reuse that memory for its next frame -- if the crash happens right
+/// after that commit, the OLD compositor dies before ever sending that
+/// release, and no amount of recreating the buffer's *identity* answers
+/// the promise the client is actually blocked on. Confirmed live: a real
+/// GTK4 client stalled forever after a clean reconnect (every object
+/// recreated correctly, no fatal errors) specifically because of this.
+/// This test proves the fix (`buffer_flow.rs`): a buffer still "in flight"
+/// (attached + committed, no release seen) when the crash happens gets a
+/// synthesized `wl_buffer.release` once it's been recreated, unblocking
+/// the client the same way the earlier `wl_surface.frame` ->
+/// `wl_callback.done` synthesis unblocks a stalled frame clock.
+#[tokio::test]
+async fn in_flight_buffer_gets_a_synthesized_release_after_reconnect() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use std::os::fd::AsRawFd;
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6), ("wl_shm", 1)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-in-flight-buffer-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
+        .await
+        .expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (first_sink, _first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    // get_registry(2), sync(3).
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p));
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let mut wl_compositor_name = None;
+    let mut wl_shm_name = None;
+    'collect: loop {
+        use tokio::io::AsyncReadExt;
+        let n = tokio::time::timeout(Duration::from_secs(3), gtk_test_side.read(&mut tmp))
+            .await
+            .expect("timed out collecting globals")
+            .expect("read error");
+        assert_ne!(n, 0);
+        buf.extend_from_slice(&tmp[..n]);
+        while let Some((msg, consumed)) = wire::take_message(&buf) {
+            let header = wire::MessageHeader::parse(msg).unwrap();
+            let payload = &msg[wire::HEADER_LEN..];
+            if header.sender_id == 2 && header.opcode == 0 {
+                if let (Some(name), Some((iface, _))) = (wire::read_u32(payload, 0), wire::read_str(payload, 4)) {
+                    match iface.as_str() {
+                        "wl_compositor" => wl_compositor_name = Some(name),
+                        "wl_shm" => wl_shm_name = Some(name),
+                        _ => {}
+                    }
+                }
+            } else if header.sender_id == 3 && header.opcode == 0 {
+                buf.drain(..consumed);
+                break 'collect;
+            }
+            buf.drain(..consumed);
+        }
+    }
+    let wl_compositor_name = wl_compositor_name.expect("wl_compositor advertised");
+    let wl_shm_name = wl_shm_name.expect("wl_shm advertised");
+
+    // bind wl_compositor->4, wl_shm->9; create_surface->6.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, wl_compositor_name);
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 4);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, wl_shm_name);
+    wire::put_str(&mut p, "wl_shm");
+    wire::put_u32(&mut p, 1);
+    wire::put_u32(&mut p, 9);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(4, 0, &p)); // wl_compositor(4).create_surface -> wl_surface(6)
+    gtk_test_side.write_all(&out).await.expect("write bind+create_surface");
+
+    // wl_shm(9).create_pool(new_id=10, fd, size=4096) -- a REAL fd, same as
+    // the recipe-replay test above: this test needs the pool to actually
+    // recreate successfully, or the synthesis-time guard in
+    // recover_state_after_reconnect (buffer must have a live host id)
+    // would skip it, silently passing for the wrong reason.
+    let backing_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp_dir.join("shm_pool_backing"))
+        .expect("create backing file");
+    backing_file.set_len(4096).expect("size backing file");
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 10); // new_id (guest) -- wl_shm_pool
+    wire::put_u32(&mut p, 4096); // size
+    let create_pool_msg = wire::build_message(9, 0, &p);
+    wayland_proxy::fdsocket::send_with_fds(gtk_test_side.as_raw_fd(), &create_pool_msg, &[backing_file.as_raw_fd()])
+        .expect("send create_pool with a real fd");
+
+    // wl_shm_pool(10).create_buffer(new_id=11, ...).
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 11); // new_id (guest) -- wl_buffer
+    wire::put_u32(&mut p, 0); // offset
+    wire::put_u32(&mut p, 64); // width
+    wire::put_u32(&mut p, 64); // height
+    wire::put_u32(&mut p, 256); // stride
+    wire::put_u32(&mut p, 0); // format
+    gtk_test_side.write_all(&wire::build_message(10, 0, &p)).await.expect("write create_buffer");
+
+    // wl_surface(6).attach(buffer=11, x=0, y=0) [opcode 1], then
+    // wl_surface(6).commit() [opcode 6] -- exactly the sequence a real
+    // client's last pre-crash frame looked like on the wire (confirmed via
+    // WAYLAND_DEBUG=1 against the real stall). No matching release is ever
+    // sent by either fake compositor life -- that's the whole point: the
+    // proxy itself must synthesize it, nothing upstream ever will.
+    let mut attach_payload = Vec::new();
+    wire::put_u32(&mut attach_payload, 11); // buffer
+    wire::put_u32(&mut attach_payload, 0); // x
+    wire::put_u32(&mut attach_payload, 0); // y
+    gtk_test_side.write_all(&wire::build_message(6, 1, &attach_payload)).await.expect("write attach");
+    gtk_test_side.write_all(&wire::build_message(6, 6, &[])).await.expect("write commit");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Crash. Second life uses different global names, same as every other
+    // reconnect test here.
+    first_life_task.abort();
+    let (second_sink, _second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) =
+            tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+                .await
+                .expect("proxy should reconnect within 3s")
+                .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
+    });
+
+    // The proxy's own synthesized wl_buffer.release(11) -- sender_id=11
+    // (the buffer's ORIGINAL, unchanged guest id), opcode=0 (wl_buffer's
+    // only event) -- should be the only thing gtk_test_side receives after
+    // reconnecting (no grabs were set up, and this test skipped
+    // xdg_wm_base entirely, so there's no configure/ack traffic to race
+    // against it).
+    let msg = tokio::time::timeout(Duration::from_secs(3), read_one_message(&mut gtk_test_side))
+        .await
+        .expect("timed out waiting for the synthesized wl_buffer.release");
+    let header = wire::MessageHeader::parse(&msg).expect("valid header");
+    assert_eq!(header.sender_id, 11, "release should target the buffer's original, unchanged guest id");
+    assert_eq!(header.opcode, 0, "wl_buffer.release event opcode");
+
+    host_listener_task.abort();
+}
+
+/// The other half of the same live finding as the test above
+/// (`in_flight_buffer_gets_a_synthesized_release_after_reconnect`), found
+/// immediately after it: even with a synthesized `wl_buffer.release`, a
+/// real GTK4 client STILL stalled forever, because its last `frame()`
+/// before the crash reached the old compositor successfully (forwarded
+/// normally -- unlike `frame_request_during_the_recovery_window_gets_a_synthesized_done`,
+/// which covers a frame() dropped because its surface was momentarily
+/// untranslatable during the narrow post-`bump_generation()` window, THIS
+/// frame() was never dropped at all) and the compositor died before ever
+/// sending back the matching `wl_callback.done`. This test proves the
+/// `pending_frames.rs` fix: a frame() confirmed to have actually reached
+/// the (soon-to-die) compositor gets a synthesized `done`+`delete_id`
+/// after reconnect, the same as the already-covered dropped-frame() case,
+/// just triggered from the opposite situation.
+#[tokio::test]
+async fn frame_forwarded_before_a_crash_gets_a_synthesized_done_after_reconnect() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-forwarded-frame-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
+        .await
+        .expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    // This time the first life's sink IS read from -- proving frame()
+    // genuinely reached it, the whole point being to distinguish this
+    // case from the already-covered "dropped, never reached any host" one.
+    let (first_sink, mut first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    // get_registry(2), sync(3), bind wl_compositor->4, create_surface->6.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p));
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+    read_n_messages(&mut gtk_test_side, 2).await; // global(wl_compositor) + callback.done
+
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 1); // name
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 4); // new_id (guest) -- wl_compositor
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 6); // new_id (guest) -- wl_surface
+    out.extend(wire::build_message(4, 0, &p)); // wl_compositor(4).create_surface -> wl_surface(6)
+    gtk_test_side.write_all(&out).await.expect("write bind+create_surface");
+
+    // wl_surface(6).frame(new_id=50) [opcode 3] -- and PROVE it actually
+    // reached the first life before crashing (the whole distinction this
+    // test exists to cover).
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 50);
+    gtk_test_side.write_all(&wire::build_message(6, 3, &p)).await.expect("write frame()");
+    // The sink also sees the earlier bind(wl_compositor) and
+    // create_surface requests ahead of frame() -- read past those to get
+    // to the one this test actually cares about.
+    let mut last = None;
+    for _ in 0..3 {
+        last = Some(
+            tokio::time::timeout(Duration::from_secs(3), first_sink_rx.recv())
+                .await
+                .expect("timed out waiting for frame() to reach the first life")
+                .expect("sink closed early"),
+        );
+    }
+    let (_sender, opcode, _payload) = last.unwrap();
+    // _sender is the surface's HOST id here (the sink observes what the
+    // fake compositor received, host-space), not its guest id 6 -- opcode
+    // alone is enough to confirm this is the frame() request, not the
+    // earlier bind/create_surface ones.
+    assert_eq!(opcode, 3, "frame() should have reached the first life on wl_surface(6)");
+
+    // Crash immediately -- no response to frame() was ever sent.
+    first_life_task.abort();
+    let (second_sink, _second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) =
+            tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+                .await
+                .expect("proxy should reconnect within 3s")
+                .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
+    });
+
+    // The proxy's own synthesized wl_callback.done(0) -- sender_id=50 (the
+    // callback's ORIGINAL, unchanged guest id), opcode=0 (wl_callback's
+    // only event) -- followed by wl_display.delete_id(50), same pair
+    // frame_request_during_the_recovery_window_gets_a_synthesized_done
+    // already proves for the dropped-frame() case.
+    let messages = read_n_messages(&mut gtk_test_side, 2).await;
+    let done = wire::MessageHeader::parse(&messages[0]).expect("valid header");
+    assert_eq!(done.sender_id, 50, "done should target the callback's original, unchanged guest id");
+    assert_eq!(done.opcode, 0, "wl_callback.done event opcode");
+    let delete_id = wire::MessageHeader::parse(&messages[1]).expect("valid header");
+    assert_eq!(delete_id.sender_id, 1, "delete_id is always sent from wl_display");
+    assert_eq!(delete_id.opcode, 1, "wl_display.delete_id event opcode");
+    assert_eq!(wire::read_u32(&messages[1][wire::HEADER_LEN..], 0), Some(50), "delete_id should free the callback's own guest id");
+
+    host_listener_task.abort();
+}

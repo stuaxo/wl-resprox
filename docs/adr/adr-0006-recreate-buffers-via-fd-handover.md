@@ -2,9 +2,14 @@ ADR 0006: Recreate wl_buffer Objects on Reconnect via FD Handover
 
 Status
 
-Proposed -- design only, not implemented. Written up immediately after
-the live investigation that motivated it, per the user's explicit request
-to capture it while fresh, before picking it back up in a future session.
+wl_shm half implemented, tested, and live-validated 2026-08-04 (see the
+"wl_shm implementation, tested and live-validated" section near the end).
+dmabuf's create_immed() path not yet started. A new, separate,
+NOT-YET-ROOT-CAUSED bug was found during live validation -- see "Open
+issue found live 2026-08-04" below -- real Wayland traffic now gets
+further than ever before, then hits a genuine `wl_shm.create_pool`
+rejection from the real compositor on an ordinary (non-recovery) resize,
+unrelated to anything this ADR's recreation logic touches.
 
 Context
 
@@ -287,3 +292,100 @@ either is actually tested:
   so far points at a GPU-level hang (every failure found this session
   was protocol-level: a dropped `attach`, a dropped `frame`), so treat
   this as a "watch for it, don't build for it yet" item.
+
+wl_shm implementation, tested and live-validated (2026-08-04)
+
+`Recreatable::ShmPool`/`ShmBuffer` (`recreation.rs`), recipe capture and
+fd retention at `wl_shm.create_pool`/`wl_shm_pool.create_buffer`
+(`lib.rs`), `wl_shm_pool.resize` updating the recorded size in place, and
+replay in `recover_state_after_reconnect` (`wl_shm` itself is now also a
+`Recreatable::Global`, needed so a recreated pool has a fresh `wl_shm`
+host id to attach to) -- all per the sketch above, covered by new unit
+and integration tests (including one sending a REAL fd via SCM_RIGHTS
+end to end, the first test in this project to do so).
+
+That integration test caught a real bug in the *test harness itself*,
+not the proxy: `tests/integration.rs`'s fake-compositor helper used a
+plain tokio `read()`, which -- once a message carries an fd -- stops
+exactly at that message's boundary and never wakes for data sent
+afterward (a genuine AF_UNIX `SOCK_STREAM` kernel behavior, not a test
+bug). Fixed by switching the harness to the same `recv_with_fds`/`try_io`
+pattern `Conn::fill()` already uses and documents for exactly this
+reason.
+
+Live validation against `scripts/gtk/basic_shm.py` on the real laptop
+surfaced two further, real gaps this ADR's design didn't anticipate --
+both are the same "unanswered promise" class as the `wl_surface.frame` ->
+`wl_callback.done` fix from the previous session, just for two different
+promises:
+
+- **`wl_buffer.release` never sent for an in-flight buffer.** Recreating
+  a buffer's protocol *identity* isn't enough if the client's own
+  userspace buffer pool still believes every buffer it owns is "busy" --
+  a `wl_buffer.release` the OLD, now-dead compositor was going to send
+  for a pre-crash `attach`+`commit`, and never will. Fixed via
+  `buffer_flow.rs`'s `BufferFlowTracker`: tracks which buffer is
+  currently attached+committed per surface, and on a successful
+  reconnect, synthesizes `release` for any buffer still "in flight"
+  (and that actually got recreated -- nothing to synthesize for one that
+  didn't). Confirmed this alone was necessary but NOT sufficient live --
+  see the next item, found immediately after fixing this one.
+- **`wl_callback.done` never sent for a `frame()` that reached the OLD
+  compositor.** The existing `wl_surface.frame` synthesis (previous
+  session) only covers a frame() *dropped* because its surface was
+  momentarily untranslatable during the narrow post-`bump_generation()`
+  window. A frame() that was forwarded normally, with the old compositor
+  simply dying before ever answering it, hit neither that branch nor any
+  other -- the client's frame clock stayed blocked on a callback nothing
+  would ever complete. Fixed via `pending_frames.rs`'s
+  `PendingFrameTracker`: tracks every callback awaiting `done`, and
+  synthesizes it (reusing the same `done`+`delete_id` pair, now factored
+  into a shared `synthesize_frame_done` helper) for any still pending
+  after a reconnect.
+
+With both fixes live, a real `basic_shm.py` client (crash mid-render,
+buffer attached+committed, frame() in flight) resumed rendering after
+reconnect for the first time this project has achieved -- through a
+*real* compositor-driven resize/reconfigure cycle, not just the proxy's
+own synthesized one. See the open issue immediately below for where it
+broke next.
+
+Open issue found live 2026-08-04, not yet root-caused
+
+Once the two fixes above let a real client get far enough to hit a
+genuine post-recovery resize, its resulting *ordinary* (non-recovery,
+non-recreation) `wl_shm.create_pool` -- destroying its old pool/buffer
+and creating a correctly-sized new one, exactly what a healthy client is
+supposed to do on resize -- gets rejected by the real compositor:
+
+```
+wl_display.error(object=1, code=1, message="invalid arguments for wl_shm#5.create_pool")
+```
+
+immediately followed by the compositor closing the connection (a real
+GTK4 client then hard-crashes: `Gdk-Message: Error 22 (Invalid argument)
+dispatching to Wayland display`). Reproduced 3/3 consecutive live runs
+against `basic_shm.py`, always at this same point (client resize
+immediately following a crash-recovery cycle), never during the
+recovery-time recreation replay itself.
+
+Ruled out, with evidence: a claimed-size-vs-actual-fd-size mismatch --
+temporarily instrumented the exact `create_pool` call site with an
+`fstat` on the fd about to be sent; claimed size and `fstat`-reported
+size matched exactly (`1056096` both) immediately before the (still
+successful, at that point) forward. The message's own byte layout
+(new_id, size) was independently confirmed correct against the wire
+dump. So whatever's wrong isn't in the *content* this ADR's code
+constructs.
+
+Not yet tested: whether this is a proxy bug at all, versus a
+pre-existing GTK4/mutter interaction limitation that nothing before this
+session's fixes ever got far enough, fast enough, to trigger (the
+failing sequence is a destroy+create+resize burst all happening within
+milliseconds of a compositor reconnect, a pace normal user-driven
+resizing never produces). The clean way to settle this: a minimal
+reproduction connecting *directly* to gnome-shell's own private socket
+(bypassing the proxy) that fires the same rapid destroy/create_pool
+burst, independent of any crash/reconnect. Not attempted yet -- this is
+the natural next step before writing any more proxy-side code for it,
+per this project's own "verify, don't guess" discipline.

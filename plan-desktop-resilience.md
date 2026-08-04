@@ -496,6 +496,28 @@ dmabuf half (`create_immed()`), both still per the ADR's own suggested
 order: validate this against `scripts/gtk/basic_shm.py` live next, then
 build the dmabuf path against `dmabuf_gl.py`.
 
+**Live-validated 2026-08-04, on the real laptop, with two more real gaps
+found and fixed along the way** (full detail in ADR-0006's own "wl_shm
+implementation, tested and live-validated" section -- this is the short
+version): the wl_shm recreation above wasn't sufficient by itself for a
+real `basic_shm.py` client to actually resume rendering after a crash --
+found and fixed, in order, live: (1) no synthesized `wl_buffer.release`
+for a buffer that was attached+committed right when the crash hit
+(`buffer_flow.rs`), (2) no synthesized `wl_callback.done` for a `frame()`
+that reached the OLD compositor and was simply never answered before it
+died (`pending_frames.rs` -- distinct from the *dropped*-frame() case
+already fixed the previous session). With both fixes, a real client
+resumed rendering after reconnect for the first time this project has
+achieved. It then hit a NEW, separate, NOT-YET-ROOT-CAUSED bug on its
+own following resize (`invalid arguments for wl_shm#N.create_pool` from
+the real compositor, on an entirely ordinary, non-recovery `create_pool`)
+-- ruled out an fd-size mismatch via `fstat`, not yet determined whether
+this is a proxy bug or a pre-existing GTK4/mutter interaction limitation
+nothing before these fixes ever got far enough, fast enough, to trigger.
+Next step: a minimal direct-to-gnome-shell (bypassing the proxy)
+reproduction of the same rapid destroy+create_pool-on-resize burst, to
+settle which it is before writing more proxy-side code.
+
 ## The actual problem
 
 gnome-shell sometimes crashes while the screen is **locked**. Since

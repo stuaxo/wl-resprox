@@ -17,9 +17,11 @@ use tracing::{error, info, warn};
 
 use wayland_backend::protocol::{ArgumentType, Interface, MessageDesc};
 
+pub mod buffer_flow;
 pub mod fdsocket;
 pub mod grab_state;
 pub mod interfaces;
+pub mod pending_frames;
 pub mod recorder;
 pub mod recreation;
 pub mod shadow_table;
@@ -27,8 +29,10 @@ pub mod wire;
 
 use recorder::recorder;
 
+use buffer_flow::BufferFlowTracker;
 use grab_state::GrabTracker;
 use interfaces::lookup_interface;
+use pending_frames::PendingFrameTracker;
 use recreation::{Recreatable, RecreationGraph};
 use shadow_table::ShadowTable;
 
@@ -251,6 +255,12 @@ fn resolve_child_interface(
 /// in `graph` for the narrow set of objects that need to survive a
 /// reconnect (see recreation.rs), and observes pointer/keyboard
 /// focus/button state into `grabs` (see grab_state.rs) for the same reason.
+// Each parameter beyond `src`/`dst`/`direction` is its own narrowly-scoped
+// tracker (ShadowTable, RecreationGraph, GrabTracker, BufferFlowTracker)
+// or transient map -- bundling them into one "context" struct would just
+// move the same fields one level down, not reduce what this function
+// actually touches, and every call site already names them explicitly.
+#[allow(clippy::too_many_arguments)]
 async fn relay_ready_messages(
     src: &mut Conn,
     mut dst: Option<&mut Conn>,
@@ -258,6 +268,8 @@ async fn relay_ready_messages(
     graph: &mut RecreationGraph,
     grabs: &mut GrabTracker,
     pending_configure_acks: &mut std::collections::HashMap<u32, u32>,
+    buffer_flow: &mut BufferFlowTracker,
+    pending_frames: &mut PendingFrameTracker,
     direction: Direction,
 ) -> Result<()> {
     'relay: loop {
@@ -675,18 +687,19 @@ async fn relay_ready_messages(
                 }
 
                 // Buffer lifetimes across a reconnect (see ShadowTable's
-                // `generation` field doc comment for the full hazard):
-                // wl_buffer is deliberately not part of the recreation
-                // graph, so a buffer's mapping never gets refreshed to the
-                // new generation on its own. A release event whose sender
-                // is still stuck in an older generation is either for a
-                // buffer the new compositor can't possibly know about, or
-                // -- worse -- a stale mapping that now numerically
-                // coincides with some unrelated fresh object, since both
-                // compositor instances' own server-side id allocators
-                // start from the same 0xff000000 baseline. Either way:
-                // never forward it, drop silently, implementation-constraints.md
-                // is explicit on both points.
+                // `generation` field doc comment for the full hazard): a
+                // wl_shm-backed buffer IS now part of the recreation graph
+                // (see recreation.rs's ShmBuffer variant, ADR-0006), but
+                // only from the point it's actually replayed on reconnect
+                // onward -- a release event whose sender is still stuck in
+                // an OLDER generation (this check) is either for a buffer
+                // that was never recreated at all (e.g. a dmabuf one,
+                // still outside the graph), or -- worse -- a stale mapping
+                // that now numerically coincides with some unrelated fresh
+                // object, since both compositor instances' own server-side
+                // id allocators start from the same 0xff000000 baseline.
+                // Either way: never forward it, drop silently,
+                // implementation-constraints.md is explicit on both points.
                 if matches!(direction, Direction::HostToClient)
                     && interface.name == "wl_buffer"
                     && desc.name == "release"
@@ -700,6 +713,49 @@ async fn relay_ready_messages(
                     }
                     src.read_buf.drain(..consumed);
                     continue 'relay;
+                }
+
+                // Buffer flow-control observation (see buffer_flow.rs) --
+                // found live 2026-08-04 validating ADR-0006's wl_shm half:
+                // recreating a wl_buffer's protocol identity isn't enough
+                // on its own if the client's own userspace buffer pool is
+                // left believing every buffer it owns is still "busy" (a
+                // wl_buffer.release the OLD, now-dead compositor was ever
+                // going to send for a pre-crash attach+commit, and never
+                // will). Observation only: neither request forwards any
+                // differently because of this.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "wl_surface" && desc.name == "attach" {
+                    let buffer_guest_id = original_object_values.first().copied().unwrap_or(0);
+                    buffer_flow.on_attach(guest_sender_id, buffer_guest_id);
+                } else if matches!(direction, Direction::ClientToHost) && interface.name == "wl_surface" && desc.name == "commit" {
+                    buffer_flow.on_commit(guest_sender_id);
+                } else if matches!(direction, Direction::HostToClient) && interface.name == "wl_buffer" && desc.name == "release" {
+                    // Only reachable here for a CURRENT-generation release
+                    // (the stale-generation one above already dropped and
+                    // continued) -- exactly the buffers this tracker needs
+                    // to hear about.
+                    buffer_flow.on_release(guest_sender_id);
+                }
+
+                // Pending-frame-callback observation (see pending_frames.rs)
+                // -- found live 2026-08-04, one step past the buffer-flow
+                // fix above: a frame() that reaches the OLD compositor
+                // successfully (forwarded normally, no drop, so the
+                // "sender has no translation" synthesis just above never
+                // fires) but never gets answered before it dies leaves the
+                // client's frame clock blocked exactly the same way.
+                // Deliberately reached for BOTH a genuinely-forwarded
+                // frame() and one silently dropped while frozen (still
+                // needs answering eventually -- see the module doc
+                // comment) -- only the "sender has no translation" variant
+                // above is excluded, since that one is already answered
+                // immediately, right there.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "wl_surface" && desc.name == "frame" {
+                    if let Some(callback_guest_id) = newly_mapped_guest_id {
+                        pending_frames.on_frame_requested(callback_guest_id);
+                    }
+                } else if matches!(direction, Direction::HostToClient) && interface.name == "wl_callback" && desc.name == "done" {
+                    pending_frames.on_done_received(guest_sender_id);
                 }
 
                 // Synthetic xdg_surface.configure events (see
@@ -795,35 +851,17 @@ async fn relay_ready_messages(
                         // specifically must still be answered, or the
                         // stall is permanent, not just a skipped frame.
                         if let Some(callback_guest_id) = newly_mapped_guest_id {
-                            if let Some(callback_iface) = objects.interface(callback_guest_id) {
-                                if let Some(done_opcode) = event_opcode(callback_iface, "done") {
-                                    let mut done_payload = Vec::new();
-                                    wire::put_u32(&mut done_payload, 0); // callback_data: no real presentation timestamp to give
-                                    if let Err(e) = src
-                                        .write_message(&wire::build_message(callback_guest_id, done_opcode, &done_payload), &[])
-                                        .await
-                                    {
-                                        warn!("failed to synthesize wl_callback.done for a dropped wl_surface.frame: {e}");
-                                    }
-                                }
-                                // wl_callback is a one-shot object -- a real
-                                // compositor frees it immediately after
-                                // done, and the client waits on delete_id
-                                // before reusing the id (same reasoning as
-                                // the destructor branch above).
-                                if let Some(delete_id_opcode) =
-                                    objects.interface(1).and_then(|wl_display| event_opcode(wl_display, "delete_id"))
-                                {
-                                    let mut delete_id_payload = Vec::new();
-                                    wire::put_u32(&mut delete_id_payload, callback_guest_id);
-                                    if let Err(e) = src
-                                        .write_message(&wire::build_message(1, delete_id_opcode, &delete_id_payload), &[])
-                                        .await
-                                    {
-                                        warn!("failed to synthesize delete_id for a dropped frame callback: {e}");
-                                    }
-                                }
-                            }
+                            synthesize_frame_done(src, objects, callback_guest_id).await;
+                            // Answered right here -- must not ALSO get
+                            // answered again by the pending_frames drain in
+                            // a later recover_state_after_reconnect (see
+                            // pending_frames.rs); it was never inserted
+                            // there in the first place since this whole
+                            // branch is reached only via the "sender has no
+                            // translation" path, which the pending_frames
+                            // insertion hook below (an ordinary observation
+                            // on a genuinely-forwarded-or-frozen-dropped
+                            // frame()) never reaches.
                         }
                         warn!(
                             "wl_surface.frame sender has no translation on the other side -- \
@@ -988,6 +1026,36 @@ fn event_opcode(interface: &Interface, name: &str) -> Option<u16> {
     interface.events.iter().position(|d| d.name == name).map(|i| i as u16)
 }
 
+/// Answers a `wl_surface.frame()` promise the real compositor never will:
+/// `wl_callback.done` (no real presentation timestamp to give) followed by
+/// the `delete_id` a one-shot callback object is owed before the client
+/// may reuse its numeric id (`wl_proxy_destroy` parks it as a zombie
+/// otherwise). Shared by two call sites that both need exactly this pair
+/// of synthesized events for a callback whose `frame()` request will never
+/// be answered by the (dead) compositor that would have -- see
+/// `relay_ready_messages`'s frame-synthesis branch (a frame() dropped
+/// because its surface was momentarily untranslatable) and
+/// `recover_state_after_reconnect`'s `pending_frames` drain (a frame()
+/// that reached the OLD compositor and was simply never answered before
+/// it died -- see pending_frames.rs).
+async fn synthesize_frame_done(dst: &mut Conn, objects: &ShadowTable, callback_guest_id: u32) {
+    let Some(callback_iface) = objects.interface(callback_guest_id) else { return };
+    if let Some(done_opcode) = event_opcode(callback_iface, "done") {
+        let mut done_payload = Vec::new();
+        wire::put_u32(&mut done_payload, 0); // callback_data: no real presentation timestamp to give
+        if let Err(e) = dst.write_message(&wire::build_message(callback_guest_id, done_opcode, &done_payload), &[]).await {
+            warn!("failed to synthesize wl_callback.done for callback {callback_guest_id}: {e}");
+        }
+    }
+    if let Some(delete_id_opcode) = objects.interface(1).and_then(|wl_display| event_opcode(wl_display, "delete_id")) {
+        let mut delete_id_payload = Vec::new();
+        wire::put_u32(&mut delete_id_payload, callback_guest_id);
+        if let Err(e) = dst.write_message(&wire::build_message(1, delete_id_opcode, &delete_id_payload), &[]).await {
+            warn!("failed to synthesize delete_id for callback {callback_guest_id}: {e}");
+        }
+    }
+}
+
 /// Runs once after a successful reconnect, before relaying resumes:
 /// implementation-constraints.md's full "On Server Reconnect" section,
 /// short of grab/buffer bookkeeping (separate, orthogonal work). Acts as
@@ -1010,6 +1078,8 @@ async fn recover_state_after_reconnect(
     objects: &mut ShadowTable,
     graph: &RecreationGraph,
     pending_configure_acks: &mut std::collections::HashMap<u32, u32>,
+    buffer_flow: &mut BufferFlowTracker,
+    pending_frames: &mut PendingFrameTracker,
 ) -> Result<()> {
     let Some(registry_guest_id) = objects.find_guest_id_by_interface_name("wl_registry") else {
         info!("no wl_registry tracked yet -- nothing to recover");
@@ -1322,6 +1392,44 @@ async fn recover_state_after_reconnect(
         }
     }
 
+    // Buffer flow-control recovery (see buffer_flow.rs) -- found live
+    // 2026-08-04: recreating a buffer's protocol identity above isn't
+    // enough on its own for a buffer that was attached+committed right
+    // before the crash, since the client is still waiting on a
+    // wl_buffer.release the old, now-dead compositor never got to send.
+    // Must run AFTER the loop above (needs each buffer's freshly-mapped
+    // host id to confirm it actually got recreated, not just guessed at).
+    for buffer_guest_id in buffer_flow.drain_in_flight() {
+        let (Some(interface), Some(_host_id)) = (objects.interface(buffer_guest_id), objects.host_id(buffer_guest_id))
+        else {
+            // Never recreated (no recipe, a failed replay, or destroyed
+            // before the crash) -- nothing live to tell the client about.
+            continue;
+        };
+        let Some(release_opcode) = event_opcode(interface, "release") else { continue };
+        if let Err(e) = gtk.write_message(&wire::build_message(buffer_guest_id, release_opcode, &[]), &[]).await {
+            warn!("failed to synthesize wl_buffer.release for in-flight buffer {buffer_guest_id}: {e}");
+        } else {
+            info!("synthesized wl_buffer.release for in-flight buffer {buffer_guest_id} left over from the crash");
+        }
+    }
+
+    // Pending-frame-callback recovery (see pending_frames.rs) -- a
+    // frame() that reached the OLD compositor and was simply never
+    // answered before it died. Unlike the buffer recovery above, a
+    // wl_callback has no host-side identity to confirm (never part of
+    // the recreation graph -- ephemeral, existing purely as a
+    // ShadowTable mapping until delete_id) -- only need to confirm we
+    // still know it at all (i.e. it wasn't already legitimately
+    // destroyed via a real done+delete_id before the crash).
+    for callback_guest_id in pending_frames.drain_awaiting_done() {
+        if objects.interface(callback_guest_id).is_none() {
+            continue;
+        }
+        synthesize_frame_done(gtk, objects, callback_guest_id).await;
+        info!("synthesized wl_callback.done for frame callback {callback_guest_id} left over from the crash");
+    }
+
     Ok(())
 }
 
@@ -1414,6 +1522,8 @@ pub async fn run_connection(
     let mut graph = RecreationGraph::new();
     let mut grabs = GrabTracker::new();
     let mut pending_configure_acks: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut buffer_flow = BufferFlowTracker::new();
+    let mut pending_frames = PendingFrameTracker::new();
 
     let mut frozen = false;
 
@@ -1429,7 +1539,7 @@ pub async fn run_connection(
                     }
                     Ok(_) => {
                         let dst = if frozen { None } else { Some(&mut host) };
-                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, Direction::ClientToHost).await?;
+                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, Direction::ClientToHost).await?;
                     }
                     Err(e) => {
                         info!("GTK client disconnected: {e}");
@@ -1444,7 +1554,7 @@ pub async fn run_connection(
                         frozen = true;
                     }
                     Ok(_) => {
-                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, Direction::HostToClient).await?;
+                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, Direction::HostToClient).await?;
                     }
                     Err(e) => {
                         info!("compositor connection lost ({e}) -- freezing, GTK client stays connected");
@@ -1463,7 +1573,7 @@ pub async fn run_connection(
                 // stays behind in the old generation, which is exactly what
                 // marks it stale for the wl_buffer.release check below.
                 objects.bump_generation();
-                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks).await {
+                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames).await {
                     Ok(()) => {
                         // Must happen before traffic resumes (frozen =
                         // false, below) -- implementation-constraints.md is
