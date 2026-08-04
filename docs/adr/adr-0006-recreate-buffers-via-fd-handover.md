@@ -4,12 +4,19 @@ Status
 
 wl_shm half implemented, tested, and live-validated 2026-08-04 (see the
 "wl_shm implementation, tested and live-validated" section near the end).
-dmabuf's create_immed() path not yet started. A new, separate,
-NOT-YET-ROOT-CAUSED bug was found during live validation -- see "Open
-issue found live 2026-08-04" below -- real Wayland traffic now gets
-further than ever before, then hits a genuine `wl_shm.create_pool`
-rejection from the real compositor on an ordinary (non-recovery) resize,
-unrelated to anything this ADR's recreation logic touches.
+dmabuf's `create_immed()` path also implemented and unit/integration
+tested 2026-08-04 (see "dmabuf create_immed() implementation" below) --
+NOT yet live-validated against `scripts/gtk/dmabuf_gl.py` (the wl_shm
+open issue below needs settling first; live-testing dmabuf on top of an
+already-open wl_shm question would conflate two unknowns). `create()`
+(the async, server-replies-later variant) remains deliberately deferred,
+per the sketch's own reasoning -- still no evidence either path is what
+real clients actually use. A new, separate, NOT-YET-ROOT-CAUSED bug was
+found during wl_shm's live validation -- see "Open issue found live
+2026-08-04" below -- real Wayland traffic now gets further than ever
+before, then hits a genuine `wl_shm.create_pool` rejection from the real
+compositor on an ordinary (non-recovery) resize, unrelated to anything
+this ADR's recreation logic touches.
 
 Context
 
@@ -349,6 +356,49 @@ reconnect for the first time this project has achieved -- through a
 *real* compositor-driven resize/reconfigure cycle, not just the proxy's
 own synthesized one. See the open issue immediately below for where it
 broke next.
+
+dmabuf create_immed() implementation (2026-08-04)
+
+`Recreatable::DmabufBuffer`/`DmabufPlane` (`recreation.rs`), matching the
+sketch above with one addition the sketch didn't spell out:
+`dmabuf_guest_id` (`zwp_linux_dmabuf_v1`'s own guest id, needed on replay
+to find its freshly recreated host id) -- `zwp_linux_dmabuf_v1` is now
+also a `Recreatable::Global`, same treatment `wl_shm` got. Verified the
+exact wire signatures against the actual compiled-in `Interface` tables
+before writing any relay code, not from memory or the XML spec read
+cold -- see `examples/probe_dmabuf.rs` (a small, permanent diagnostic
+tool, kept for the next time this question comes up for some other
+interface).
+
+Recipe capture: `create_params()` is NOT itself a `Recreatable` -- it
+only records `(dmabuf_guest_id, [])` in a new transient
+`pending_dmabuf_planes` map (keyed by the params object's own guest id,
+threaded through `relay_ready_messages` the same way
+`pending_configure_acks` already is), exactly as the sketch anticipated.
+Each `add()` call retains its fd (same "move out of the generic
+per-message fd vec, after forwarding" mechanic as `wl_shm.create_pool`)
+and pushes a `DmabufPlane` onto that pending entry. `create_immed()` is
+where the ONE `Recreatable::DmabufBuffer` recipe actually gets recorded,
+draining the accumulated planes out of the pending map in the process.
+
+Replay reconstructs the whole dance against the fresh compositor: a
+throwaway host id for a brand-new params object (never tracked in the
+Shadow Table -- disposable, single-use by protocol design, exactly like
+the sketch said), one `add()` per retained plane (with the proxy's own
+retained fd), then `create_immed()` with the recorded
+width/height/format/flags, mapping the result onto the buffer's
+original, unchanged guest id. `create()`/`created()` (the async variant)
+remains unbuilt, per the sketch's own deferral.
+
+Covered by a new unit test (`records_and_retrieves_a_dmabuf_buffer_recipe_with_its_planes`)
+and a new integration test
+(`dmabuf_buffer_recipe_replays_correctly_after_reconnect`, sending a real
+fd via SCM_RIGHTS end to end, mirroring the wl_shm recipe-replay test) --
+both passed on the first run once the wire signatures were confirmed via
+`probe_dmabuf.rs`. NOT yet exercised against a real client
+(`scripts/gtk/dmabuf_gl.py`) or a real compositor -- deliberately held
+back until the still-open `wl_shm.create_pool` issue below is settled,
+so a NEW live failure here doesn't get conflated with that one.
 
 Open issue found live 2026-08-04, not yet root-caused
 

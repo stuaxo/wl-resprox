@@ -2703,3 +2703,209 @@ async fn frame_forwarded_before_a_crash_gets_a_synthesized_done_after_reconnect(
 
     host_listener_task.abort();
 }
+
+/// ADR-0006's dmabuf half: `zwp_linux_dmabuf_v1.create_params()` -> one
+/// `.add()` per plane -> `.create_immed()`, mirroring
+/// `wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect` but
+/// for the multi-request dmabuf dance instead of a single `create_pool`
+/// call. Confirms: the proxy's retained per-plane fd replays correctly
+/// against a fresh `zwp_linux_dmabuf_v1` host id (not the pool's stale
+/// first-life one), the disposable intermediate params object never
+/// leaks into the client-visible guest id space, and the final buffer
+/// lands back on its original, unchanged guest id.
+#[tokio::test]
+async fn dmabuf_buffer_recipe_replays_correctly_after_reconnect() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use std::os::fd::AsRawFd;
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6), ("zwp_linux_dmabuf_v1", 5)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-dmabuf-reconnect-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
+        .await
+        .expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (first_sink, _first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    // get_registry(2), sync(3).
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p));
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let mut wl_compositor_name = None;
+    let mut dmabuf_name = None;
+    'collect: loop {
+        use tokio::io::AsyncReadExt;
+        let n = tokio::time::timeout(Duration::from_secs(3), gtk_test_side.read(&mut tmp))
+            .await
+            .expect("timed out collecting globals")
+            .expect("read error");
+        assert_ne!(n, 0);
+        buf.extend_from_slice(&tmp[..n]);
+        while let Some((msg, consumed)) = wire::take_message(&buf) {
+            let header = wire::MessageHeader::parse(msg).unwrap();
+            let payload = &msg[wire::HEADER_LEN..];
+            if header.sender_id == 2 && header.opcode == 0 {
+                if let (Some(name), Some((iface, _))) = (wire::read_u32(payload, 0), wire::read_str(payload, 4)) {
+                    match iface.as_str() {
+                        "wl_compositor" => wl_compositor_name = Some(name),
+                        "zwp_linux_dmabuf_v1" => dmabuf_name = Some(name),
+                        _ => {}
+                    }
+                }
+            } else if header.sender_id == 3 && header.opcode == 0 {
+                buf.drain(..consumed);
+                break 'collect;
+            }
+            buf.drain(..consumed);
+        }
+    }
+    let wl_compositor_name = wl_compositor_name.expect("wl_compositor advertised");
+    let dmabuf_name = dmabuf_name.expect("zwp_linux_dmabuf_v1 advertised");
+
+    // bind wl_compositor->4, zwp_linux_dmabuf_v1->9; create_params->10
+    // [opcode 1 on zwp_linux_dmabuf_v1].
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, wl_compositor_name);
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 4);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, dmabuf_name);
+    wire::put_str(&mut p, "zwp_linux_dmabuf_v1");
+    wire::put_u32(&mut p, 5);
+    wire::put_u32(&mut p, 9);
+    out.extend(wire::build_message(2, 0, &p));
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 10); // new_id (guest) -- zwp_linux_buffer_params_v1
+    out.extend(wire::build_message(9, 1, &p)); // zwp_linux_dmabuf_v1(9).create_params -> params(10)
+    gtk_test_side.write_all(&out).await.expect("write bind+create_params");
+
+    // params(10).add(fd, plane_idx=0, offset=0, stride=256,
+    // modifier_hi=0xAABBCCDD, modifier_lo=0xEEFF0011) [opcode 1] -- a REAL
+    // fd via SCM_RIGHTS, same reasoning as the wl_shm recipe-replay test:
+    // this test needs the plane to actually retain and replay, or the
+    // synthesis-time guard in recover_state_after_reconnect (the dmabuf
+    // global must have a live host id) would just skip it silently.
+    let backing_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp_dir.join("dmabuf_plane_backing"))
+        .expect("create backing file");
+    backing_file.set_len(4096).expect("size backing file");
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 0); // plane_idx
+    wire::put_u32(&mut p, 0); // offset
+    wire::put_u32(&mut p, 256); // stride
+    wire::put_u32(&mut p, 0xAABBCCDD); // modifier_hi
+    wire::put_u32(&mut p, 0xEEFF0011); // modifier_lo
+    let add_msg = wire::build_message(10, 1, &p);
+    wayland_proxy::fdsocket::send_with_fds(gtk_test_side.as_raw_fd(), &add_msg, &[backing_file.as_raw_fd()])
+        .expect("send add() with a real fd");
+
+    // params(10).create_immed(new_id=11, width=64, height=64, format=0,
+    // flags=0) [opcode 3].
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 11); // new_id (guest) -- wl_buffer
+    wire::put_u32(&mut p, 64); // width
+    wire::put_u32(&mut p, 64); // height
+    wire::put_u32(&mut p, 0); // format
+    wire::put_u32(&mut p, 0); // flags
+    gtk_test_side.write_all(&wire::build_message(10, 3, &p)).await.expect("write create_immed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Crash. Second life uses different global names, same as every
+    // other reconnect test here.
+    first_life_task.abort();
+    let (second_sink, mut second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) =
+            tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+                .await
+                .expect("proxy should reconnect within 3s")
+                .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
+    });
+
+    // Recovery replays exactly 5 requests, in order: bind(wl_compositor),
+    // bind(zwp_linux_dmabuf_v1), create_params, add, create_immed -- the
+    // disposable params object itself never gets its own recipe (see
+    // DmabufBuffer's own doc comment in recreation.rs), so there's no 6th
+    // replay for it.
+    let mut observed = Vec::new();
+    for i in 0..5 {
+        let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for recreation request #{i}, got so far: {observed:?}"))
+            .expect("sink closed early");
+        observed.push((sender, opcode, payload));
+    }
+
+    fn bind_new_id(payload: &[u8]) -> u32 {
+        let (_, next) = wire::read_str(payload, 4).expect("interface string");
+        wire::read_u32(payload, next + 4).expect("new_id") // next+4 skips version
+    }
+
+    let iface = wire::read_str(&observed[1].2, 4).unwrap().0;
+    assert_eq!(iface, "zwp_linux_dmabuf_v1", "second bind should be the dmabuf global, matching the client's own bind order");
+    let recreated_dmabuf_host_id = bind_new_id(&observed[1].2);
+
+    // create_params: sent to the freshly re-bound dmabuf global.
+    assert_eq!(observed[2].0, recreated_dmabuf_host_id, "create_params should target the dmabuf global's freshly recreated host id");
+    assert_eq!(observed[2].1, 1, "create_params opcode");
+    let recreated_params_host_id = wire::read_u32(&observed[2].2, 0).unwrap();
+
+    // add: sent to the freshly created params object, carrying the
+    // plane's originally-recorded plane_idx/offset/stride/modifier.
+    assert_eq!(observed[3].0, recreated_params_host_id, "add should target the freshly created params object");
+    assert_eq!(observed[3].1, 1, "add opcode");
+    assert_eq!(wire::read_u32(&observed[3].2, 0), Some(0), "plane_idx");
+    assert_eq!(wire::read_u32(&observed[3].2, 4), Some(0), "offset");
+    assert_eq!(wire::read_u32(&observed[3].2, 8), Some(256), "stride");
+    assert_eq!(wire::read_u32(&observed[3].2, 12), Some(0xAABBCCDD), "modifier_hi");
+    assert_eq!(wire::read_u32(&observed[3].2, 16), Some(0xEEFF0011), "modifier_lo");
+
+    // create_immed: sent to the SAME params object, carrying the
+    // buffer's originally-recorded width/height/format/flags.
+    assert_eq!(observed[4].0, recreated_params_host_id, "create_immed should target the same params object as add");
+    assert_eq!(observed[4].1, 3, "create_immed opcode");
+    assert_eq!(wire::read_u32(&observed[4].2, 4), Some(64), "width");
+    assert_eq!(wire::read_u32(&observed[4].2, 8), Some(64), "height");
+    assert_eq!(wire::read_u32(&observed[4].2, 12), Some(0), "format");
+    assert_eq!(wire::read_u32(&observed[4].2, 16), Some(0), "flags");
+
+    host_listener_task.abort();
+}

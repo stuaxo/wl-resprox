@@ -59,6 +59,34 @@ pub enum Recreatable {
     /// height, stride, format)` -- see ADR-0006. No fd of its own; draws
     /// from the pool's already-retained backing memfd.
     ShmBuffer { pool_guest_id: u32, offset: i32, width: i32, height: i32, stride: i32, format: u32 },
+    /// The dmabuf half of ADR-0006: `zwp_linux_dmabuf_v1(dmabuf_guest_id)
+    /// .create_params(new_id)` -> one `.add(...)` per plane -> `.create_immed
+    /// (new_id, width, height, format, flags)`. Unlike `ShmPool`/`ShmBuffer`,
+    /// this is ONE recipe covering the whole multi-request dance -- the
+    /// intermediate `zwp_linux_buffer_params_v1` object is disposable
+    /// (single-use by protocol design, replayed against a throwaway host id
+    /// each time, never tracked in the Shadow Table) -- so there's nothing
+    /// for a separate "pool" variant to mean here the way there is for
+    /// wl_shm. `dmabuf_guest_id` is `zwp_linux_dmabuf_v1`'s own guest id
+    /// (itself a `Recreatable::Global`), needed to find its freshly
+    /// recreated host id to create a new params object from on replay.
+    DmabufBuffer { dmabuf_guest_id: u32, width: i32, height: i32, format: u32, flags: u32, planes: Vec<DmabufPlane> },
+}
+
+/// One plane of a dmabuf-backed buffer, as accumulated by one
+/// `zwp_linux_buffer_params_v1.add()` call. `fd` is the proxy's own
+/// retained copy of the client's dmabuf fd, same reasoning and same
+/// closed-for-free-via-`Drop` treatment as `ShmPool`'s `fd`.
+pub struct DmabufPlane {
+    pub fd: OwnedFd,
+    pub plane_idx: u32,
+    pub offset: u32,
+    pub stride: u32,
+    /// The wire's `modifier_hi`/`modifier_lo` uint pair combined into one
+    /// value (`(hi as u64) << 32 | lo as u64`) -- a single DRM format
+    /// modifier is logically one 64-bit number, just split across two wire
+    /// arguments because Wayland has no native 64-bit argument type.
+    pub modifier: u64,
 }
 
 /// Backed by a `Vec`, not a `HashMap`, specifically to preserve insertion
@@ -182,5 +210,32 @@ mod tests {
     fn untracked_id_has_no_recipe() {
         let graph = RecreationGraph::new();
         assert!(graph.recipe_for(999).is_none());
+    }
+
+    #[test]
+    fn records_and_retrieves_a_dmabuf_buffer_recipe_with_its_planes() {
+        let mut graph = RecreationGraph::new();
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        graph.record(
+            11,
+            Recreatable::DmabufBuffer {
+                dmabuf_guest_id: 9,
+                width: 64,
+                height: 64,
+                format: 0,
+                flags: 0,
+                planes: vec![DmabufPlane { fd, plane_idx: 0, offset: 0, stride: 256, modifier: 0xAABB_CCDD_EEFF_0011 }],
+            },
+        );
+        match graph.recipe_for(11) {
+            Some(Recreatable::DmabufBuffer { dmabuf_guest_id, width, height, planes, .. }) => {
+                assert_eq!(*dmabuf_guest_id, 9);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+                assert_eq!(planes.len(), 1);
+                assert_eq!(planes[0].modifier, 0xAABB_CCDD_EEFF_0011);
+            }
+            _ => panic!("expected a DmabufBuffer recipe"),
+        }
     }
 }

@@ -33,7 +33,7 @@ use buffer_flow::BufferFlowTracker;
 use grab_state::GrabTracker;
 use interfaces::lookup_interface;
 use pending_frames::PendingFrameTracker;
-use recreation::{Recreatable, RecreationGraph};
+use recreation::{DmabufPlane, Recreatable, RecreationGraph};
 use shadow_table::ShadowTable;
 
 /// Which direction a message is travelling. Determines whether we look its
@@ -270,6 +270,7 @@ async fn relay_ready_messages(
     pending_configure_acks: &mut std::collections::HashMap<u32, u32>,
     buffer_flow: &mut BufferFlowTracker,
     pending_frames: &mut PendingFrameTracker,
+    pending_dmabuf_planes: &mut std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)>,
     direction: Direction,
 ) -> Result<()> {
     'relay: loop {
@@ -431,7 +432,8 @@ async fn relay_ready_messages(
                                     ("wl_registry", "bind")
                                         if child_iface.name == "wl_compositor"
                                             || child_iface.name == "xdg_wm_base"
-                                            || child_iface.name == "wl_shm" =>
+                                            || child_iface.name == "wl_shm"
+                                            || child_iface.name == "zwp_linux_dmabuf_v1" =>
                                     {
                                         // The version the CLIENT itself
                                         // requested, not child_iface.version
@@ -505,6 +507,61 @@ async fn relay_ready_messages(
                                                     height,
                                                     stride,
                                                     format: format as u32,
+                                                })
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    ("zwp_linux_dmabuf_v1", "create_params") => {
+                                        // Not itself a Recreatable -- the
+                                        // params object is single-use by
+                                        // protocol design and never
+                                        // replayed as its own object (see
+                                        // DmabufBuffer's own doc comment in
+                                        // recreation.rs) -- only its
+                                        // parent (this dmabuf global's own
+                                        // guest id) needs remembering, so a
+                                        // later create_immed on this same
+                                        // params guest id knows which host
+                                        // dmabuf global to recreate a fresh
+                                        // params object from.
+                                        pending_dmabuf_planes.insert(guest_new_id, (guest_sender_id, Vec::new()));
+                                        None
+                                    }
+                                    ("zwp_linux_buffer_params_v1", "create_immed") => {
+                                        // width/height/format/flags are
+                                        // plain Int/Uint args immediately
+                                        // after the new_id, same reasoning
+                                        // as wl_shm_pool.create_buffer
+                                        // above. Planes were already
+                                        // accumulated by each preceding
+                                        // add() call (see the fd-retention
+                                        // site below) against THIS params
+                                        // object's own guest id
+                                        // (guest_sender_id here, since
+                                        // create_immed is a request ON the
+                                        // params object) -- removed
+                                        // (not just read) since the params
+                                        // object is documented single-use,
+                                        // nothing else will ever add() to
+                                        // it again.
+                                        let payload = &msg[wire::HEADER_LEN..];
+                                        let read_i32 = |at: usize| wire::read_u32(payload, at).map(|v| v as i32);
+                                        match (
+                                            read_i32(offset + 4),
+                                            read_i32(offset + 8),
+                                            read_i32(offset + 12),
+                                            read_i32(offset + 16),
+                                            pending_dmabuf_planes.remove(&guest_sender_id),
+                                        ) {
+                                            (Some(width), Some(height), Some(format), Some(flags), Some((dmabuf_guest_id, planes))) => {
+                                                Some(Recreatable::DmabufBuffer {
+                                                    dmabuf_guest_id,
+                                                    width,
+                                                    height,
+                                                    format: format as u32,
+                                                    flags: flags as u32,
+                                                    planes,
                                                 })
                                             }
                                             _ => None,
@@ -974,6 +1031,46 @@ async fn relay_ready_messages(
                         warn!("wl_shm.create_pool had no fd to retain for recreation");
                     }
                 }
+
+                // Retain our own copy of zwp_linux_buffer_params_v1.add's
+                // per-plane fd for later buffer recreation (see
+                // recreation.rs's DmabufBuffer variant and ADR-0006) --
+                // same reasoning and same AFTER-forwarding placement as
+                // wl_shm.create_pool's retention above. Accumulated
+                // against the params object's own guest id
+                // (guest_sender_id, since add() is a request ON the
+                // params object) until create_immed() drains it into an
+                // actual recipe.
+                if matches!(direction, Direction::ClientToHost) && interface.name == "zwp_linux_buffer_params_v1" && desc.name == "add" {
+                    if let Some(fd) = fds.pop() {
+                        let payload = &msg[wire::HEADER_LEN..];
+                        let fields = (
+                            wire::read_u32(payload, 0),  // plane_idx
+                            wire::read_u32(payload, 4),  // offset
+                            wire::read_u32(payload, 8),  // stride
+                            wire::read_u32(payload, 12), // modifier_hi
+                            wire::read_u32(payload, 16), // modifier_lo
+                        );
+                        if let (Some(plane_idx), Some(plane_offset), Some(stride), Some(modifier_hi), Some(modifier_lo)) = fields {
+                            if let Some((_dmabuf_guest_id, planes)) = pending_dmabuf_planes.get_mut(&guest_sender_id) {
+                                planes.push(DmabufPlane {
+                                    fd,
+                                    plane_idx,
+                                    offset: plane_offset,
+                                    stride,
+                                    modifier: ((modifier_hi as u64) << 32) | modifier_lo as u64,
+                                });
+                            } else {
+                                warn!(
+                                    "zwp_linux_buffer_params_v1.add on an untracked params object {guest_sender_id} \
+                                     -- dropping the retained fd"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!("zwp_linux_buffer_params_v1.add had no fd to retain for recreation");
+                    }
+                }
             }
             Err(e) => {
                 // We know the interface/opcode but couldn't walk its own
@@ -1107,6 +1204,7 @@ async fn recover_state_after_reconnect(
     let mut wl_compositor_global: Option<(u32, u32)> = None; // (name, version)
     let mut xdg_wm_base_global: Option<(u32, u32)> = None;
     let mut wl_shm_global: Option<(u32, u32)> = None;
+    let mut zwp_linux_dmabuf_v1_global: Option<(u32, u32)> = None;
     'collect: loop {
         // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention
         // -- see its own doc comment), which the `?` below does NOT catch
@@ -1134,6 +1232,7 @@ async fn recover_state_after_reconnect(
                                 "wl_compositor" => wl_compositor_global = Some((name, version)),
                                 "xdg_wm_base" => xdg_wm_base_global = Some((name, version)),
                                 "wl_shm" => wl_shm_global = Some((name, version)),
+                                "zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1_global = Some((name, version)),
                                 _ => {}
                             }
                         }
@@ -1158,6 +1257,7 @@ async fn recover_state_after_reconnect(
                     "wl_compositor" => wl_compositor_global,
                     "xdg_wm_base" => xdg_wm_base_global,
                     "wl_shm" => wl_shm_global,
+                    "zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1_global,
                     other => {
                         warn!("recreation graph tracked an unexpected global {other} -- skipping");
                         None
@@ -1389,6 +1489,83 @@ async fn recover_state_after_reconnect(
                 objects.map(guest_id, host_id, child_interface);
                 info!("recreated wl_shm buffer (guest={guest_id}, host={host_id})");
             }
+            Recreatable::DmabufBuffer { dmabuf_guest_id, width, height, format, flags, planes } => {
+                let Some(dmabuf_interface) = objects.interface(*dmabuf_guest_id) else {
+                    warn!("can't recreate dmabuf buffer {guest_id}: dmabuf global {dmabuf_guest_id} was never recreated");
+                    continue;
+                };
+                let Some(dmabuf_host_id) = objects.host_id(*dmabuf_guest_id) else {
+                    warn!("can't recreate dmabuf buffer {guest_id}: dmabuf global {dmabuf_guest_id} has no host id");
+                    continue;
+                };
+                let Some(create_params_opcode) = request_opcode(dmabuf_interface, "create_params") else {
+                    warn!("can't recreate dmabuf buffer {guest_id}: {} has no create_params request", dmabuf_interface.name);
+                    continue;
+                };
+                let params_interface = dmabuf_interface.requests[create_params_opcode as usize]
+                    .child_interface
+                    .expect("create_params always has a static child interface");
+                // Throwaway params object -- single-use by protocol
+                // design, never tracked in the Shadow Table (see
+                // DmabufBuffer's own doc comment in recreation.rs), just
+                // a fresh host id to address the add()/create_immed()
+                // sequence below to.
+                let params_host_id = objects.allocate_host_id();
+                let mut create_params_payload = Vec::new();
+                wire::put_u32(&mut create_params_payload, params_host_id);
+                if let Err(e) =
+                    host.write_message(&wire::build_message(dmabuf_host_id, create_params_opcode, &create_params_payload), &[]).await
+                {
+                    warn!("failed to recreate dmabuf buffer {guest_id}: create_params failed: {e}");
+                    continue;
+                }
+                let Some(add_opcode) = request_opcode(params_interface, "add") else {
+                    warn!("can't recreate dmabuf buffer {guest_id}: {} has no add request", params_interface.name);
+                    continue;
+                };
+                let mut add_failed = false;
+                for plane in planes {
+                    let mut add_payload = Vec::new();
+                    wire::put_u32(&mut add_payload, plane.plane_idx);
+                    wire::put_u32(&mut add_payload, plane.offset);
+                    wire::put_u32(&mut add_payload, plane.stride);
+                    wire::put_u32(&mut add_payload, (plane.modifier >> 32) as u32);
+                    wire::put_u32(&mut add_payload, (plane.modifier & 0xFFFF_FFFF) as u32);
+                    if let Err(e) = host
+                        .write_message(&wire::build_message(params_host_id, add_opcode, &add_payload), &[plane.fd.as_raw_fd()])
+                        .await
+                    {
+                        warn!("failed to recreate dmabuf buffer {guest_id}: add (plane {}) failed: {e}", plane.plane_idx);
+                        add_failed = true;
+                        break;
+                    }
+                }
+                if add_failed {
+                    continue;
+                }
+                let Some(create_immed_opcode) = request_opcode(params_interface, "create_immed") else {
+                    warn!("can't recreate dmabuf buffer {guest_id}: {} has no create_immed request", params_interface.name);
+                    continue;
+                };
+                let wl_buffer_interface = params_interface.requests[create_immed_opcode as usize]
+                    .child_interface
+                    .expect("create_immed always has a static child interface");
+                let buffer_host_id = objects.allocate_host_id();
+                let mut create_immed_payload = Vec::new();
+                wire::put_u32(&mut create_immed_payload, buffer_host_id);
+                wire::put_u32(&mut create_immed_payload, *width as u32);
+                wire::put_u32(&mut create_immed_payload, *height as u32);
+                wire::put_u32(&mut create_immed_payload, *format);
+                wire::put_u32(&mut create_immed_payload, *flags);
+                if let Err(e) =
+                    host.write_message(&wire::build_message(params_host_id, create_immed_opcode, &create_immed_payload), &[]).await
+                {
+                    warn!("failed to recreate dmabuf buffer {guest_id}: create_immed failed: {e}");
+                    continue;
+                }
+                objects.map(guest_id, buffer_host_id, wl_buffer_interface);
+                info!("recreated dmabuf buffer (guest={guest_id}, host={buffer_host_id}, planes={})", planes.len());
+            }
         }
     }
 
@@ -1524,6 +1701,7 @@ pub async fn run_connection(
     let mut pending_configure_acks: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut buffer_flow = BufferFlowTracker::new();
     let mut pending_frames = PendingFrameTracker::new();
+    let mut pending_dmabuf_planes: std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)> = std::collections::HashMap::new();
 
     let mut frozen = false;
 
@@ -1539,7 +1717,7 @@ pub async fn run_connection(
                     }
                     Ok(_) => {
                         let dst = if frozen { None } else { Some(&mut host) };
-                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, Direction::ClientToHost).await?;
+                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, Direction::ClientToHost).await?;
                     }
                     Err(e) => {
                         info!("GTK client disconnected: {e}");
@@ -1554,7 +1732,7 @@ pub async fn run_connection(
                         frozen = true;
                     }
                     Ok(_) => {
-                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, Direction::HostToClient).await?;
+                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, Direction::HostToClient).await?;
                     }
                     Err(e) => {
                         info!("compositor connection lost ({e}) -- freezing, GTK client stays connected");
