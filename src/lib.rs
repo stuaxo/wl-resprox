@@ -884,9 +884,25 @@ async fn relay_ready_messages(
                 // comment) -- only the "sender has no translation" variant
                 // above is excluded, since that one is already answered
                 // immediately, right there.
+                //
+                // wl_display.sync() gets the identical treatment -- found
+                // live 2026-08-04 chasing ADR-0008's dmabuf client-wedge
+                // bug: Mesa's GL renderer sends one of these after every
+                // commit as its own internal commit-confirmation
+                // roundtrip and blocks (uninterruptibly, confirmed via
+                // /proc/<pid>/stack) until it's answered. The one in
+                // flight at crash time reaches the old compositor the
+                // same way a frame() can and is just as permanently
+                // unanswered if nothing tracks it -- see pending_frames.rs's
+                // module doc comment for the full live trace that found
+                // this.
                 if matches!(direction, Direction::ClientToHost) && interface.name == "wl_surface" && desc.name == "frame" {
                     if let Some(callback_guest_id) = newly_mapped_guest_id {
                         pending_frames.on_frame_requested(callback_guest_id);
+                    }
+                } else if matches!(direction, Direction::ClientToHost) && interface.name == "wl_display" && desc.name == "sync" {
+                    if let Some(callback_guest_id) = newly_mapped_guest_id {
+                        pending_frames.on_sync_requested(callback_guest_id);
                     }
                 } else if matches!(direction, Direction::HostToClient) && interface.name == "wl_callback" && desc.name == "done" {
                     pending_frames.on_done_received(guest_sender_id);
