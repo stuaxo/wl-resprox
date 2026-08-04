@@ -19,6 +19,8 @@
 //! constraint that doesn't apply to us (see docs/architecture-context.md
 //! section 4).
 
+use wayland_backend::protocol::ArgumentType;
+
 /// Size of the fixed Wayland message header, in bytes.
 pub const HEADER_LEN: usize = 8;
 
@@ -130,6 +132,99 @@ pub fn put_str(buf: &mut Vec<u8>, s: &str) {
     for _ in with_nul_len..padded {
         buf.push(0);
     }
+}
+
+/// Appends a wire-encoded array: a u32 byte length, the bytes themselves
+/// (no NUL terminator, unlike `put_str`), then padding out to the next
+/// 4-byte boundary.
+pub fn put_array(buf: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32(buf, bytes.len() as u32);
+    buf.extend_from_slice(bytes);
+    let padded = bytes.len().next_multiple_of(4);
+    for _ in bytes.len()..padded {
+        buf.push(0);
+    }
+}
+
+/// A single Wayland message argument, typed -- the encode-side counterpart
+/// to `walk_signature`'s decode-side offset-walking (see ADR-0007). Built
+/// by `recover_state_after_reconnect` from a `Recreatable` recipe's
+/// already-translated fields, then passed through `encode_arguments` for
+/// signature-validated serialization instead of hand-rolled `put_*` calls.
+///
+/// `Fd` borrows rather than owns: `Recreatable::ShmPool`'s and
+/// `DmabufPlane`'s file descriptors are retained in the RecreationGraph for
+/// as long as the recipe lives (a session may reconnect more than once),
+/// so encoding one replay message must never take ownership away from the
+/// recipe -- only `main.rs`/`recreation.rs`'s owning fields ever hold the
+/// real `OwnedFd`.
+#[derive(Debug)]
+pub enum WaylandValue<'a> {
+    Int(i32),
+    Uint(u32),
+    Fixed(i32),
+    String(String),
+    Object(u32),
+    NewId(u32),
+    Array(Vec<u8>),
+    Fd(std::os::fd::BorrowedFd<'a>),
+}
+
+/// Signature-validated argument encoder for state-replay (ADR-0007) --
+/// the encode-side counterpart to `walk_signature`. Bails loudly (`Err`,
+/// not `panic!`: this runs inside a live connection's task, and every
+/// call site already treats one recipe's replay failure as best-effort,
+/// warn-and-continue rather than fatal) if `values` doesn't match
+/// `signature` exactly in length or argument type, instead of silently
+/// emitting a malformed message the way a bare sequence of `put_*` calls
+/// can.
+///
+/// Fd-typed values never occupy wire bytes (they travel out-of-band via
+/// `SCM_RIGHTS`) -- pulled out of the byte encoding and returned
+/// separately, for the caller to pass straight to `Conn::write_message`'s
+/// own `fds` argument.
+///
+/// Handles `wl_registry.bind` (and any other interface-less/dynamic
+/// `new_id` request) with no special case: wayland-scanner's own codegen
+/// (see `wayland-scanner`'s `build_messagedesc_list`) already expands an
+/// interface-less `new_id` argument into `[Str(No), Uint, NewId]` directly
+/// in the static `signature` array -- e.g. `bind`'s real, generated
+/// signature is `[Uint, Str(No), Uint, NewId]`, not the 2-entry
+/// `[Uint, NewId]` its XML declaration alone would suggest. So the static
+/// signature already matches the four values actually on the wire; no
+/// bypass is needed. (`tests/coverage.rs` asserts this shape stays true.)
+pub fn encode_arguments(
+    signature: &[ArgumentType],
+    values: Vec<WaylandValue<'_>>,
+) -> anyhow::Result<(Vec<u8>, Vec<std::os::fd::RawFd>)> {
+    if values.len() != signature.len() {
+        anyhow::bail!(
+            "argument count mismatch: signature expects {} argument(s), got {}",
+            signature.len(),
+            values.len(),
+        );
+    }
+    let mut payload = Vec::new();
+    let mut fds = Vec::new();
+    for (i, (arg_type, value)) in signature.iter().zip(values).enumerate() {
+        match (arg_type, value) {
+            (ArgumentType::Int, WaylandValue::Int(v)) => put_u32(&mut payload, v as u32),
+            (ArgumentType::Uint, WaylandValue::Uint(v)) => put_u32(&mut payload, v),
+            (ArgumentType::Fixed, WaylandValue::Fixed(v)) => put_u32(&mut payload, v as u32),
+            (ArgumentType::Str(_), WaylandValue::String(s)) => put_str(&mut payload, &s),
+            (ArgumentType::Object(_), WaylandValue::Object(v)) => put_u32(&mut payload, v),
+            (ArgumentType::NewId, WaylandValue::NewId(v)) => put_u32(&mut payload, v),
+            (ArgumentType::Array, WaylandValue::Array(bytes)) => put_array(&mut payload, &bytes),
+            (ArgumentType::Fd, WaylandValue::Fd(fd)) => {
+                use std::os::fd::AsRawFd;
+                fds.push(fd.as_raw_fd());
+            }
+            (expected, got) => {
+                anyhow::bail!("argument {i} type mismatch: signature expects {expected:?}, got {got:?}");
+            }
+        }
+    }
+    Ok((payload, fds))
 }
 
 pub fn read_u32(payload: &[u8], offset: usize) -> Option<u32> {

@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 use tokio::net::UnixStream;
 use tracing::{error, info, warn};
@@ -1391,12 +1391,26 @@ async fn recover_state_after_reconnect(
                 // never exceed the registry's advertised version either).
                 let version = (*requested_version).min(fresh_max_version);
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, name);
-                wire::put_str(&mut payload, interface.name);
-                wire::put_u32(&mut payload, version);
-                wire::put_u32(&mut payload, host_id);
-                if let Err(e) = host.write_message(&wire::build_message(registry_host_id, 0, &payload), &[]).await {
+                // wl_registry.bind's real signature (`[Uint, Str(No), Uint,
+                // NewId]`, per wayland-scanner's own codegen for any
+                // interface-less new_id -- see encode_arguments's doc
+                // comment) already matches these four values 1:1; no
+                // special-casing needed.
+                let values = vec![
+                    wire::WaylandValue::Uint(name),
+                    wire::WaylandValue::String(interface.name.to_string()),
+                    wire::WaylandValue::Uint(version),
+                    wire::WaylandValue::NewId(host_id),
+                ];
+                let bind_signature = registry_interface.requests[0].signature;
+                let (payload, fds) = match wire::encode_arguments(bind_signature, values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode bind for {}: {e}", interface.name);
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(registry_host_id, 0, &payload), &fds).await {
                     warn!("failed to re-bind {}: {e}", interface.name);
                     continue;
                 }
@@ -1419,9 +1433,15 @@ async fn recover_state_after_reconnect(
                 let child_interface =
                     parent_interface.requests[opcode as usize].child_interface.expect("create_surface always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[]).await {
+                let signature = parent_interface.requests[opcode as usize].signature;
+                let (payload, fds) = match wire::encode_arguments(signature, vec![wire::WaylandValue::NewId(host_id)]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode create_surface for surface {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate surface {guest_id}: {e}");
                     continue;
                 }
@@ -1446,10 +1466,16 @@ async fn recover_state_after_reconnect(
                 let child_interface =
                     parent_interface.requests[opcode as usize].child_interface.expect("get_xdg_surface always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                wire::put_u32(&mut payload, surface_host_id);
-                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[]).await {
+                let signature = parent_interface.requests[opcode as usize].signature;
+                let values = vec![wire::WaylandValue::NewId(host_id), wire::WaylandValue::Object(surface_host_id)];
+                let (payload, fds) = match wire::encode_arguments(signature, values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode get_xdg_surface for xdg_surface {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate xdg_surface {guest_id}: {e}");
                     continue;
                 }
@@ -1472,9 +1498,15 @@ async fn recover_state_after_reconnect(
                 let child_interface =
                     parent_interface.requests[opcode as usize].child_interface.expect("get_toplevel always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[]).await {
+                let signature = parent_interface.requests[opcode as usize].signature;
+                let (payload, fds) = match wire::encode_arguments(signature, vec![wire::WaylandValue::NewId(host_id)]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode get_toplevel for xdg_toplevel {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate xdg_toplevel {guest_id}: {e}");
                     continue;
                 }
@@ -1492,22 +1524,31 @@ async fn recover_state_after_reconnect(
                 // the surface is treated as mapped).
                 if let Some(title) = title {
                     if let Some(set_title_opcode) = request_opcode(child_interface, "set_title") {
-                        let mut set_title_payload = Vec::new();
-                        wire::put_str(&mut set_title_payload, title);
-                        if let Err(e) = host.write_message(&wire::build_message(host_id, set_title_opcode, &set_title_payload), &[]).await
-                        {
-                            warn!("failed to replay set_title for xdg_toplevel {guest_id}: {e}");
+                        let sig = child_interface.requests[set_title_opcode as usize].signature;
+                        match wire::encode_arguments(sig, vec![wire::WaylandValue::String(title.clone())]) {
+                            Ok((set_title_payload, fds)) => {
+                                if let Err(e) =
+                                    host.write_message(&wire::build_message(host_id, set_title_opcode, &set_title_payload), &fds).await
+                                {
+                                    warn!("failed to replay set_title for xdg_toplevel {guest_id}: {e}");
+                                }
+                            }
+                            Err(e) => warn!("failed to encode set_title for xdg_toplevel {guest_id}: {e}"),
                         }
                     }
                 }
                 if let Some(app_id) = app_id {
                     if let Some(set_app_id_opcode) = request_opcode(child_interface, "set_app_id") {
-                        let mut set_app_id_payload = Vec::new();
-                        wire::put_str(&mut set_app_id_payload, app_id);
-                        if let Err(e) =
-                            host.write_message(&wire::build_message(host_id, set_app_id_opcode, &set_app_id_payload), &[]).await
-                        {
-                            warn!("failed to replay set_app_id for xdg_toplevel {guest_id}: {e}");
+                        let sig = child_interface.requests[set_app_id_opcode as usize].signature;
+                        match wire::encode_arguments(sig, vec![wire::WaylandValue::String(app_id.clone())]) {
+                            Ok((set_app_id_payload, fds)) => {
+                                if let Err(e) =
+                                    host.write_message(&wire::build_message(host_id, set_app_id_opcode, &set_app_id_payload), &fds).await
+                                {
+                                    warn!("failed to replay set_app_id for xdg_toplevel {guest_id}: {e}");
+                                }
+                            }
+                            Err(e) => warn!("failed to encode set_app_id for xdg_toplevel {guest_id}: {e}"),
                         }
                     }
                 }
@@ -1535,15 +1576,22 @@ async fn recover_state_after_reconnect(
                 // see task #7's graceful-stale-reference handling for the
                 // remaining gap this doesn't close.
                 if let Some(toplevel_configure_opcode) = event_opcode(child_interface, "configure") {
-                    let mut toplevel_configure_payload = Vec::new();
-                    wire::put_u32(&mut toplevel_configure_payload, 0); // width: 0 = no suggested size
-                    wire::put_u32(&mut toplevel_configure_payload, 0); // height: 0 = no suggested size
-                    wire::put_u32(&mut toplevel_configure_payload, 0); // states: empty array (length 0)
-                    if let Err(e) = gtk
-                        .write_message(&wire::build_message(guest_id, toplevel_configure_opcode, &toplevel_configure_payload), &[])
-                        .await
-                    {
-                        warn!("failed to synthesize xdg_toplevel.configure for {guest_id}: {e}");
+                    let sig = child_interface.events[toplevel_configure_opcode as usize].signature;
+                    let values = vec![
+                        wire::WaylandValue::Int(0),   // width: 0 = no suggested size
+                        wire::WaylandValue::Int(0),   // height: 0 = no suggested size
+                        wire::WaylandValue::Array(Vec::new()), // states: empty array
+                    ];
+                    match wire::encode_arguments(sig, values) {
+                        Ok((toplevel_configure_payload, fds)) => {
+                            if let Err(e) = gtk
+                                .write_message(&wire::build_message(guest_id, toplevel_configure_opcode, &toplevel_configure_payload), &fds)
+                                .await
+                            {
+                                warn!("failed to synthesize xdg_toplevel.configure for {guest_id}: {e}");
+                            }
+                        }
+                        Err(e) => warn!("failed to encode xdg_toplevel.configure for {guest_id}: {e}"),
                     }
                 } else {
                     warn!("xdg_toplevel has no configure event -- can't force a buffer-reallocating repaint for {guest_id}");
@@ -1558,15 +1606,21 @@ async fn recover_state_after_reconnect(
                     warn!("xdg_surface has no configure event -- can't force a repaint for {guest_id}");
                     continue;
                 };
-                let mut configure_payload = Vec::new();
-                wire::put_u32(&mut configure_payload, next_configure_serial);
+                let sig = parent_interface.events[configure_opcode as usize].signature;
+                let (configure_payload, fds) = match wire::encode_arguments(sig, vec![wire::WaylandValue::Uint(next_configure_serial)]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode xdg_surface.configure for {parent_guest_id}: {e}");
+                        continue;
+                    }
+                };
                 // Recorded so relay_ready_messages can recognize and
                 // swallow the client's resulting ack_configure instead of
                 // forwarding an invented serial to the real compositor.
                 pending_configure_acks.insert(*parent_guest_id, next_configure_serial);
                 next_configure_serial += 1;
                 if let Err(e) = gtk
-                    .write_message(&wire::build_message(*parent_guest_id, configure_opcode, &configure_payload), &[])
+                    .write_message(&wire::build_message(*parent_guest_id, configure_opcode, &configure_payload), &fds)
                     .await
                 {
                     warn!("failed to synthesize xdg_surface.configure for {parent_guest_id}: {e}");
@@ -1588,15 +1642,24 @@ async fn recover_state_after_reconnect(
                 let child_interface =
                     parent_interface.requests[opcode as usize].child_interface.expect("create_pool always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                wire::put_u32(&mut payload, *size as u32);
-                // Our own retained copy (see recreation.rs's ShmPool doc
-                // comment) -- the new compositor gets its own independent
-                // copy via sendmsg, same as every other fd-bearing message
-                // this proxy relays; ours stays open afterward, still owned
-                // by this recipe.
-                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[fd.as_raw_fd()]).await {
+                let signature = parent_interface.requests[opcode as usize].signature;
+                // fd is borrowed, not moved -- see WaylandValue::Fd's own
+                // doc comment: this recipe's OwnedFd must survive for any
+                // later reconnect too, so encoding one replay message must
+                // never take ownership away from it. The new compositor
+                // gets its own independent copy via sendmsg, same as every
+                // other fd-bearing message this proxy relays; ours stays
+                // open afterward, still owned by this recipe.
+                let values =
+                    vec![wire::WaylandValue::NewId(host_id), wire::WaylandValue::Fd(fd.as_fd()), wire::WaylandValue::Int(*size)];
+                let (payload, fds) = match wire::encode_arguments(signature, values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode create_pool for shm pool {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate shm pool {guest_id}: {e}");
                     continue;
                 }
@@ -1619,14 +1682,23 @@ async fn recover_state_after_reconnect(
                 let child_interface =
                     parent_interface.requests[opcode as usize].child_interface.expect("create_buffer always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                wire::put_u32(&mut payload, *offset as u32);
-                wire::put_u32(&mut payload, *width as u32);
-                wire::put_u32(&mut payload, *height as u32);
-                wire::put_u32(&mut payload, *stride as u32);
-                wire::put_u32(&mut payload, *format);
-                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &[]).await {
+                let signature = parent_interface.requests[opcode as usize].signature;
+                let values = vec![
+                    wire::WaylandValue::NewId(host_id),
+                    wire::WaylandValue::Int(*offset),
+                    wire::WaylandValue::Int(*width),
+                    wire::WaylandValue::Int(*height),
+                    wire::WaylandValue::Int(*stride),
+                    wire::WaylandValue::Uint(*format),
+                ];
+                let (payload, fds) = match wire::encode_arguments(signature, values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode create_buffer for shm buffer {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(parent_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate shm buffer {guest_id}: {e}");
                     continue;
                 }
@@ -1655,10 +1727,18 @@ async fn recover_state_after_reconnect(
                 // a fresh host id to address the add()/create_immed()
                 // sequence below to.
                 let params_host_id = objects.allocate_host_id();
-                let mut create_params_payload = Vec::new();
-                wire::put_u32(&mut create_params_payload, params_host_id);
-                if let Err(e) =
-                    host.write_message(&wire::build_message(dmabuf_host_id, create_params_opcode, &create_params_payload), &[]).await
+                let create_params_sig = dmabuf_interface.requests[create_params_opcode as usize].signature;
+                let (create_params_payload, create_params_fds) =
+                    match wire::encode_arguments(create_params_sig, vec![wire::WaylandValue::NewId(params_host_id)]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("failed to encode create_params for dmabuf buffer {guest_id}: {e}");
+                            continue;
+                        }
+                    };
+                if let Err(e) = host
+                    .write_message(&wire::build_message(dmabuf_host_id, create_params_opcode, &create_params_payload), &create_params_fds)
+                    .await
                 {
                     warn!("failed to recreate dmabuf buffer {guest_id}: create_params failed: {e}");
                     continue;
@@ -1667,17 +1747,32 @@ async fn recover_state_after_reconnect(
                     warn!("can't recreate dmabuf buffer {guest_id}: {} has no add request", params_interface.name);
                     continue;
                 };
+                let add_sig = params_interface.requests[add_opcode as usize].signature;
                 let mut add_failed = false;
                 for plane in planes {
-                    let mut add_payload = Vec::new();
-                    wire::put_u32(&mut add_payload, plane.plane_idx);
-                    wire::put_u32(&mut add_payload, plane.offset);
-                    wire::put_u32(&mut add_payload, plane.stride);
-                    wire::put_u32(&mut add_payload, (plane.modifier >> 32) as u32);
-                    wire::put_u32(&mut add_payload, (plane.modifier & 0xFFFF_FFFF) as u32);
-                    if let Err(e) = host
-                        .write_message(&wire::build_message(params_host_id, add_opcode, &add_payload), &[plane.fd.as_raw_fd()])
-                        .await
+                    // Wire order per zwp_linux_buffer_params_v1.add's real
+                    // signature is (fd, plane_idx, offset, stride,
+                    // modifier_hi, modifier_lo) -- fd occupies a values
+                    // slot (so values.len() matches signature.len()) but
+                    // no wire bytes, same as every other Fd argument.
+                    let values = vec![
+                        wire::WaylandValue::Fd(plane.fd.as_fd()),
+                        wire::WaylandValue::Uint(plane.plane_idx),
+                        wire::WaylandValue::Uint(plane.offset),
+                        wire::WaylandValue::Uint(plane.stride),
+                        wire::WaylandValue::Uint((plane.modifier >> 32) as u32),
+                        wire::WaylandValue::Uint((plane.modifier & 0xFFFF_FFFF) as u32),
+                    ];
+                    let (add_payload, add_fds) = match wire::encode_arguments(add_sig, values) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("failed to encode add (plane {}) for dmabuf buffer {guest_id}: {e}", plane.plane_idx);
+                            add_failed = true;
+                            break;
+                        }
+                    };
+                    if let Err(e) =
+                        host.write_message(&wire::build_message(params_host_id, add_opcode, &add_payload), &add_fds).await
                     {
                         warn!("failed to recreate dmabuf buffer {guest_id}: add (plane {}) failed: {e}", plane.plane_idx);
                         add_failed = true;
@@ -1695,14 +1790,24 @@ async fn recover_state_after_reconnect(
                     .child_interface
                     .expect("create_immed always has a static child interface");
                 let buffer_host_id = objects.allocate_host_id();
-                let mut create_immed_payload = Vec::new();
-                wire::put_u32(&mut create_immed_payload, buffer_host_id);
-                wire::put_u32(&mut create_immed_payload, *width as u32);
-                wire::put_u32(&mut create_immed_payload, *height as u32);
-                wire::put_u32(&mut create_immed_payload, *format);
-                wire::put_u32(&mut create_immed_payload, *flags);
-                if let Err(e) =
-                    host.write_message(&wire::build_message(params_host_id, create_immed_opcode, &create_immed_payload), &[]).await
+                let create_immed_sig = params_interface.requests[create_immed_opcode as usize].signature;
+                let create_immed_values = vec![
+                    wire::WaylandValue::NewId(buffer_host_id),
+                    wire::WaylandValue::Int(*width),
+                    wire::WaylandValue::Int(*height),
+                    wire::WaylandValue::Uint(*format),
+                    wire::WaylandValue::Uint(*flags),
+                ];
+                let (create_immed_payload, create_immed_fds) = match wire::encode_arguments(create_immed_sig, create_immed_values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode create_immed for dmabuf buffer {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host
+                    .write_message(&wire::build_message(params_host_id, create_immed_opcode, &create_immed_payload), &create_immed_fds)
+                    .await
                 {
                     warn!("failed to recreate dmabuf buffer {guest_id}: create_immed failed: {e}");
                     continue;
@@ -1727,9 +1832,15 @@ async fn recover_state_after_reconnect(
                     .child_interface
                     .expect("get_pointer/get_keyboard/get_touch always have a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                if let Err(e) = host.write_message(&wire::build_message(seat_host_id, opcode, &payload), &[]).await {
+                let signature = seat_interface.requests[opcode as usize].signature;
+                let (payload, fds) = match wire::encode_arguments(signature, vec![wire::WaylandValue::NewId(host_id)]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode {} for {:?} {guest_id}: {e}", kind.request_name(), kind);
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(seat_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate {:?} {guest_id}: {e}", kind);
                     continue;
                 }
@@ -1754,10 +1865,16 @@ async fn recover_state_after_reconnect(
                 let child_interface =
                     manager_interface.requests[opcode as usize].child_interface.expect("get_viewport always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                wire::put_u32(&mut payload, surface_host_id);
-                if let Err(e) = host.write_message(&wire::build_message(manager_host_id, opcode, &payload), &[]).await {
+                let signature = manager_interface.requests[opcode as usize].signature;
+                let values = vec![wire::WaylandValue::NewId(host_id), wire::WaylandValue::Object(surface_host_id)];
+                let (payload, fds) = match wire::encode_arguments(signature, values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode get_viewport for viewport {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(manager_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate viewport {guest_id}: {e}");
                     continue;
                 }
@@ -1766,13 +1883,18 @@ async fn recover_state_after_reconnect(
 
                 if let Some((width, height)) = destination {
                     if let Some(set_destination_opcode) = request_opcode(child_interface, "set_destination") {
-                        let mut set_destination_payload = Vec::new();
-                        wire::put_u32(&mut set_destination_payload, *width as u32);
-                        wire::put_u32(&mut set_destination_payload, *height as u32);
-                        if let Err(e) =
-                            host.write_message(&wire::build_message(host_id, set_destination_opcode, &set_destination_payload), &[]).await
-                        {
-                            warn!("failed to replay set_destination for viewport {guest_id}: {e}");
+                        let sig = child_interface.requests[set_destination_opcode as usize].signature;
+                        let values = vec![wire::WaylandValue::Int(*width), wire::WaylandValue::Int(*height)];
+                        match wire::encode_arguments(sig, values) {
+                            Ok((set_destination_payload, fds)) => {
+                                if let Err(e) = host
+                                    .write_message(&wire::build_message(host_id, set_destination_opcode, &set_destination_payload), &fds)
+                                    .await
+                                {
+                                    warn!("failed to replay set_destination for viewport {guest_id}: {e}");
+                                }
+                            }
+                            Err(e) => warn!("failed to encode set_destination for viewport {guest_id}: {e}"),
                         }
                     }
                 }
@@ -1796,10 +1918,16 @@ async fn recover_state_after_reconnect(
                     .child_interface
                     .expect("get_fractional_scale always has a static child interface");
                 let host_id = objects.allocate_host_id();
-                let mut payload = Vec::new();
-                wire::put_u32(&mut payload, host_id);
-                wire::put_u32(&mut payload, surface_host_id);
-                if let Err(e) = host.write_message(&wire::build_message(manager_host_id, opcode, &payload), &[]).await {
+                let signature = manager_interface.requests[opcode as usize].signature;
+                let values = vec![wire::WaylandValue::NewId(host_id), wire::WaylandValue::Object(surface_host_id)];
+                let (payload, fds) = match wire::encode_arguments(signature, values) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to encode get_fractional_scale for fractional scale {guest_id}: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = host.write_message(&wire::build_message(manager_host_id, opcode, &payload), &fds).await {
                     warn!("failed to recreate fractional scale {guest_id}: {e}");
                     continue;
                 }
