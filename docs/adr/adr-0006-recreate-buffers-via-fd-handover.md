@@ -16,7 +16,12 @@ found during wl_shm's live validation -- see "Open issue found live
 2026-08-04" below -- real Wayland traffic now gets further than ever
 before, then hits a genuine `wl_shm.create_pool` rejection from the real
 compositor on an ordinary (non-recovery) resize, unrelated to anything
-this ADR's recreation logic touches.
+this ADR's recreation logic touches. That bug's mechanism is now fully
+understood at the source level and the proxy's own send path is proven
+correct at the syscall level (see the same section's later, same-day
+update) -- what's left is outside this proxy's own code entirely: real
+concurrent-client load or something mutter-side during the ~100ms
+between our send and its rejection.
 
 Context
 
@@ -508,3 +513,89 @@ diff against a clean run instead of more guess-and-check reproductions
 -- the recorder already exists and logs every relayed/dropped message
 with full context, unlike the ad hoc `tracing::debug!` lines used to
 investigate so far.
+
+**2026-08-04, same day: root mechanism found via source reading + a
+wire-recorder capture, though not yet the ultimate cause.**
+
+The wire recorder (above) was used first, on a fresh live failing run.
+It confirmed (again) that the proxy's own message content is correct,
+and added two new facts the earlier `fstat` check couldn't see: this
+exact "destroy old pool, create a differently-sized new one" pattern
+had already happened once earlier in the *same run* (~11s before the
+failure) and succeeded cleanly -- so the shape of the request isn't
+inherently fragile -- and, in the sub-millisecond window right before
+the failing `create_pool`, a *different* client was recorded mid-way
+through a large registry-bind burst (10+ interfaces), landing in the
+same trace window. Real evidence of concurrent load at the moment of
+failure, not just a plausible theory anymore -- though the recorder has
+no per-connection tag on each line, so this is strong correlation, not
+proof of causation.
+
+That pointed at needing to read real source rather than guess further.
+`apt-get source wayland` pulled the exact installed version (1.24.0-2,
+confirmed via `dpkg -l`) with `deb-src` already enabled on this box.
+`src/wayland-server.c:461-477` confirms the error is libwayland-server's
+own generic wire-level demarshal failure -- fired when
+`wl_connection_demarshal()` returns `NULL`, *before* mutter's own
+`create_pool` handler is ever invoked (same class of bug as the
+`wl_registry.bind` one this project already found once before). Tracing
+into `wl_connection_demarshal()`, the `WL_ARG_FD` case in
+`connection.c:1053-1061` is the exact trigger:
+
+```c
+case WL_ARG_FD:
+    if (connection->fds_in.tail == connection->fds_in.head) {
+        wl_log("file descriptor expected, ...");
+        errno = EINVAL;
+        goto err;
+```
+
+Mutter's own internal fd ring buffer (`fds_in`) was **empty** at the
+exact moment it tried to read `create_pool`'s fd argument. Read through
+`wl_connection_read()` (the receive-side loop) too: it decodes ancillary
+SCM_RIGHTS data (`decode_cmsg()`) and advances the byte buffer together,
+every `recvmsg()` iteration, in lockstep -- no mechanism there for bytes
+to become visible without their fd also being available at the same
+moment. That pushed the question back to the SEND side: did the
+proxy's own `sendmsg()` call for this exact message definitely include
+the fd, every time?
+
+`scripts/strace-proxy.sh` (built this session specifically for this
+question -- see its own header and the matching debugging-notes.md
+entry for the two real obstacles it works around) answered this with
+syscall-level certainty. The exact failing `sendmsg()` call, captured
+live:
+
+```
+sendmsg(19<UNIX-STREAM:[593114->594355]>,
+  {msg_iov=[{iov_base="\5\0\0\0\0\0\20\0\21\0\0\0`\35\20\0", iov_len=16}],
+   msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS,
+                 cmsg_data=[11</memfd:gdk-wayland>(deleted)]}],
+   msg_controllen=24}, 0) = 16
+```
+
+Full 16-byte payload in one call (no partial write), `SCM_RIGHTS`
+correctly attached with a real fd, return value 16 (complete success at
+the syscall level). **This conclusively rules out the proxy's own send
+path** -- the fd genuinely left this process correctly attached to this
+exact message. Whatever causes mutter's `fds_in` ring to be empty by
+the time it demarshals this message happens on the kernel/mutter side,
+after a provably-correct send.
+
+The same capture also measured, precisely for the first time, how long
+mutter took to respond: **101.5ms** between the `sendmsg()` above
+(`.025569`) and the `wl_display.error` arriving back (`.127118`) -- see
+the recvmsg entries in the same capture. That is a very long time for
+processing a single small message under normal circumstances, and is
+the strongest evidence yet for the concurrent-load theory: whatever
+mutter was doing in that ~100ms window is the most likely place the
+actual cause lives, not anything on this side of the socket.
+
+Not yet done: instrumenting or reading mutter's *own* source (as
+opposed to libwayland-server's, which this session covered) for what it
+might be doing with `wl_shm`/fd-related resources during that 100ms,
+and/or reproducing genuine multi-client simultaneous-reconnect load
+synthetically (all reproductions so far, per the section above, are
+effectively single-client). Given the proxy's own correctness is now
+about as thoroughly settled as it can be from this side of the socket,
+that's the natural next place to look if this is picked back up again.

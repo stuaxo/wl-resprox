@@ -541,6 +541,27 @@ capture a full byte-for-byte trace of a live failing run for comparison,
 rather than more guess-and-check reproductions. Full detail in
 ADR-0006's own "Open issue" section.
 
+**Root mechanism found, same day, via a wire-recorder capture plus
+reading real libwayland-server source (`apt-get source wayland` pulled
+the exact installed 1.24.0-2, `deb-src` already enabled)**: the error is
+libwayland-server's own generic wire-demarshal failure
+(`src/wayland-server.c`), firing before mutter's `create_pool` handler
+ever runs, because mutter's internal fd ring buffer was empty when it
+tried to read the message's fd argument (`connection.c`'s `WL_ARG_FD`
+case). New tool `scripts/strace-proxy.sh` (works around `yama
+ptrace_scope=1` refusing to attach to the running systemd unit, by
+launching an identical copy as strace's own child instead -- see its own
+header and the matching 2026-08-04 debugging-notes.md entry) then proved
+at the syscall level that the proxy's own `sendmsg()` for the exact
+failing message was fully correct -- complete 16-byte write, `SCM_RIGHTS`
+fd correctly attached -- ruling out the proxy's send path entirely. Also
+measured, precisely: **101.5ms** between that send and mutter's
+rejection arriving back, the strongest evidence yet that something
+mutter-side (most likely genuine concurrent-client load) during that
+window is where the actual cause lives, not anything on this side of
+the socket. Full detail, including the exact `sendmsg()` capture, in
+ADR-0006.
+
 ## The actual problem
 
 gnome-shell sometimes crashes while the screen is **locked**. Since
