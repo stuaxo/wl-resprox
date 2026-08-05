@@ -11,9 +11,54 @@ enough server-side state that the client never notices.
 
 ## Status
 
+### GTK4 recovery
+
 Proxy core and crash recovery: done, including cross-compositor
-recovery (e.g. labwc crashes, sway takes over the same socket).
-Verified live against labwc, sway, kwin and gnome-shell.
+recovery (e.g. labwc crashes, sway takes over the same socket) and
+both GTK4 renderers (cairo/`wl_shm` and GL/dmabuf).
+
+Wayland extensions the proxy actively recreates/tracks state for, vs.
+relaying generically with no reconnect-time recovery:
+
+| Extension | Purpose | Status |
+|---|---|---|
+| `wl_compositor` | Surface creation | Done |
+| `xdg_wm_base` (xdg-shell) | Window/toplevel management | Done |
+| `wl_shm` | Shared-memory buffers | Done |
+| `zwp_linux_dmabuf_v1` | GPU (dmabuf) buffers | Done |
+| `wl_seat` | Pointer/keyboard/touch | Done |
+| `wp_viewporter` | Fractional-scale geometry | Done |
+| `wp_fractional_scale_manager_v1` | DPI scale info | Done |
+| `wp_presentation` | Frame timing feedback | Pass-through |
+| `wp_linux_drm_syncobj_v1` | Explicit GPU sync | Not bound (unused by tested clients) |
+| `wl_data_device_manager` | Clipboard, drag-and-drop | Unverified |
+| `gtk_shell1` | GNOME/GTK startup notification | Unsupported |
+
+Everything else a compositor might advertise is relayed generically
+(pass-through, id translation only), not part of the recreation graph —
+see `docs/architecture-notes.md` for the full coverage picture.
+
+### GNOME Shell
+
+Live-verified against a real installed session (not just a container),
+through repeated real crashes, for both renderers above.
+
+> **Caveat:** doesn't work with `gnome-session` — a gnome-shell crash was
+> taking `gnome-session` down with it, dumping you back to the login
+> screen. Instead a separate session (`wl-res-gnome-shell-direct`) launches
+> gnome-shell itself as a direct child, without `gnome-session` in the
+> loop.
+
+### labwc / sway / kwin
+
+Protocol coverage and the cross-compositor case above are verified in
+the container test harness (`scripts/containers/`) for all three.
+labwc additionally ships a real installable session
+(`wl-res-labwc-session-wrapper.sh`, same direct-child architecture as
+gnome-shell's) and has been run that way, not just in a container. sway
+and kwin currently have no installable session — container-only.
+
+### Other
 
 Both the proxy and its test harness have a proper CLI (`clap` for the
 proxy, Python/Typer for the harness). The harness is also its own
@@ -21,8 +66,8 @@ installable package, `wayland-headless-harness`, independent of this
 repo — a general-purpose tool for reproducing Wayland client/compositor
 issues, not just for testing this proxy. See `scripts/README.md`.
 
-Not done: desktop integration (auto-starting under a real session,
-systemd unit lifecycle management) and independent review.
+Not done: systemd unit lifecycle management for the non-GNOME sessions,
+and independent review.
 
 ## Usage
 
