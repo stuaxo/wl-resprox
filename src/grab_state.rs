@@ -1,10 +1,8 @@
 //! Tracks pointer/keyboard focus and pressed-button state, purely so a
-//! reconnect can clean it up before resuming traffic --
-//! implementation-constraints.md's "Grab State (mid-interaction crash)"
-//! rule: if a pointer or keyboard grab was active when the compositor
-//! died, synthesize `wl_pointer.leave` and/or a fake button-release BEFORE
-//! resuming, so the client doesn't end up stuck believing a button is
-//! still held or a surface still has focus that the (now-different) new
+//! reconnect can clean it up before resuming traffic: if a grab was
+//! active when the compositor died, synthesize `wl_pointer.leave` and/or
+//! a fake button-release first, so the client doesn't end up believing a
+//! button is still held or a surface still has focus that the new
 //! compositor will never confirm or release on its own. A stuck grab is
 //! worse than a dropped click.
 //!

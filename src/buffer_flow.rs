@@ -3,24 +3,16 @@
 //! `wl_buffer.release` event before it's allowed to reuse that buffer's
 //! memory for a new frame -- purely so a reconnect can synthesize a
 //! release for any buffer left in-flight when the compositor died.
+//! Recreating the buffer object alone isn't enough: a client whose whole
+//! pool was checked out at crash time won't attempt a new frame while it
+//! believes every buffer it owns is still busy, even though every
+//! protocol object involved recovered cleanly. Same "unanswered promise"
+//! shape as `pending_frames.rs`'s `wl_callback.done` tracking, for
+//! `wl_buffer.release` instead.
 //!
-//! Found live 2026-08-04 validating ADR-0006's wl_shm half against
-//! `scripts/gtk/basic_shm.py`: `wl_buffer` recreation alone (recreation.rs)
-//! fixes the *fatal* disconnect (`attach` on an untranslatable object), but
-//! a client whose buffer pool was fully checked out at the exact moment of
-//! a crash (attach+commit reached the old compositor, which died before
-//! ever sending the matching `release`) stalls forever afterward, even
-//! though every protocol object involved recovers cleanly -- GTK's own
-//! cairo/shm buffer-pool implementation won't attempt a new frame while it
-//! believes every buffer it owns is still busy. Same "unanswered promise"
-//! class as the `wl_surface.frame` -> `wl_callback.done` stall fixed
-//! earlier the same session (see `relay_ready_messages`'s frame-synthesis
-//! branch in lib.rs), just for `wl_buffer.release` instead of
-//! `wl_callback.done`.
-//!
-//! Deliberately narrow, matching that fix's own scope: only "is this
-//! specific buffer currently attached+committed with no release seen
-//! since" is tracked, not general buffer content/damage history.
+//! Deliberately narrow: only "is this specific buffer currently
+//! attached+committed with no release seen since" is tracked, not general
+//! buffer content/damage history.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,13 +59,11 @@ impl BufferFlowTracker {
     }
 
     /// Every buffer still believed in-flight -- a compositor crash between
-    /// `commit` and the `release` it would eventually have sent. Draining
-    /// (not just reading) is deliberate: whether or not the caller manages
-    /// to actually recreate/synthesize a release for each one, none of
-    /// them are this tracker's concern any more after a reconnect -- a
-    /// buffer that failed to recreate has nothing further to wait on
-    /// either, and leaving it tracked would only risk re-synthesizing
-    /// against a future, unrelated reconnect.
+    /// `commit` and the `release` it would eventually have sent. Drains
+    /// rather than just reads: none of these are this tracker's concern
+    /// after a reconnect, whether or not the caller manages to synthesize
+    /// a release for each one, and leaving stale entries around risks
+    /// re-synthesizing against a later, unrelated reconnect.
     pub fn drain_in_flight(&mut self) -> Vec<u32> {
         self.in_flight.drain().collect()
     }

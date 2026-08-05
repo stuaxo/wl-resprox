@@ -5,18 +5,16 @@
 //! the full reasoning behind the socket-identity swap this is one piece of.
 //!
 //! Exists as a standalone native helper (not shell script polling, not a
-//! shell-out to `inotifywait`) for two reasons found live 2026-08-03:
+//! shell-out to `inotifywait`) for two reasons:
 //!
-//! 1. A plain `while [ ! -S path ]; do sleep 0.05; done` loop in the
-//!    session wrapper script matched a STALE leftover socket file from a
-//!    previous gnome-shell/proxy cycle instead of the compositor's own
-//!    fresh bind -- confirmed by comparing the renamed file's birth time
-//!    against gnome-shell's own reported bind timestamp, which were over a
-//!    minute apart. `inotify`'s `IN_CREATE` only fires for a file created
-//!    *after* the watch is established, which rules this out by
-//!    construction (the stale file already existed before the watch was
-//!    set up), not just by reacting faster. The stale file is also
-//!    explicitly removed before watching starts, belt-and-suspenders.
+//! 1. A plain `while [ ! -S path ]; do sleep 0.05; done` loop can match a
+//!    STALE leftover socket file from a previous gnome-shell/proxy cycle
+//!    instead of the compositor's own fresh bind. `inotify`'s `IN_CREATE`
+//!    only fires for a file created *after* the watch is established,
+//!    which rules this out by construction (the stale file already
+//!    existed before the watch was set up), not just by reacting faster.
+//!    The stale file is also explicitly removed before watching starts,
+//!    belt-and-suspenders.
 //! 2. Freezing the target process (`SIGSTOP`) the instant the file appears,
 //!    before renaming, closes the *remaining* real race: the compositor's
 //!    own subsequently-spawned children (DING, notification helpers, ...)

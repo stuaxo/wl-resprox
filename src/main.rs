@@ -77,11 +77,10 @@ async fn main() -> Result<()> {
                     // Best-effort: the connecting process's own pid, purely for
                     // tagging every log line this connection's task ever emits
                     // (via the span below) -- with several clients each
-                    // independently reconnecting after a compositor crash (see
-                    // plan-desktop-resilience.md's 2026-08-03 entries on the
-                    // reconnect race), the proxy's log otherwise interleaves
-                    // multiple clients' recovery sequences with no way to tell
-                    // which lines belong to which real process. `None` (peer_cred
+                    // independently reconnecting after a compositor crash, the
+                    // proxy's log otherwise interleaves multiple clients'
+                    // recovery sequences with no way to tell which lines
+                    // belong to which real process. `None` (peer_cred
                     // failing) just means "unknown", never fatal.
                     let client_pid = gtk_stream.peer_cred().ok().and_then(|c| c.pid());
                     let span = tracing::info_span!("client", pid = client_pid);

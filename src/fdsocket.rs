@@ -1,12 +1,10 @@
 //! Unix domain socket I/O that carries file descriptors alongside bytes,
 //! via `recvmsg`/`sendmsg` with `SCM_RIGHTS` ancillary data.
 //!
-//! `tokio::net::UnixStream`'s plain `read`/`write` do NOT carry ancillary
-//! data at all -- that's the actual bug that motivated moving off a raw
-//! byte pipe in the first place (Wayland routinely sends fds: shm pool
-//! memory, keymaps, DnD/clipboard pipes). Going back to hand-rolled wire
-//! parsing without fixing this would silently reintroduce it. sommelier-rs
-//! and waypipe (see reference/) both use this same approach.
+//! `tokio::net::UnixStream`'s plain `read`/`write` don't carry ancillary
+//! data at all, so they can't be used here -- Wayland routinely sends fds
+//! (shm pool memory, keymaps, DnD/clipboard pipes) that a plain byte pipe
+//! would silently drop.
 
 use nix::cmsg_space;
 use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr};

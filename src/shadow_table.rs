@@ -38,16 +38,15 @@ pub struct ShadowTable {
     /// `guest_id`/`is_current_generation` use to answer "was this guest id
     /// (re)mapped against the *current* host connection, or is it a
     /// leftover from a previous one that was never refreshed?" Two
-    /// distinct hazards this guards against, both confirmed live against
-    /// real labwc (see the 2026-07-30 entry in docs/debugging-notes.md):
+    /// distinct hazards this guards against:
     ///
     /// 1. A *fresh* host connection is a brand new `wl_client` from the
     ///    compositor's own perspective -- it has never seen any
     ///    client-allocated id before and expects the first one to be 2,
-    ///    gapless from there (this is the exact same "new_id gap" rule
-    ///    root-caused earlier in this project for dropped messages, just
-    ///    now applying to `next_host_id` continuing to count up across a
-    ///    reconnect instead of resetting). `bump_generation` resets it.
+    ///    gapless from there (the same "new_id gap" rule that applies to
+    ///    dropped messages, just now for `next_host_id` continuing to
+    ///    count up across a reconnect instead of resetting).
+    ///    `bump_generation` resets it.
     /// 2. Once it resets, freshly-allocated *low* host ids can numerically
     ///    coincide with a stale guest_to_host entry from the previous
     ///    generation that nothing ever refreshed (anything outside the
@@ -128,27 +127,22 @@ impl ShadowTable {
         id
     }
 
-    /// Gives back a host id that was allocated via `allocate_host_id`
-    /// but never actually sent to the host -- e.g. the message carrying
-    /// it as a `new_id` argument got dropped (its own sender turned out
-    /// untranslatable) before ever being forwarded. Found live
-    /// 2026-08-04 as the root cause of a real fatal disconnect
-    /// (`wl_display.error "invalid arguments for wl_shm#N.create_pool"`,
-    /// see docs/adr/adr-0006-recreate-buffers-via-fd-handover.md's "Open
-    /// issue" section for the full investigation): without this, this
-    /// table's own `next_host_id` counter permanently drifts ahead of
-    /// what the host has actually seen -- and libwayland-server's own
-    /// new_id validation (`wl_map_reserve_new`, confirmed by reading its
-    /// actual source) rejects the NEXT legitimate `new_id` outright once
-    /// the resulting gap is reached, since a real Wayland server
-    /// requires a client's own object ids to be gapless. Silently a
-    /// no-op unless `id` is exactly the most recently allocated one
-    /// (`next_host_id - 1`) -- true by construction at every call site
-    /// this exists for today (`relay_ready_messages` always allocates,
-    /// then immediately either forwards or rolls back, within the same
-    /// message's processing, before any other allocation on this same
-    /// table can happen), but a guard against ever silently corrupting
-    /// the counter if that invariant stops holding somewhere new.
+    /// Gives back a host id that was allocated via `allocate_host_id` but
+    /// never actually sent to the host -- e.g. the message carrying it as
+    /// a `new_id` argument got dropped (its own sender turned out
+    /// untranslatable) before ever being forwarded. Without this,
+    /// `next_host_id` permanently drifts ahead of what the host has
+    /// actually seen, and libwayland-server's own new_id validation
+    /// (`wl_map_reserve_new`) rejects the next legitimate `new_id`
+    /// outright once the gap is reached, since a real Wayland server
+    /// requires a client's object ids to stay gapless (see ADR-0006's
+    /// "Open issue" section). Silently a no-op unless `id` is exactly the
+    /// most recently allocated one (`next_host_id - 1`) -- true by
+    /// construction at every call site today (`relay_ready_messages`
+    /// always allocates, then immediately either forwards or rolls back,
+    /// within the same message's processing), but a guard against
+    /// silently corrupting the counter if that invariant stops holding
+    /// somewhere new.
     pub fn unallocate_host_id(&mut self, id: u32) {
         if id == self.next_host_id - 1 {
             self.next_host_id -= 1;
@@ -348,12 +342,10 @@ mod tests {
     fn bump_generation_resets_the_host_id_allocator() {
         // A fresh host connection is a brand new wl_client from the
         // compositor's own perspective, requiring gapless allocation
-        // starting at 2 -- continuing to count up from wherever a
-        // previous connection's lifetime left off reproduces the exact
-        // "new_id gap" bug this project already root-caused once, just
-        // against a fresh compositor connection instead of a dropped
-        // message (confirmed live against real labwc -- see the
-        // 2026-07-30 entry in docs/debugging-notes.md).
+        // starting at 2 -- continuing to count up from a previous
+        // connection's lifetime would reproduce the same "new_id gap"
+        // rejection as a dropped message, just against a fresh compositor
+        // connection instead.
         let mut table = ShadowTable::new();
         table.allocate_host_id();
         table.allocate_host_id();

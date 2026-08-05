@@ -1,24 +1,20 @@
-//! Tracks enough about a deliberately narrow set of objects to replay
-//! their creation against a fresh host connection after a reconnect --
-//! implementation-constraints.md's "On Server Reconnect" rule is
-//! specifically "Recreate `wl_surface` / `xdg_toplevel`... using the
-//! shadow table's tracked state", not "replay every object ever created".
+//! Tracks a deliberately narrow set of objects to replay their creation
+//! against a fresh host connection after a reconnect -- not every object
+//! the client ever created, just `wl_surface`/`xdg_toplevel` and the
+//! roots they hang off.
 //!
-//! `xdg_surface` is tracked too, as the unavoidable link between the two
-//! (`xdg_wm_base.get_xdg_surface(surface)` -> `xdg_surface.get_toplevel()`),
-//! and `wl_compositor`/`xdg_wm_base`/`wl_seat` themselves, as the roots
-//! every other entry here is ultimately created from (`wl_seat` joined
-//! this list 2026-08-04 -- see `Recreatable::SeatDevice`'s doc comment for
-//! why the original "GTK re-obtains it naturally" assumption turned out
-//! false). `wl_buffer` is still deliberately excluded except via the
-//! narrow `ShmBuffer`/`DmabufBuffer` recipes below -- see ADR-0006.
+//! `xdg_surface` is tracked as the link between `xdg_wm_base` and
+//! `xdg_toplevel`; `wl_compositor`/`xdg_wm_base`/`wl_seat` themselves are
+//! the roots everything else is ultimately created from. `wl_buffer` is
+//! excluded except via the narrow `ShmBuffer`/`DmabufBuffer` recipes below
+//! (see ADR-0006).
 //!
 //! A fully generic "replay any object's creation from its raw wire bytes"
-//! engine was considered and rejected here: since the request shapes
-//! involved (`wl_registry.bind`, `create_surface`, `get_xdg_surface`,
-//! `get_toplevel`) are few and fixed, hand-modeling each as a variant is
-//! less code and more obviously correct than a byte-patching replay engine
-//! that would need to *also* know which of a replayed message's arguments
+//! engine was considered and rejected: the request shapes involved
+//! (`wl_registry.bind`, `create_surface`, `get_xdg_surface`,
+//! `get_toplevel`) are few and fixed, so hand-modeling each as a variant
+//! is less code and more obviously correct than a byte-patching engine
+//! that would *also* need to know which of a replayed message's arguments
 //! are stale host ids needing re-translation vs. static data to replay
 //! verbatim.
 
@@ -29,103 +25,75 @@ use wayland_backend::protocol::Interface;
 /// What's needed to recreate one guest object on a fresh host connection,
 /// once its parent (if any) has already been recreated.
 pub enum Recreatable {
-    /// A `wl_registry.bind` for a specific interface. The roots
-    /// (`wl_compositor`, `xdg_wm_base`, `wl_shm`) are recreated this way,
-    /// against whatever name the *new* compositor happens to advertise them
-    /// as -- never assumed to match the pre-crash name. `version` is the
-    /// version the *client itself* originally requested in its own bind
-    /// call, not our compiled-in `interface.version` (its static maximum)
-    /// or the new compositor's own advertised maximum -- see the
-    /// version-mismatch hazard documented where this is replayed, in
-    /// `recover_state_after_reconnect`.
+    /// A `wl_registry.bind` for a specific interface -- roots like
+    /// `wl_compositor`/`xdg_wm_base`/`wl_shm`/`wl_seat` are recreated this
+    /// way, against whatever name the *new* compositor advertises them
+    /// as, never assumed to match the pre-crash name. `version` is the
+    /// version the client itself originally requested, not our
+    /// compiled-in maximum or the new compositor's advertised maximum --
+    /// replaying at the wrong version can hand a client protocol data
+    /// shaped for a newer version than its own listener structs expect.
     Global { interface: &'static Interface, version: u32 },
     /// `wl_compositor(parent).create_surface(new_id)`.
     Surface { parent_guest_id: u32 },
     /// `xdg_wm_base(parent).get_xdg_surface(new_id, surface)`.
     XdgSurface { parent_guest_id: u32, surface_guest_id: u32 },
-    /// `xdg_surface(parent).get_toplevel(new_id)`. `title`/`app_id` are
-    /// `None` until the client's own `set_title`/`set_app_id` requests are
-    /// observed and recorded in place via `RecreationGraph::update_toplevel_title`/
-    /// `update_toplevel_app_id` -- see those methods' own doc comments for
-    /// why replaying them after recreation matters (found live 2026-08-04).
+    /// `xdg_surface(parent).get_toplevel(new_id)`. `title`/`app_id` start
+    /// `None` and are filled in once the client's own `set_title`/
+    /// `set_app_id` are observed (see `update_toplevel_title`/
+    /// `update_toplevel_app_id`) -- both are follow-up requests with no
+    /// `new_id` of their own, so they can't be captured at creation time.
     XdgToplevel { parent_guest_id: u32, title: Option<String>, app_id: Option<String> },
-    /// `wl_shm(wl_shm_guest_id).create_pool(new_id, fd, size)` -- see
-    /// ADR-0006. `fd` is the proxy's own retained copy of the client's
-    /// backing memfd (SCM_RIGHTS hands every receiving end its own
-    /// independent copy, so keeping this one doesn't affect the copy
-    /// already sent on to the original host); closed automatically by
-    /// `OwnedFd`'s `Drop` impl whenever this recipe is forgotten via
-    /// `RecreationGraph::remove` (destroy/delete_id), which needs no
-    /// separate cleanup bookkeeping as a result. `size` is updated in place
-    /// by `RecreationGraph::update_shm_pool_size` on `wl_shm_pool.resize`,
-    /// rather than recorded as a second recipe for the same guest id.
+    /// `wl_shm(wl_shm_guest_id).create_pool(new_id, fd, size)` (ADR-0006).
+    /// `fd` is the proxy's own retained copy of the client's backing memfd
+    /// (SCM_RIGHTS gives every receiving end its own independent copy, so
+    /// retaining one doesn't affect the copy already sent to the host);
+    /// closed automatically via `Drop` whenever `RecreationGraph::remove`
+    /// forgets this recipe. `size` is updated in place by
+    /// `update_shm_pool_size` on `wl_shm_pool.resize`, not recorded as a
+    /// second recipe.
     ShmPool { wl_shm_guest_id: u32, fd: OwnedFd, size: i32 },
     /// `wl_shm_pool(pool_guest_id).create_buffer(new_id, offset, width,
-    /// height, stride, format)` -- see ADR-0006. No fd of its own; draws
-    /// from the pool's already-retained backing memfd.
+    /// height, stride, format)` (ADR-0006). No fd of its own -- draws from
+    /// the pool's already-retained backing memfd.
     ShmBuffer { pool_guest_id: u32, offset: i32, width: i32, height: i32, stride: i32, format: u32 },
     /// The dmabuf half of ADR-0006: `zwp_linux_dmabuf_v1(dmabuf_guest_id)
-    /// .create_params(new_id)` -> one `.add(...)` per plane -> `.create_immed
-    /// (new_id, width, height, format, flags)`. Unlike `ShmPool`/`ShmBuffer`,
-    /// this is ONE recipe covering the whole multi-request dance -- the
-    /// intermediate `zwp_linux_buffer_params_v1` object is disposable
-    /// (single-use by protocol design, replayed against a throwaway host id
-    /// each time, never tracked in the Shadow Table) -- so there's nothing
-    /// for a separate "pool" variant to mean here the way there is for
-    /// wl_shm. `dmabuf_guest_id` is `zwp_linux_dmabuf_v1`'s own guest id
-    /// (itself a `Recreatable::Global`), needed to find its freshly
-    /// recreated host id to create a new params object from on replay.
+    /// .create_params(new_id)` -> one `.add(...)` per plane ->
+    /// `.create_immed(new_id, width, height, format, flags)`. One recipe
+    /// covers the whole multi-request dance, unlike `ShmPool`/`ShmBuffer`
+    /// as two -- the intermediate `zwp_linux_buffer_params_v1` is
+    /// disposable (single-use by protocol design, replayed against a
+    /// throwaway host id, never tracked in the Shadow Table), so there's
+    /// nothing for a separate variant to mean here. `dmabuf_guest_id` is
+    /// `zwp_linux_dmabuf_v1`'s own guest id (itself a `Global`), needed to
+    /// find its freshly recreated host id to create the params object
+    /// from on replay.
     DmabufBuffer { dmabuf_guest_id: u32, width: i32, height: i32, format: u32, flags: u32, planes: Vec<DmabufPlane> },
     /// `wl_seat(seat_guest_id).get_pointer/get_keyboard/get_touch(new_id)`.
-    /// Found live 2026-08-04 (see docs/debugging-notes.md): `wl_seat` and
-    /// its derived input-device objects were originally deliberately left
-    /// out of this graph (see this module's own top-of-file doc comment,
-    /// "Nothing else -- not wl_seat... gets a recipe: GTK re-obtains those
-    /// naturally by reacting to the freshly-fetched registry") -- that
-    /// assumption doesn't hold: `recover_state_after_reconnect` re-fetches
-    /// the registry purely internally and never forwards any `global`
-    /// event to the client, so the client is never told a new `wl_seat`
-    /// exists, and even if it were, GTK has no reason to rebind an
-    /// already-bound singleton. Net effect confirmed live: after a crash
-    /// the new compositor connection never has a `wl_seat` (or a
-    /// `wl_pointer`/`wl_keyboard`) bound on it for this client at all, so
-    /// there is nothing for the compositor to route input events to --
-    /// the client's existing pointer/keyboard guest ids go silently,
-    /// permanently dead. `wl_seat` itself now rides the existing `Global`
-    /// recipe (bound the same way as `wl_compositor`/`xdg_wm_base`/etc.);
-    /// this variant covers the one extra step -- re-deriving each input
-    /// device the client had already obtained from it, replayed onto the
-    /// client's *existing* guest id the same way every other recipe here
-    /// re-maps an existing guest id onto a freshly allocated host id.
+    /// `wl_seat` rides the `Global` recipe like any other root; this
+    /// variant covers the extra step of re-deriving each input device the
+    /// client already held, onto its existing guest id. Needed because
+    /// recovery never forwards a `wl_registry.global` event to the client
+    /// (the registry refetch is internal to the proxy), so the client is
+    /// never told a new `wl_seat` exists to rebind -- without this, a
+    /// recovered client keeps a `wl_pointer`/`wl_keyboard` guest id that
+    /// nothing on the new host side will ever route input to.
     SeatDevice { seat_guest_id: u32, kind: SeatDeviceKind },
     /// `wp_viewporter(viewporter_guest_id).get_viewport(new_id, surface)`.
-    /// Same bug shape as `SeatDevice`, found live 2026-08-04 immediately
-    /// after that fix: a recovered window rendered fine and had input
-    /// again, but came back visibly larger on a fractionally-scaled
-    /// output (125% DPI here) -- a real client's own `wp_viewport` is
-    /// created once and told `set_destination(w, h)` once, telling the
-    /// compositor "scale my higher-resolution buffer back down to this
-    /// logical size." That object is exactly as un-recreated as
-    /// `wl_seat` was, so the freshly recreated host-side `wl_surface` has
-    /// no scaling instruction at all and displays the buffer at raw
-    /// pixel size -- confirmed live via a `WAYLAND_DEBUG=1` trace showing
-    /// `set_destination(348, 269)` while the toplevel's own configured
-    /// size was `(435, 336)`, i.e. exactly 1.25x, matching the 125% DPI
-    /// setting exactly. `destination` starts `None` and is filled in by
-    /// `RecreationGraph::update_viewport_destination` the same way
-    /// `ShmPool`'s `size` and `XdgToplevel`'s `title`/`app_id` are --
-    /// `set_destination` doesn't carry a `new_id` either. `set_source`
-    /// (viewport cropping) isn't tracked -- not exercised by anything
-    /// seen live yet; add it here the same way if that ever matters.
+    /// Same shape as `SeatDevice`: without recreating this, a recovered
+    /// window on a fractionally-scaled output renders at the wrong size,
+    /// since `set_destination`'s scaling instruction never reaches the
+    /// new host surface. `destination` starts `None`, filled in by
+    /// `update_viewport_destination` the same way `ShmPool.size` and
+    /// `XdgToplevel`'s title/app_id are, since `set_destination` carries
+    /// no `new_id` either. `set_source` (viewport cropping) isn't
+    /// tracked -- add it here the same way if that's ever needed.
     Viewport { viewporter_guest_id: u32, surface_guest_id: u32, destination: Option<(i32, i32)> },
     /// `wp_fractional_scale_manager_v1(manager_guest_id).get_fractional_scale
-    /// (new_id, surface)`. Bound together with `Viewport` by every real
-    /// client seen live -- recreated purely so a *future* DPI change
-    /// while the session is up still reaches this client after a crash
-    /// (its `preferred_scale` event is the only thing this object ever
-    /// sends); nothing needs replaying on it beyond recreating the object
-    /// itself, since the client already has the current scale cached
-    /// from before the crash.
+    /// (new_id, surface)`. Recreated purely so a *future* DPI change still
+    /// reaches this client after a crash (its `preferred_scale` event is
+    /// all this object ever sends) -- nothing needs replaying on it, since
+    /// the client already has the current scale cached from before.
     FractionalScale { manager_guest_id: u32, surface_guest_id: u32 },
 }
 
@@ -228,17 +196,11 @@ impl RecreationGraph {
 
     /// `xdg_toplevel.set_title(title)` doesn't get its own new_id either --
     /// update the toplevel's already-recorded `title` in place, same
-    /// reasoning as `update_shm_pool_size`. Found live 2026-08-04: a real
-    /// client only ever calls `set_title`/`set_app_id` *once*, right after
-    /// `get_toplevel()`, well before any crash -- our recreation replays the
-    /// object creation itself but, without this, never replays these two
-    /// follow-up requests, so the *new* host-side toplevel is created and
-    /// never told its title or app_id at all. Confirmed live: GNOME Shell's
-    /// own "Open Windows" listing showed the real title before a crash and
-    /// literally "Unknown" after recovery -- the window itself keeps
-    /// rendering and keeps its window-manager-level state (stacking,
-    /// activation) otherwise intact, but its identity is gone from the new
-    /// host connection's point of view.
+    /// reasoning as `update_shm_pool_size`. A real client calls
+    /// `set_title`/`set_app_id` once, right after `get_toplevel()`, well
+    /// before any crash; without replaying them too, a recreated toplevel
+    /// exists but was never told its title/app_id, so its window-manager
+    /// identity is lost even though it keeps rendering.
     pub fn update_toplevel_title(&mut self, guest_id: u32, new_title: String) {
         if let Some((_, Recreatable::XdgToplevel { title, .. })) =
             self.recipes.iter_mut().rev().find(|(id, r)| *id == guest_id && matches!(r, Recreatable::XdgToplevel { .. }))
@@ -256,9 +218,9 @@ impl RecreationGraph {
         }
     }
 
-    /// `wp_viewport.set_destination(width, height)` -- see `Recreatable::Viewport`'s
-    /// own doc comment (found live 2026-08-04) for why replaying this
-    /// after recreation matters. Same mechanism as `update_toplevel_title`.
+    /// `wp_viewport.set_destination(width, height)` -- see
+    /// `Recreatable::Viewport`'s doc comment for why this matters. Same
+    /// mechanism as `update_toplevel_title`.
     pub fn update_viewport_destination(&mut self, guest_id: u32, width: i32, height: i32) {
         if let Some((_, Recreatable::Viewport { destination, .. })) =
             self.recipes.iter_mut().rev().find(|(id, r)| *id == guest_id && matches!(r, Recreatable::Viewport { .. }))

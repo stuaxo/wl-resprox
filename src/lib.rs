@@ -1,12 +1,8 @@
 //! Core relay logic for the crash-resilient Wayland proxy. Split out from
 //! `main.rs` so integration tests (see `tests/`) can drive `run_connection`
-//! directly against a controlled fake compositor and a real Wayland client,
-//! without needing a container, GPU, or real compositor -- see the
-//! 2026-07-30 entries in docs/debugging-notes.md for why: a real compositor
-//! was intermittently rejecting our output with protocol errors, and manual
-//! byte-level inspection of individual messages kept coming back clean, so
-//! a deterministic, known-good reproduction was needed instead of more
-//! manual live testing.
+//! directly against a fake compositor and a real Wayland client, without
+//! needing a container, GPU, or real compositor for a deterministic,
+//! known-good reproduction of a given wire exchange.
 
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -64,16 +60,14 @@ impl Conn {
     /// blocking asynchronously until at least one byte is available.
     /// Returns `Ok(0)` on EOF, matching `read()`'s convention.
     ///
-    /// Uses `try_io`, not a bare `readable().await` followed by our own
-    /// raw `recvmsg` call -- that combination looks right but isn't:
+    /// Uses `try_io`, not a bare `readable().await` followed by our own raw
+    /// `recvmsg` call -- that combination looks right but isn't:
     /// `readable()` alone doesn't clear tokio's internal readiness bit,
-    /// only tokio's own `try_read`/`try_io` do that (by construction, when
-    /// the closure reports `WouldBlock`). Without it, a `WouldBlock` from
-    /// our own raw syscall left tokio thinking the socket was still ready,
-    /// so `readable().await` kept resolving immediately -- a silent 100%-CPU
-    /// busy loop that never actually noticed EOF. Caught this empirically:
-    /// killing the compositor never logged the freeze message, and the
-    /// process's utime was climbing on an otherwise-idle connection.
+    /// only `try_read`/`try_io` do (when the closure reports `WouldBlock`).
+    /// Without it, a `WouldBlock` from our own raw syscall leaves tokio
+    /// thinking the socket is still ready, so `readable().await` keeps
+    /// resolving immediately -- a silent 100%-CPU busy loop that never
+    /// notices EOF.
     async fn fill(&mut self) -> std::io::Result<usize> {
         let raw_fd = self.stream.as_raw_fd();
         loop {
@@ -96,25 +90,17 @@ impl Conn {
     }
 
     /// Writes a single message's bytes plus its fds, retrying on
-    /// EWOULDBLOCK. Tried batching every ready message into one buffer and
-    /// issuing a single `write_message` call per `relay_ready_messages`
-    /// pass, to match how a real libwayland client's `wl_display_flush()`
-    /// coalesces writes -- verified byte-correct via `strace`, but it made
-    /// the intermittent real-compositor rejection (see below) 100%
-    /// deterministic instead of fixing it, so it was reverted; messages are
-    /// sent one `write_message` call each (see the 2026-07-30 entries in
-    /// docs/debugging-notes.md). Attaches fds only to the first `sendmsg`
-    /// call: a `SOCK_STREAM` unix socket can do a *partial* write under
-    /// backpressure (a real, not
-    /// theoretical, concern here -- e.g. GTK's startup burst of 20+
-    /// back-to-back `wl_registry.bind` calls can fill the socket buffer).
-    /// Silently treating a partial write as complete truncates the buffer
-    /// and desyncs the receiver's parser for everything after it on the
-    /// connection -- confirmed empirically: this exact bug produced
-    /// "invalid arguments for wl_registry#2.bind" (and, in a different
-    /// run, "for wl_display#1.sync") from a real compositor, which then
-    /// reset the connection. Uses `try_io` for the same reason `fill`
-    /// does -- see its comment.
+    /// EWOULDBLOCK. Batching every ready message into one buffer per
+    /// `relay_ready_messages` pass (to match libwayland's own
+    /// `wl_display_flush()` coalescing) was tried and reverted -- it made
+    /// an intermittent real-compositor rejection 100% deterministic
+    /// instead of fixing it, so messages are sent one `write_message` call
+    /// each. A `SOCK_STREAM` socket can do a genuine partial write under
+    /// backpressure (GTK's startup burst of 20+ back-to-back
+    /// `wl_registry.bind` calls can fill the socket buffer); silently
+    /// treating that as a complete write desyncs the receiver's parser for
+    /// everything after it on the connection. Uses `try_io` for the same
+    /// reason `fill` does.
     async fn write_message(&mut self, msg: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
         let raw_fd = self.stream.as_raw_fd();
         let mut sent = 0;
@@ -440,28 +426,17 @@ async fn relay_ready_messages(
                                     {
                                         // The version the CLIENT itself
                                         // requested, not child_iface.version
-                                        // (our own compiled-in static
-                                        // maximum) -- found live 2026-08-03
-                                        // (see plan-desktop-resilience.md):
-                                        // recovery previously re-bound at
-                                        // whatever version the *new*
-                                        // compositor's registry advertised,
-                                        // which can exceed what the
-                                        // client's own compiled listener
-                                        // structs understand. A real tilix
-                                        // then hit libwayland-client's own
-                                        // fatal `wl_abort` (confirmed via a
-                                        // coredump backtrace through
-                                        // wl_closure_invoke) processing a
-                                        // newer wl_surface event
-                                        // (preferred_buffer_scale, added in
-                                        // wl_surface v6) its older stub had
-                                        // no listener slot for. For a
-                                        // dynamic new_id (bind is the only
-                                        // such request -- see
-                                        // resolve_child_interface's doc
-                                        // comment), the wire layout is
-                                        // always [..][interface_name:string]
+                                        // (our compiled-in static maximum)
+                                        // or the new compositor's own
+                                        // advertised max -- rebinding at a
+                                        // higher version than the client's
+                                        // own listener structs understand
+                                        // can hand it an event shape it has
+                                        // no slot for. For a dynamic new_id
+                                        // (bind is the only such request --
+                                        // see resolve_child_interface), the
+                                        // wire layout is always
+                                        // [..][interface_name:string]
                                         // [version:uint][new_id:uint], so
                                         // the version sits exactly 4 bytes
                                         // before new_id's own offset.
@@ -570,15 +545,10 @@ async fn relay_ready_messages(
                                             _ => None,
                                         }
                                     }
-                                    // See Recreatable::SeatDevice's doc
-                                    // comment (found live 2026-08-04):
-                                    // wl_seat's derived input devices need
-                                    // exactly the same "re-map this
-                                    // existing guest id onto a fresh host
-                                    // id" replay every other recipe here
-                                    // gets, or the client's pointer/
-                                    // keyboard/touch objects go silently,
-                                    // permanently dead after a crash.
+                                    // See Recreatable::SeatDevice: needs the
+                                    // same "re-map onto a fresh host id"
+                                    // replay every other recipe gets, or
+                                    // these go silently dead after a crash.
                                     ("wl_seat", "get_pointer") => {
                                         Some(Recreatable::SeatDevice { seat_guest_id: guest_sender_id, kind: SeatDeviceKind::Pointer })
                                     }
@@ -588,15 +558,10 @@ async fn relay_ready_messages(
                                     ("wl_seat", "get_touch") => {
                                         Some(Recreatable::SeatDevice { seat_guest_id: guest_sender_id, kind: SeatDeviceKind::Touch })
                                     }
-                                    // See Recreatable::Viewport's doc
-                                    // comment (found live 2026-08-04,
-                                    // right after the wl_seat fix above):
-                                    // same missing-root shape, this time
-                                    // causing a recovered window to render
-                                    // 1.25x too big on a 125%-DPI output.
+                                    // See Recreatable::Viewport -- same
+                                    // missing-root shape as SeatDevice.
                                     // `surface` is the request's only
-                                    // object argument, so it's
-                                    // original_object_values[0].
+                                    // object argument, so index 0.
                                     ("wp_viewporter", "get_viewport") => {
                                         original_object_values.first().map(|&surface_guest_id| Recreatable::Viewport {
                                             viewporter_guest_id: guest_sender_id,
@@ -697,31 +662,20 @@ async fn relay_ready_messages(
                                     .copy_from_slice(&guest_deleted_id.to_ne_bytes());
                             }
                             None => {
-                                // Confirmed live 2026-08-03 (see
-                                // plan-desktop-resilience.md): this is NOT
-                                // just diagnostic-only. host id 3 is always
-                                // `recover_state_after_reconnect`'s own
-                                // internal wl_display.sync callback (used
-                                // solely to detect "all globals have
-                                // arrived"), deliberately never mapped to a
-                                // guest id -- so the real compositor's
-                                // later delete_id for it always lands here,
-                                // on EVERY reconnect. The old code warned
-                                // but still fell through and forwarded the
-                                // message with its host-space payload
-                                // UNTRANSLATED -- telling the client
-                                // "your own guest-space id 3 is now free",
-                                // except guest id 3 is whatever unrelated,
-                                // very-possibly-still-live object the
-                                // client itself allocated third. Caught
-                                // live via WAYLAND_DEBUG=1 against a real
-                                // tilix: this landed immediately before an
-                                // unexplained clean client exit with no
-                                // error output, consistent with a corrupted
-                                // client-side id table. Never forward it --
-                                // same "untracked, drop" contract as every
-                                // other untranslatable-id case in this
-                                // function.
+                                // Not just diagnostic: host id 3 is always
+                                // recover_state_after_reconnect's own
+                                // internal wl_display.sync callback
+                                // (detects "all globals have arrived"),
+                                // deliberately never mapped to a guest id --
+                                // so the real compositor's delete_id for it
+                                // lands here on every reconnect. Forwarding
+                                // it untranslated would tell the client
+                                // "guest id 3 is now free" for whatever
+                                // unrelated, possibly-still-live object it
+                                // actually allocated third, corrupting its
+                                // own id table. Same "untracked, drop"
+                                // contract as every other untranslatable-id
+                                // case in this function.
                                 warn!("delete_id for untracked host id {host_deleted_id} -- dropping");
                                 if let Some(rec) = recorder() {
                                     rec.record(
@@ -789,12 +743,10 @@ async fn relay_ready_messages(
                 // xdg_toplevel.set_title(title)/set_app_id(app_id) --
                 // same reasoning as wl_shm_pool.resize just above: neither
                 // creates a new object, so neither goes through the new_id
-                // recipe-capture block. See RecreationGraph::update_toplevel_title's
-                // own doc comment (found live 2026-08-04) for why keeping
-                // these current matters: a real client only ever sends
-                // them once, right after get_toplevel(), so without this
-                // observation a replayed toplevel is recreated with no
-                // title/app_id at all.
+                // recipe-capture block. See
+                // RecreationGraph::update_toplevel_title: a client sends
+                // these once, right after get_toplevel(), so without this
+                // observation a replayed toplevel has no title/app_id.
                 if matches!(direction, Direction::ClientToHost) && interface.name == "xdg_toplevel" && desc.name == "set_title" {
                     if let Some((title, _)) = wire::read_str(&msg[wire::HEADER_LEN..], 0) {
                         graph.update_toplevel_title(guest_sender_id, title);
@@ -807,9 +759,8 @@ async fn relay_ready_messages(
 
                 // wp_viewport.set_destination(width, height) -- same
                 // reasoning as set_title/set_app_id just above. See
-                // Recreatable::Viewport's doc comment (found live
-                // 2026-08-04) for why this is the piece that actually
-                // fixes a recovered window rendering oversized on a
+                // Recreatable::Viewport: this is the piece that fixes a
+                // recovered window rendering oversized on a
                 // fractionally-scaled output.
                 if matches!(direction, Direction::ClientToHost) && interface.name == "wp_viewport" && desc.name == "set_destination" {
                     let payload = &msg[wire::HEADER_LEN..];
@@ -849,15 +800,12 @@ async fn relay_ready_messages(
                     continue 'relay;
                 }
 
-                // Buffer flow-control observation (see buffer_flow.rs) --
-                // found live 2026-08-04 validating ADR-0006's wl_shm half:
+                // Buffer flow-control observation (see buffer_flow.rs):
                 // recreating a wl_buffer's protocol identity isn't enough
-                // on its own if the client's own userspace buffer pool is
-                // left believing every buffer it owns is still "busy" (a
-                // wl_buffer.release the OLD, now-dead compositor was ever
-                // going to send for a pre-crash attach+commit, and never
-                // will). Observation only: neither request forwards any
-                // differently because of this.
+                // if the client's own buffer pool believes every buffer it
+                // owns is still "busy," waiting on a release the dead
+                // compositor will never send. Observation only -- neither
+                // request forwards any differently because of this.
                 if matches!(direction, Direction::ClientToHost) && interface.name == "wl_surface" && desc.name == "attach" {
                     let buffer_guest_id = original_object_values.first().copied().unwrap_or(0);
                     buffer_flow.on_attach(guest_sender_id, buffer_guest_id);
@@ -871,31 +819,17 @@ async fn relay_ready_messages(
                     buffer_flow.on_release(guest_sender_id);
                 }
 
-                // Pending-frame-callback observation (see pending_frames.rs)
-                // -- found live 2026-08-04, one step past the buffer-flow
-                // fix above: a frame() that reaches the OLD compositor
-                // successfully (forwarded normally, no drop, so the
-                // "sender has no translation" synthesis just above never
-                // fires) but never gets answered before it dies leaves the
-                // client's frame clock blocked exactly the same way.
-                // Deliberately reached for BOTH a genuinely-forwarded
-                // frame() and one silently dropped while frozen (still
-                // needs answering eventually -- see the module doc
-                // comment) -- only the "sender has no translation" variant
-                // above is excluded, since that one is already answered
+                // Pending-callback observation (see pending_frames.rs): a
+                // frame()/sync() that reaches the OLD compositor
+                // successfully (forwarded normally, so the "sender has no
+                // translation" synthesis just above never fires) but never
+                // gets answered before it dies leaves the client blocked
+                // waiting on that specific callback's `done` forever.
+                // Reached for both a genuinely-forwarded request and one
+                // silently dropped while frozen (still needs answering
+                // eventually) -- only the "sender has no translation"
+                // variant above is excluded, since that's already answered
                 // immediately, right there.
-                //
-                // wl_display.sync() gets the identical treatment -- found
-                // live 2026-08-04 chasing ADR-0008's dmabuf client-wedge
-                // bug: Mesa's GL renderer sends one of these after every
-                // commit as its own internal commit-confirmation
-                // roundtrip and blocks (uninterruptibly, confirmed via
-                // /proc/<pid>/stack) until it's answered. The one in
-                // flight at crash time reaches the old compositor the
-                // same way a frame() can and is just as permanently
-                // unanswered if nothing tracks it -- see pending_frames.rs's
-                // module doc comment for the full live trace that found
-                // this.
                 if matches!(direction, Direction::ClientToHost) && interface.name == "wl_surface" && desc.name == "frame" {
                     if let Some(callback_guest_id) = newly_mapped_guest_id {
                         pending_frames.on_frame_requested(callback_guest_id);
@@ -913,11 +847,10 @@ async fn relay_ready_messages(
                 // compositor never issued, purely to force a client
                 // repaint after recreation. Forwarding the client's
                 // resulting ack_configure to the real compositor gets it
-                // rejected ("wrong configure serial") -- confirmed live
-                // against labwc, see the 2026-07-30 entry in
-                // docs/debugging-notes.md. Swallow exactly the one ack
-                // matching a pending synthetic serial; anything else is a
-                // real ack for a real configure and forwards as normal.
+                // rejected ("wrong configure serial"). Swallow exactly the
+                // one ack matching a pending synthetic serial; anything
+                // else is a real ack for a real configure and forwards as
+                // normal.
                 if matches!(direction, Direction::ClientToHost) && interface.name == "xdg_surface" && desc.name == "ack_configure" {
                     if let Some(serial_bytes) = msg.get(wire::HEADER_LEN..wire::HEADER_LEN + 4) {
                         let serial = u32::from_ne_bytes(serial_bytes.try_into().unwrap());
@@ -973,7 +906,6 @@ async fn relay_ready_messages(
                         && interface.name == "wl_surface"
                         && desc.name == "frame"
                     {
-                        // Found live 2026-08-03 (see plan-desktop-resilience.md):
                         // wl_surface.frame registers a promise the
                         // compositor must keep -- "tell me (via
                         // wl_callback.done) when it's a good time to draw
@@ -985,21 +917,15 @@ async fn relay_ready_messages(
                         // narrow window between bump_generation() and the
                         // surface being remapped by
                         // recover_state_after_reconnect, not because the
-                        // surface is gone for good. Dropping the request
-                        // without answering it leaves the client waiting
-                        // forever on a callback that will never fire,
-                        // since the request that would have triggered it
-                        // never reached the real compositor -- a real
-                        // gtk4-demo caught mid-render at the moment of a
-                        // crash stalled exactly this way, its window never
-                        // redrawing again despite the surface/toplevel
-                        // otherwise recovering fully seconds later. Losing
-                        // the frame's own attach/commit is fine (matches
-                        // implementation-constraints.md's "tell the client
-                        // the display went away" design -- one frame's
-                        // pixel content is acceptable loss); the callback
-                        // specifically must still be answered, or the
-                        // stall is permanent, not just a skipped frame.
+                        // surface is gone for good. Dropping it without
+                        // answering leaves the client waiting forever on a
+                        // callback that will never fire, since the request
+                        // that would have triggered it never reached the
+                        // real compositor. Losing the frame's own
+                        // attach/commit is fine (one frame's pixel content
+                        // is acceptable loss); the callback specifically
+                        // must still be answered, or the stall is
+                        // permanent, not just a skipped frame.
                         if let Some(callback_guest_id) = newly_mapped_guest_id {
                             synthesize_frame_done(src, objects, callback_guest_id).await;
                             // Answered right here -- must not ALSO get
@@ -1023,41 +949,31 @@ async fn relay_ready_messages(
                             interface.name, desc.name
                         );
                     }
-                    // Found live 2026-08-03 (see plan-desktop-resilience.md):
-                    // if THIS message also carried a new_id (e.g.
+                    // If THIS message also carried a new_id (e.g.
                     // wl_shm.create_pool on a stale, never-recreated
                     // wl_shm), the new_id handling above already mapped and
-                    // allocated a host id for it -- before this check ever
-                    // ran, since the sender itself is only validated at the
-                    // very end. Dropping the message here without undoing
-                    // that leaves the shadow table believing an object
-                    // exists on the host that was never actually created
-                    // there (the request that would have created it never
-                    // got forwarded). A real tilix hit exactly this: a
-                    // later request against that phantom id got happily
-                    // translated and forwarded, and the real compositor
-                    // killed the whole connection with a fatal
-                    // `wl_display.error` ("invalid object"). Roll the
-                    // mapping back so the id is genuinely untracked again,
-                    // matching what actually happened on the host.
+                    // allocated a host id for it, since the sender itself
+                    // is only validated at the very end. Dropping the
+                    // message here without undoing that leaves the shadow
+                    // table believing an object exists on the host that
+                    // was never actually created there -- a later request
+                    // against that phantom id would get happily translated
+                    // and forwarded, and the real compositor would kill
+                    // the whole connection with a fatal `wl_display.error`
+                    // ("invalid object"). Roll the mapping back so the id
+                    // is genuinely untracked again, matching what actually
+                    // happened on the host.
                     if let Some(phantom_guest_id) = newly_mapped_guest_id {
-                        // Found live 2026-08-04, the actual root cause of a
-                        // SEPARATE fatal disconnect than the one above
-                        // (`wl_display.error "invalid arguments for
-                        // wl_shm#N.create_pool"`, see ADR-0006's "Open
-                        // issue" section for the full investigation, and
-                        // ShadowTable::unallocate_host_id's own doc comment
-                        // for the mechanism): only a ClientToHost message
-                        // burns one of *our* host ids via allocate_host_id
-                        // in the first place (HostToClient allocates a
-                        // guest id instead, from a completely independent
-                        // counter never subject to this) -- give it back
-                        // before forgetting the mapping, or *this*
-                        // connection's own next legitimate new_id
-                        // eventually gets rejected by the host as
-                        // out-of-sequence once the gap is reached, an
-                        // entirely different failure from the one this
-                        // rollback was originally written for.
+                        // See ShadowTable::unallocate_host_id for the
+                        // mechanism this closes: only a ClientToHost
+                        // message burns one of *our* host ids via
+                        // allocate_host_id (HostToClient allocates a guest
+                        // id instead, from an independent counter never
+                        // subject to this) -- give it back before
+                        // forgetting the mapping, or this connection's own
+                        // next legitimate new_id eventually gets rejected
+                        // by the host as out-of-sequence once the gap is
+                        // reached.
                         if matches!(direction, Direction::ClientToHost) {
                             if let Some(phantom_host_id) = objects.host_id(phantom_guest_id) {
                                 objects.unallocate_host_id(phantom_host_id);
@@ -1096,14 +1012,8 @@ async fn relay_ready_messages(
                             other_side_sender_id, header.opcode, raw_fds.len(), &msg,
                         );
                     }
-                    // Per-message write, NOT batched: batching everything
-                    // into one combined write was tried and made the real
-                    // compositor's intermittent rejection fully
-                    // deterministic (worse), so per-message sends are
-                    // deliberately kept -- see the 2026-07-30 entries in
-                    // docs/debugging-notes.md for the full experiment and
-                    // why the "batch like a real client's flush()" theory
-                    // didn't hold up.
+                    // Per-message write, not batched -- see
+                    // Conn::write_message's own doc comment for why.
                     if let Err(e) = dst.write_message(&msg, &raw_fds).await {
                         error!("failed to relay {}.{}: {e}", interface.name, desc.name);
                     }
@@ -1320,24 +1230,20 @@ async fn recover_state_after_reconnect(
     let mut xdg_wm_base_global: Option<(u32, u32)> = None;
     let mut wl_shm_global: Option<(u32, u32)> = None;
     let mut zwp_linux_dmabuf_v1_global: Option<(u32, u32)> = None;
-    // Joined the roots 2026-08-04 -- see Recreatable::SeatDevice's doc
-    // comment for why wl_seat needs to be a real recreation root now,
-    // not just left for the client to naturally re-obtain.
+    // See Recreatable::SeatDevice for why wl_seat needs to be a real
+    // recreation root, not left for the client to naturally re-obtain.
     let mut wl_seat_global: Option<(u32, u32)> = None;
-    // Joined the roots 2026-08-04 too, same call site -- see
-    // Recreatable::Viewport's doc comment.
+    // See Recreatable::Viewport.
     let mut wp_viewporter_global: Option<(u32, u32)> = None;
     let mut wp_fractional_scale_manager_v1_global: Option<(u32, u32)> = None;
     'collect: loop {
-        // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention
-        // -- see its own doc comment), which the `?` below does NOT catch
-        // since it's not an `Err`. Left unchecked, a compositor that
-        // closes the connection right after rejecting `get_registry`
-        // (confirmed live: labwc did exactly this, "invalid arguments for
-        // wl_display#1.get_registry" -- see the 2026-07-30 entry in
-        // docs/debugging-notes.md) turns this into a silent, 100%-CPU
-        // busy loop: `fill()` keeps returning `Ok(0)` immediately forever,
-        // never `WouldBlock`, so nothing here ever stops calling it again.
+        // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention),
+        // which the `?` below does NOT catch since it's not an `Err`.
+        // Left unchecked, a compositor that closes the connection right
+        // after rejecting `get_registry` turns this into a silent,
+        // 100%-CPU busy loop: `fill()` keeps returning `Ok(0)` immediately
+        // forever, never `WouldBlock`, so nothing here ever stops calling
+        // it again.
         if host.fill().await? == 0 {
             return Err(anyhow::anyhow!(
                 "compositor closed the connection while fetching its registry (probably rejected get_registry -- possibly a new_id it didn't expect)"
@@ -1530,14 +1436,11 @@ async fn recover_state_after_reconnect(
                 info!("recreated xdg_toplevel (guest={guest_id}, host={host_id})");
 
                 // Replay set_title/set_app_id -- see
-                // RecreationGraph::update_toplevel_title's doc comment
-                // (found live 2026-08-04): without this, the freshly
-                // recreated host-side toplevel has never been told its
-                // title or app_id at all, and GNOME Shell's own window
-                // list showed "Unknown" for it after a real crash-recovery
-                // test. Sent before the synthesized configure below, same
-                // ordering a real client uses (identity established before
-                // the surface is treated as mapped).
+                // RecreationGraph::update_toplevel_title: without this,
+                // the freshly recreated host-side toplevel is never told
+                // its title/app_id at all. Sent before the synthesized
+                // configure below, same ordering a real client uses
+                // (identity established before the surface is mapped).
                 if let Some(title) = title {
                     if let Some(set_title_opcode) = request_opcode(child_interface, "set_title") {
                         let sig = child_interface.requests[set_title_opcode as usize].signature;
@@ -1570,27 +1473,22 @@ async fn recover_state_after_reconnect(
                 }
 
                 // Synthesize xdg_toplevel.configure(0, 0, []) BEFORE the
-                // xdg_surface.configure below -- found live 2026-08-03 (see
-                // plan-desktop-resilience.md): a bare xdg_surface.configure
-                // alone doesn't reliably say anything about client state
-                // being invalid, so a client can ack it and keep using its
+                // xdg_surface.configure below: a bare xdg_surface.configure
+                // alone doesn't reliably signal that client state is
+                // invalid, so a client can ack it and keep using its
                 // existing (now stale-generation) buffers, which then get
                 // silently dropped on the next attach and can trigger a
-                // real, fatal compositor protocol error ("invalid arguments
-                // for wl_surface#N.frame") that kills the connection --
-                // exactly the failure this proxy exists to prevent.
-                // xdg_toplevel.configure is the event real compositors send
-                // on an actual resize/state change, which clients' already
-                // -tested resize-handling code reacts to by reallocating
-                // buffers -- width=0/height=0 is the protocol's own "you
-                // decide the size" convention (no forced resize, avoids any
-                // visible jump), states=[] (empty array) since none of the
-                // tracked states (maximized/fullscreen/etc.) are known to
-                // have changed. Not yet confirmed this alone is sufficient
-                // against a real client (there's likely still a race window
-                // for a client already mid-frame with pooled buffers) --
-                // see task #7's graceful-stale-reference handling for the
-                // remaining gap this doesn't close.
+                // fatal compositor protocol error that kills the
+                // connection. xdg_toplevel.configure is what real
+                // compositors send on an actual resize/state change,
+                // which a client's own resize-handling reacts to by
+                // reallocating buffers -- width=0/height=0 is the
+                // protocol's "you decide the size" convention (no forced
+                // resize, no visible jump), states=[] since no tracked
+                // state is known to have changed. May not be sufficient
+                // alone for a client already mid-frame with pooled
+                // buffers -- not yet hit live, but a plausible remaining
+                // race.
                 if let Some(toplevel_configure_opcode) = event_opcode(child_interface, "configure") {
                     let sig = child_interface.events[toplevel_configure_opcode as usize].signature;
                     let values = vec![
@@ -1953,13 +1851,13 @@ async fn recover_state_after_reconnect(
         }
     }
 
-    // Buffer flow-control recovery (see buffer_flow.rs) -- found live
-    // 2026-08-04: recreating a buffer's protocol identity above isn't
-    // enough on its own for a buffer that was attached+committed right
-    // before the crash, since the client is still waiting on a
-    // wl_buffer.release the old, now-dead compositor never got to send.
-    // Must run AFTER the loop above (needs each buffer's freshly-mapped
-    // host id to confirm it actually got recreated, not just guessed at).
+    // Buffer flow-control recovery (see buffer_flow.rs): recreating a
+    // buffer's protocol identity above isn't enough on its own for a
+    // buffer that was attached+committed right before the crash, since
+    // the client is still waiting on a wl_buffer.release the old,
+    // now-dead compositor never got to send. Must run AFTER the loop
+    // above (needs each buffer's freshly-mapped host id to confirm it
+    // actually got recreated, not just guessed at).
     for buffer_guest_id in buffer_flow.drain_in_flight() {
         let (Some(interface), Some(_host_id)) = (objects.interface(buffer_guest_id), objects.host_id(buffer_guest_id))
         else {
@@ -2065,10 +1963,9 @@ async fn synthesize_grab_releases(gtk: &mut Conn, objects: &ShadowTable, grabs: 
 /// rather than the whole session tearing down. While frozen, this
 /// retries connecting to `compositor_socket_path` in the background; once
 /// that succeeds, `recover_state_after_reconnect` re-fetches globals and
-/// recreates tracked surfaces/toplevels before the connection unfreezes
-/// and relaying resumes. Grab/buffer bookkeeping across a reconnect is
-/// separate, not-yet-wired-in work (implementation-constraints.md's other
-/// two "On Server Reconnect"-adjacent rules).
+/// recreates tracked surfaces/toplevels, then `synthesize_grab_releases`
+/// clears any stuck pointer/keyboard grab, before the connection
+/// unfreezes and relaying resumes.
 pub async fn run_connection(
     gtk_stream: UnixStream,
     compositor_stream: UnixStream,
@@ -2155,25 +2052,19 @@ pub async fn run_connection(
                         // dead, not just that recovery came up short (see
                         // that function's own doc comment on individual
                         // steps degrading gracefully instead of returning
-                        // Err). Found live 2026-08-03 (see
-                        // plan-desktop-resilience.md): the old code
-                        // unfroze anyway here, resuming relaying on a
-                        // connection already known to be broken -- the
-                        // next poll would immediately see another EOF and
-                        // re-freeze, but real client traffic could race
-                        // into that brief unfrozen window and get
-                        // silently dropped/misrouted instead of safely
-                        // buffered. Stay frozen; the select loop's own
+                        // Err). Stay frozen rather than unfreezing here:
+                        // resuming relaying on a connection already known
+                        // to be broken lets real client traffic race into
+                        // a brief unfrozen window and get silently
+                        // dropped/misrouted, instead of safely buffered,
+                        // before the next poll sees another EOF and
+                        // re-freezes. The select loop's own
                         // `reconnect_with_backoff, if frozen` arm retries
-                        // on the next iteration. This is also exactly the
-                        // race a fresh compositor's stale-socket cleanup
-                        // window can trigger: `reconnect_with_backoff`'s
-                        // `connect()` can succeed against a socket file
-                        // the new compositor hasn't finished
-                        // unlinking/rebinding yet, so a short sleep here
-                        // (matching reconnect_with_backoff's own 250ms
-                        // between failed connect() attempts) avoids
-                        // hot-looping through that same window.
+                        // next iteration. The short sleep matches
+                        // `reconnect_with_backoff`'s own 250ms between
+                        // failed `connect()` attempts, avoiding a hot loop
+                        // against a fresh compositor's socket file before
+                        // it's finished unlinking/rebinding.
                         warn!("state recovery after reconnect failed partway, staying frozen and retrying: {e:?}");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     }

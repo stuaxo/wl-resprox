@@ -1,16 +1,9 @@
 //! Permanent, opt-in sequence recorder: dumps every message the relay
 //! processes (forwarded, dropped-unknown, or dropped-parse-error) to a
-//! file, one line per message, for post-mortem analysis of a live run.
-//!
-//! Grew out of an ad-hoc `tracing::debug!` hex dump used manually while
-//! chasing the intermittent "invalid arguments for wl_registry#2.bind"
-//! failure against a real compositor (see the 2026-07-30 entries in
-//! docs/debugging-notes.md). That worked, but only if you remembered to
-//! set `RUST_LOG=debug` *before* the failure happened and were watching
-//! the log live. This is the same idea made permanent and always
-//! available: opt in with an env var, get a fixed artifact you can
-//! inspect (or diff against a known-good run, e.g. from
-//! tests/integration.rs) after the fact instead of re-triggering live.
+//! file, one line per message, for post-mortem analysis of a live run --
+//! a fixed artifact you can inspect (or diff against a known-good run,
+//! e.g. from tests/integration.rs) after the fact, instead of needing
+//! `RUST_LOG=debug` already running before an intermittent failure hits.
 //!
 //! Recording has a real cost (a line written and flushed per message), so
 //! it's off by default -- set `WAYLAND_PROXY_RECORD=/path/to/file` to

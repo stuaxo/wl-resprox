@@ -1,52 +1,26 @@
-//! Tracks `wl_callback`s that are still awaiting their `done` event,
-//! purely so a reconnect can answer any that the OLD compositor died
-//! holding a promise on. Two independent request shapes create such a
-//! callback and both are tracked here, since neither's `done` arriving
-//! late is survivable for a real client:
+//! Tracks `wl_callback`s still awaiting their `done`, so a reconnect can
+//! answer any the old compositor died holding a promise on. Recreating
+//! the objects a callback depends on isn't enough on its own -- the
+//! promise itself was never fulfilled, and two distinct requests create a
+//! callback a client can block on forever if it isn't:
 //!
-//! - `wl_surface.frame()` -- found live 2026-08-04, one step past the
-//!   `wl_buffer.release` synthesis fix (`buffer_flow.rs`) for the same
-//!   live validation run: a real gtk4-demo-like client's LAST `frame()`
-//!   before a crash reached the old compositor just fine (successfully
-//!   forwarded, no drop, no synthesis -- the `relay_ready_messages`
-//!   branch that already handles a *dropped* frame(), because the
-//!   surface itself was momentarily untranslatable during the narrow
-//!   post-`bump_generation()` recovery window, never fires for this case
-//!   at all) -- but the compositor died before ever sending back the
-//!   matching `wl_callback.done`. Recreating every object involved
-//!   (surface, buffer, even a synthesized `wl_buffer.release` for the
-//!   buffer that commit was carrying) still left the client stalled
-//!   forever, since GTK's own frame clock blocks specifically on that one
-//!   `wl_callback.done`, and nothing about object recreation answers a
-//!   promise that was never fulfilled in the first place.
-//! - `wl_display.sync()` -- found live 2026-08-04 chasing ADR-0008's
-//!   dmabuf client-wedge bug: Mesa's GL renderer sends one of these after
-//!   *every* `wl_surface.commit()` on its own private queue, as an
-//!   internal commit-confirmation roundtrip, and blocks (a plain,
-//!   uninterruptible `poll()`, confirmed via `/proc/<pid>/stack` and a
-//!   `WAYLAND_DEBUG=1` trace on a real hang) until that specific
-//!   callback's `done` arrives. The one sent immediately before a crash
-//!   reaches the old compositor the same way a `frame()` can -- forwarded
-//!   fine, never answered -- and this tracker had no hook for it at all
-//!   (only `wl_surface.frame()` was tracked), so recreating everything
-//!   else still left the client permanently wedged on this one
-//!   unanswered `sync()`.
+//! - `wl_surface.frame()`: GTK's frame clock blocks on this one's `done`
+//!   before rendering again.
+//! - `wl_display.sync()`: Mesa's GL renderer sends one after every
+//!   `wl_surface.commit()` on its own private queue, as an internal
+//!   commit-confirmation roundtrip, and blocks uninterruptibly (a plain
+//!   `poll()`, not dispatching anything else) until it's answered.
 //!
-//! Same "unanswered promise" class as `buffer_flow.rs`, and the
-//! *dropped*-frame() case already handled inline in `relay_ready_messages`
-//! -- both entries here are the variant where a callback-creating request
-//! was neither dropped nor answered, just abandoned mid-flight.
+//! Same "unanswered promise" shape as `buffer_flow.rs`'s
+//! `wl_buffer.release` tracking.
 
 use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct PendingFrameTracker {
-    /// Guest ids of `wl_callback` objects created by a `wl_surface.frame()`
-    /// or `wl_display.sync()` that was forwarded (or dropped only because
-    /// the connection was frozen, not because the sender was
-    /// untranslatable -- that case synthesizes done+delete_id immediately
-    /// and never reaches this tracker at all) with no `done` event seen
-    /// since.
+    /// Guest ids of `wl_callback`s created by `frame()`/`sync()` with no
+    /// `done` seen since. An untranslatable sender is answered immediately
+    /// elsewhere and never reaches this set at all.
     awaiting_done: HashSet<u32>,
 }
 
