@@ -372,6 +372,7 @@ fn main() {
                     println!("wl_data_source.cancelled fired right after set_selection -- REJECTED");
                     rejected = true;
                 }
+                (SOURCE_ID, 1) => answer_data_source_send(payload, &mut fds),
                 (18, 0) => {
                     let n = consumed;
                     buf.drain(..n);
@@ -402,22 +403,7 @@ fn main() {
             let header = wire::MessageHeader::parse(msg).unwrap();
             let payload = &msg[wire::HEADER_LEN..];
             match (header.sender_id, header.opcode) {
-                (SOURCE_ID, 1) => {
-                    let (mime, _) = read_str(payload, 0).unwrap_or_default();
-                    if let Some(fd) = fds.pop_front() {
-                        // This fd is a plain pipe (created by the pasting
-                        // client / mutter, not our Wayland socket) --
-                        // write() directly, not sendmsg/SCM_RIGHTS.
-                        println!("EVENT: wl_data_source.send(mime_type={mime:?}) -- answering with marker bytes, fd={}", fd.as_raw_fd());
-                        let mut pipe = std::fs::File::from(fd);
-                        match pipe.write_all(CLIPBOARD_MARKER) {
-                            Ok(()) => println!("  wrote {} bytes", CLIPBOARD_MARKER.len()),
-                            Err(e) => println!("  write FAILED: {e}"),
-                        }
-                    } else {
-                        println!("EVENT: wl_data_source.send(mime_type={mime:?}) -- NO FD IN QUEUE");
-                    }
-                }
+                (SOURCE_ID, 1) => answer_data_source_send(payload, &mut fds),
                 (SOURCE_ID, 2) => println!("EVENT: wl_data_source.cancelled (late)"),
                 _ => {}
             }
@@ -426,6 +412,29 @@ fn main() {
         }
     }
     println!("done");
+}
+
+/// Answers a real wl_data_source.send by writing the marker bytes into
+/// its fd. Called from both the post-set_selection confirm loop and the
+/// later hold loop -- send() can arrive during either (Mutter's own
+/// eager-fetch fires immediately, often before the confirm loop's own
+/// sync completes), and missing it in the confirm loop leaves the fd
+/// unanswered, which -- when routed through wl-resprox's tee -- means its
+/// own pump task waits forever for a write that never comes.
+fn answer_data_source_send(payload: &[u8], fds: &mut VecDeque<OwnedFd>) {
+    let (mime, _) = read_str(payload, 0).unwrap_or_default();
+    let Some(fd) = fds.pop_front() else {
+        println!("EVENT: wl_data_source.send(mime_type={mime:?}) -- NO FD IN QUEUE");
+        return;
+    };
+    // Plain pipe (created by the pasting client / Mutter, not our
+    // Wayland socket) -- write() directly, not sendmsg/SCM_RIGHTS.
+    println!("EVENT: wl_data_source.send(mime_type={mime:?}) -- answering with marker bytes, fd={}", fd.as_raw_fd());
+    let mut pipe = std::fs::File::from(fd);
+    match pipe.write_all(CLIPBOARD_MARKER) {
+        Ok(()) => println!("  wrote {} bytes", CLIPBOARD_MARKER.len()),
+        Err(e) => println!("  write FAILED: {e}"),
+    }
 }
 
 /// Best-effort opaque fill so the mapped window isn't blank/transparent;
