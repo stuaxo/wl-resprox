@@ -90,8 +90,13 @@ async fn main() -> Result<()> {
                         async move {
                             match UnixStream::connect(&target_path).await {
                                 Ok(compositor_stream) => {
-                                    if let Err(e) =
-                                        run_connection(gtk_stream, compositor_stream, target_path).await
+                                    if let Err(e) = run_connection(
+                                        gtk_stream,
+                                        compositor_stream,
+                                        target_path,
+                                        client_pid,
+                                    )
+                                    .await
                                     {
                                         error!("proxy session ended with error: {e:?}");
                                     }

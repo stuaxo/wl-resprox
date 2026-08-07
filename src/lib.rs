@@ -17,6 +17,7 @@ pub mod buffer_flow;
 pub mod fdsocket;
 pub mod grab_state;
 pub mod interfaces;
+pub mod notify;
 pub mod pending_frames;
 pub mod recorder;
 pub mod recreation;
@@ -1970,6 +1971,7 @@ pub async fn run_connection(
     gtk_stream: UnixStream,
     compositor_stream: UnixStream,
     compositor_socket_path: std::path::PathBuf,
+    client_pid: Option<i32>,
 ) -> Result<()> {
     let mut gtk = Conn::new(gtk_stream);
     let mut host = Conn::new(compositor_stream);
@@ -2043,6 +2045,9 @@ pub async fn run_connection(
                         }
                         frozen = false;
                         info!("connection unfrozen, relaying resumed");
+                        // Detached: a slow/absent notification daemon must
+                        // not delay relaying, which has already resumed.
+                        tokio::spawn(notify::notify_recovered(client_pid));
                     }
                     Err(e) => {
                         // Every error this function can return -- a failed

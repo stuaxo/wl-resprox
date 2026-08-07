@@ -85,5 +85,10 @@ clap = { version = "4", features = ["derive", "env"] }
 # sommelier-rs and waypipe both use for this.
 nix = { version = "0.31.3", features = ["socket", "fs", "uio", "inotify", "signal", "poll"] }
 
+# Desktop notification on crash recovery (org.freedesktop.Notifications),
+# over the session bus. "tokio" feature: runs on our own runtime instead
+# of pulling in async-io as a second one.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
 [dev-dependencies]
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }

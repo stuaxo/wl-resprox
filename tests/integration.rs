@@ -347,7 +347,7 @@ async fn proxy_survives_rapid_bind_burst_from_a_real_client() {
             .await
             .expect("proxy connect to host");
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_stream, compositor_stream, host_socket_path_for_proxy).await
+            wayland_proxy::run_connection(gtk_stream, compositor_stream, host_socket_path_for_proxy, None).await
         {
             eprintln!("run_connection ended with error: {e:?}");
         }
@@ -482,7 +482,7 @@ async fn shadow_table_translates_new_id_and_delete_id_round_trip() {
         // Never used -- this test never triggers a freeze/reconnect --
         // but run_connection needs a path unconditionally.
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
-        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path).await {
+        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None).await {
             eprintln!("run_connection ended with error: {e:?}");
         }
     });
@@ -547,7 +547,7 @@ async fn delete_id_for_an_untracked_host_id_is_dropped_not_forwarded() {
 
     tokio::spawn(async move {
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
-        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path).await {
+        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None).await {
             eprintln!("run_connection ended with error: {e:?}");
         }
     });
@@ -610,7 +610,7 @@ async fn reconnect_rebinds_globals_at_the_clients_originally_requested_version()
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -747,7 +747,7 @@ async fn create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -872,7 +872,7 @@ async fn frame_request_during_the_recovery_window_gets_a_synthesized_done() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1047,7 +1047,7 @@ async fn proxy_reconnects_to_a_restarted_compositor() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1192,7 +1192,7 @@ async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1460,7 +1460,7 @@ async fn stale_wl_buffer_release_is_dropped_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1634,7 +1634,7 @@ async fn stale_wl_buffer_attach_is_dropped_not_forwarded_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1841,7 +1841,7 @@ async fn stale_wl_buffer_destroy_synthesizes_delete_id_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1959,7 +1959,7 @@ async fn grab_state_is_released_before_traffic_resumes_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2204,7 +2204,7 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2430,7 +2430,7 @@ async fn in_flight_buffer_gets_a_synthesized_release_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2614,7 +2614,7 @@ async fn frame_forwarded_before_a_crash_gets_a_synthesized_done_after_reconnect(
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2738,7 +2738,7 @@ async fn dmabuf_buffer_recipe_replays_correctly_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2955,7 +2955,7 @@ async fn dropped_new_id_message_does_not_burn_a_host_id() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
