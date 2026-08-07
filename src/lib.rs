@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use wayland_backend::protocol::{ArgumentType, Interface, MessageDesc};
 
 pub mod buffer_flow;
+pub mod clipboard;
 pub mod fdsocket;
 pub mod grab_state;
 pub mod interfaces;
@@ -258,6 +259,7 @@ async fn relay_ready_messages(
     buffer_flow: &mut BufferFlowTracker,
     pending_frames: &mut PendingFrameTracker,
     pending_dmabuf_planes: &mut std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)>,
+    clipboard_cache: &clipboard::SharedClipboardCache,
     direction: Direction,
 ) -> Result<()> {
     'relay: loop {
@@ -997,6 +999,27 @@ async fn relay_ready_messages(
                             "{}.{} declares a fd argument that never arrived",
                             interface.name, desc.name
                         ),
+                    }
+                }
+
+                // required for clipboard copy: wl_data_source.send's fd is
+                // the pipe the client writes the copied bytes into: swap
+                // it for a pipe of our own and tee the bytes into a cache
+                // as they go by, so a later crash or the client quitting
+                // doesn't lose them (see docs/adr/adr-0009-clipboard-
+                // persistence.md). Real fd still gets every byte, just
+                // relayed through us instead of handed straight to the
+                // client.
+                if matches!(direction, Direction::HostToClient) && interface.name == "wl_data_source" && desc.name == "send" {
+                    if let Some(mime_type) = wire::read_str(&msg[wire::HEADER_LEN..], 0).map(|(s, _)| s) {
+                        if clipboard::is_cacheable_mime(&mime_type) {
+                            if let Some(real_fd) = fds.pop() {
+                                match clipboard::start_tee(real_fd, mime_type, clipboard_cache.clone()) {
+                                    Some(client_facing_fd) => fds.push(client_facing_fd),
+                                    None => warn!("clipboard tee setup failed -- not forwarding a substitute fd"),
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1972,6 +1995,12 @@ pub async fn run_connection(
     compositor_stream: UnixStream,
     compositor_socket_path: std::path::PathBuf,
     client_pid: Option<i32>,
+    // Process-wide, shared across every client's own run_connection --
+    // required for clipboard copy to survive the copying client quitting,
+    // not just a compositor crash while it's still running (see
+    // docs/adr/adr-0009-clipboard-persistence.md). A per-connection cache
+    // would die with this task, defeating that.
+    clipboard_cache: clipboard::SharedClipboardCache,
 ) -> Result<()> {
     let mut gtk = Conn::new(gtk_stream);
     let mut host = Conn::new(compositor_stream);
@@ -2000,7 +2029,7 @@ pub async fn run_connection(
                     }
                     Ok(_) => {
                         let dst = if frozen { None } else { Some(&mut host) };
-                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, Direction::ClientToHost).await?;
+                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, Direction::ClientToHost).await?;
                     }
                     Err(e) => {
                         info!("GTK client disconnected: {e}");
@@ -2015,7 +2044,7 @@ pub async fn run_connection(
                         frozen = true;
                     }
                     Ok(_) => {
-                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, Direction::HostToClient).await?;
+                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, Direction::HostToClient).await?;
                     }
                     Err(e) => {
                         info!("compositor connection lost ({e}) -- freezing, GTK client stays connected");

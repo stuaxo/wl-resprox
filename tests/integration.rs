@@ -347,7 +347,7 @@ async fn proxy_survives_rapid_bind_burst_from_a_real_client() {
             .await
             .expect("proxy connect to host");
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_stream, compositor_stream, host_socket_path_for_proxy, None).await
+            wayland_proxy::run_connection(gtk_stream, compositor_stream, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new()).await
         {
             eprintln!("run_connection ended with error: {e:?}");
         }
@@ -482,7 +482,7 @@ async fn shadow_table_translates_new_id_and_delete_id_round_trip() {
         // Never used -- this test never triggers a freeze/reconnect --
         // but run_connection needs a path unconditionally.
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
-        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None).await {
+        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, wayland_proxy::clipboard::ClipboardCache::new()).await {
             eprintln!("run_connection ended with error: {e:?}");
         }
     });
@@ -547,7 +547,7 @@ async fn delete_id_for_an_untracked_host_id_is_dropped_not_forwarded() {
 
     tokio::spawn(async move {
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
-        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None).await {
+        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, wayland_proxy::clipboard::ClipboardCache::new()).await {
             eprintln!("run_connection ended with error: {e:?}");
         }
     });
@@ -610,7 +610,7 @@ async fn reconnect_rebinds_globals_at_the_clients_originally_requested_version()
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -747,7 +747,7 @@ async fn create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -872,7 +872,7 @@ async fn frame_request_during_the_recovery_window_gets_a_synthesized_done() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1047,7 +1047,7 @@ async fn proxy_reconnects_to_a_restarted_compositor() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1192,7 +1192,7 @@ async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1460,7 +1460,7 @@ async fn stale_wl_buffer_release_is_dropped_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1634,7 +1634,7 @@ async fn stale_wl_buffer_attach_is_dropped_not_forwarded_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1841,7 +1841,7 @@ async fn stale_wl_buffer_destroy_synthesizes_delete_id_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1959,7 +1959,7 @@ async fn grab_state_is_released_before_traffic_resumes_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2204,7 +2204,7 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2430,7 +2430,7 @@ async fn in_flight_buffer_gets_a_synthesized_release_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2614,7 +2614,7 @@ async fn frame_forwarded_before_a_crash_gets_a_synthesized_done_after_reconnect(
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2738,7 +2738,7 @@ async fn dmabuf_buffer_recipe_replays_correctly_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2955,7 +2955,7 @@ async fn dropped_new_id_message_does_not_burn_a_host_id() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None)
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -3051,4 +3051,154 @@ async fn dropped_new_id_message_does_not_burn_a_host_id() {
     );
 
     host_listener_task.abort();
+}
+
+/// Reads one message off `stream`, also returning any fds that rode
+/// alongside it via `SCM_RIGHTS` -- plain `AsyncReadExt::read` (as
+/// `read_one_message` uses) silently discards ancillary data, which loses
+/// exactly the fd a clipboard-tee test needs to inspect. Same
+/// `try_io`/`recv_with_fds` pattern as `Conn::fill` and
+/// `serve_fake_compositor_life` use for the same reason.
+async fn read_one_message_with_fds(stream: &mut tokio::net::UnixStream) -> (Vec<u8>, Vec<OwnedFd>) {
+    use std::os::fd::AsRawFd;
+    let mut buf = Vec::new();
+    let mut fds = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some((msg, _consumed)) = wayland_proxy::wire::take_message(&buf) {
+            return (msg.to_vec(), fds);
+        }
+        stream.readable().await.expect("readable");
+        let raw_fd = stream.as_raw_fd();
+        match stream.try_io(tokio::io::Interest::READABLE, || {
+            wayland_proxy::fdsocket::recv_with_fds(raw_fd, &mut tmp).map_err(std::io::Error::from)
+        }) {
+            Ok((0, _)) => panic!("closed before a full message arrived"),
+            Ok((n, new_fds)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                fds.extend(new_fds);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+}
+
+/// End-to-end proof of the clipboard tee (see docs/adr/adr-0009-clipboard-
+/// persistence.md and src/clipboard.rs): a fake compositor sends
+/// `wl_data_source.send` carrying a real pipe fd, exactly as Mutter does
+/// once a client has set itself as clipboard owner. The client must
+/// receive a *different* fd than the one the compositor sent (the tee
+/// substitutes its own pipe); writing into that substitute fd must both
+/// reach the real one AND end up in the shared clipboard cache.
+#[tokio::test]
+async fn wl_data_source_send_is_teed_into_the_clipboard_cache() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let (host_proxy_side, mut host_test_side) = tokio::net::UnixStream::pair().expect("pair");
+
+    let cache = wayland_proxy::clipboard::ClipboardCache::new();
+    let cache_for_proxy = cache.clone();
+    tokio::spawn(async move {
+        let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
+        if let Err(e) =
+            wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, cache_for_proxy)
+                .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    // get_registry(2), then bind wl_data_device_manager(name=1) -> guest id
+    // 3 -- no wl_registry.global roundtrip needed, resolve_child_interface
+    // only needs the interface name string bind() itself carries.
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    gtk_test_side.write_all(&wire::build_message(1, 1, &p)).await.expect("write get_registry");
+    let _ = read_one_message(&mut host_test_side).await; // drain forwarded get_registry
+
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 1);
+    wire::put_str(&mut p, "wl_data_device_manager");
+    wire::put_u32(&mut p, 3);
+    wire::put_u32(&mut p, 3); // new_id (guest) -- wl_data_device_manager
+    gtk_test_side.write_all(&wire::build_message(2, 0, &p)).await.expect("write bind");
+    let _ = read_one_message(&mut host_test_side).await; // drain forwarded bind
+
+    // wl_data_device_manager(3).create_data_source(new_id=4) -- learn the
+    // HOST id the proxy allocated, since the fake compositor below has to
+    // address its send() event to that, not the guest one.
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 4); // new_id (guest) -- wl_data_source
+    gtk_test_side.write_all(&wire::build_message(3, 0, &p)).await.expect("write create_data_source");
+    let forwarded = read_one_message(&mut host_test_side).await;
+    let host_data_source_id = u32::from_ne_bytes(forwarded[8..12].try_into().unwrap());
+
+    // The fake compositor's own pipe -- exactly what Mutter would create:
+    // it keeps the read end, hands the write end to the (source) client via
+    // send()'s fd argument. required for clipboard copy: this is the real
+    // fd the tee must relay bytes into unchanged.
+    let (mutter_read, mutter_write) = nix::unistd::pipe().expect("create mutter-side pipe");
+
+    const MIME_TYPE: &str = "text/plain";
+    let mut p = Vec::new();
+    wire::put_str(&mut p, MIME_TYPE);
+    let send_msg = wire::build_message(host_data_source_id, 1, &p); // wl_data_source.send
+    wayland_proxy::fdsocket::send_with_fds(
+        std::os::fd::AsRawFd::as_raw_fd(&host_test_side),
+        &send_msg,
+        &[std::os::fd::AsRawFd::as_raw_fd(&mutter_write)],
+    )
+    .expect("send wl_data_source.send with a real fd");
+    drop(mutter_write); // our copy: sendmsg already dup'd it onto the wire
+
+    // Client's side: must receive a DIFFERENT fd than mutter_write's
+    // (the tee's whole point), carrying the same mime_type unchanged.
+    let (client_msg, mut client_fds) = tokio::time::timeout(Duration::from_secs(5), read_one_message_with_fds(&mut gtk_test_side))
+        .await
+        .expect("timed out waiting for wl_data_source.send to reach the client");
+    let client_header = wire::MessageHeader::parse(&client_msg).expect("valid header");
+    assert_eq!(client_header.opcode, 1, "wl_data_source.send event opcode");
+    let (received_mime, _) = wire::read_str(&client_msg[wire::HEADER_LEN..], 0).expect("mime_type string");
+    assert_eq!(received_mime, MIME_TYPE);
+    assert_eq!(client_fds.len(), 1, "send() carries exactly one fd");
+    let client_facing_fd = client_fds.remove(0);
+
+    // Client writes the clipboard content into its (substitute) fd, then
+    // closes it -- exactly what a real copying app's toolkit does once
+    // it's written everything for this mime type.
+    const CONTENT: &[u8] = b"tee'd clipboard content";
+    {
+        let mut pipe = std::fs::File::from(client_facing_fd);
+        std::io::Write::write_all(&mut pipe, CONTENT).expect("client write into substitute fd");
+    } // dropped here -- closes the fd, signalling EOF to the tee's pump
+
+    // Real fd must receive the SAME bytes, unmodified, then EOF -- proves
+    // the relay side of the tee, not just that a substitute fd was handed
+    // out. read_to_end() blocks (this is a plain pipe, no async wrapper
+    // needed for a test) -- spawn_blocking so it doesn't starve the
+    // single-threaded test runtime the tee's own pump() task needs to run
+    // on to ever close its end and unblock this read.
+    let relayed = tokio::task::spawn_blocking(move || {
+        let mut real_side = std::fs::File::from(mutter_read);
+        let mut relayed = Vec::new();
+        std::io::Read::read_to_end(&mut real_side, &mut relayed).expect("read relayed bytes");
+        relayed
+    })
+    .await
+    .expect("spawn_blocking join");
+    assert_eq!(relayed, CONTENT, "the real fd must see exactly what the client wrote, byte for byte");
+
+    // By the time the real fd's read hit EOF, ClipboardCache::store already
+    // ran in the same task, strictly before it (see clipboard.rs's pump():
+    // store() happens before `to_host` drops, which is what closes
+    // mutter_read's peer) -- no extra sleep/retry needed here.
+    assert_eq!(
+        cache.get(MIME_TYPE).as_deref(),
+        Some(CONTENT),
+        "the tee must cache the same bytes it relayed"
+    );
 }
