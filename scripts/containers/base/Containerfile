@@ -37,10 +37,24 @@ ENV DEBIAN_FRONTEND=noninteractive
 # psmisc (fuser) and iproute2 (ss): not needed by the proxy or any
 # compositor itself, but scripts/diagnose.sh depends on both for
 # live/stale socket detection and XWayland-slot ownership.
+#
+# python3-gi/gir1.2-gtk-3.0 (2026-08-07): the one deliberate exception to
+# "none of these Containerfiles install python3" (see the project-layout
+# comment in scripts/README.md) -- needed for scripts/gtk/gtk3_popup.py,
+# which exercises xdg_popup/grab (a right-click-style context menu).
+# gtk-3-examples' own gtk3-demo/gtk3-widget-factory binaries have real
+# popup menus too, but nothing triggers them without a real mouse click,
+# which a headless container doesn't have -- gtk3_popup.py auto-triggers
+# its own menu from a real focus-in event instead (see its own doc
+# comment), which needs GTK's Python bindings to script.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
     libgtk-4-dev \
     gtk-4-examples \
+    libgtk-3-0t64 \
+    gtk-3-examples \
+    python3-gi \
+    gir1.2-gtk-3.0 \
     libwayland-dev \
     wayland-utils \
     dbus \
