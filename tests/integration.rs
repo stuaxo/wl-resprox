@@ -3697,3 +3697,407 @@ async fn concurrent_reconnects_dont_mix_up_toplevel_identity() {
          ZapZap's app_id, exactly the shape of the live symptom (wrong icon in the overview)"
     );
 }
+
+/// Plays "compositor" for one paste, end to end: sends
+/// `wl_data_device.data_offer` + `wl_data_offer.offer` +
+/// `wl_data_device.selection` to `host` (so the real proxy forwards a
+/// fresh offer to `client`), reads `client`'s resulting
+/// `wl_data_offer.receive(mime, fd)` request back off `host`, bridges
+/// that fd onto `source_host`/`source_host_id`'s own connection as a
+/// real `wl_data_source.send` event (exactly what Mutter does -- the
+/// data never touches the compositor, it's relayed peer-to-peer through
+/// whichever fd the pasting client handed over), then blocking-reads the
+/// bytes that eventually arrive back on `client`'s own kept pipe read
+/// end. `offer_host_id` just needs to be unique on this connection
+/// generation -- picked far from the low sequential ids real requests
+/// use so it never collides with one.
+async fn paste_via_compositor(
+    host: &mut tokio::net::UnixStream,
+    client: &mut tokio::net::UnixStream,
+    device_host_id: u32,
+    offer_host_id: u32,
+    mime_type: &str,
+    source_host: &mut tokio::net::UnixStream,
+    source_host_id: u32,
+) -> Vec<u8> {
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, offer_host_id);
+    out.extend(wire::build_message(device_host_id, 0, &p)); // wl_data_device.data_offer
+    p.clear();
+    wire::put_str(&mut p, mime_type);
+    out.extend(wire::build_message(offer_host_id, 0, &p)); // wl_data_offer.offer
+    p.clear();
+    wire::put_u32(&mut p, offer_host_id);
+    out.extend(wire::build_message(device_host_id, 5, &p)); // wl_data_device.selection
+    host.write_all(&out).await.expect("write data_offer+offer+selection");
+
+    // Client observes: data_offer(new guest id), offer(mime), selection(id).
+    let msgs = read_n_messages(client, 3).await;
+    let offer_guest_id = u32::from_ne_bytes(msgs[0][wire::HEADER_LEN..wire::HEADER_LEN + 4].try_into().unwrap());
+    let header = wire::MessageHeader::parse(&msgs[1]).unwrap();
+    assert_eq!(header.sender_id, offer_guest_id, "offer() must target the just-created data_offer");
+    let (offered_mime, _) = wire::read_str(&msgs[1][wire::HEADER_LEN..], 0).unwrap();
+    assert_eq!(offered_mime, mime_type);
+
+    // Client "pastes": creates its own pipe, keeps the read end, sends
+    // the write end via wl_data_offer(offer_guest_id).receive(mime, fd)
+    // -- exactly what a real pasting client does.
+    let (paste_read, paste_write) = nix::unistd::pipe().expect("create paste pipe");
+    let mut p = Vec::new();
+    wire::put_str(&mut p, mime_type);
+    wayland_proxy::fdsocket::send_with_fds(
+        std::os::fd::AsRawFd::as_raw_fd(client),
+        &wire::build_message(offer_guest_id, 1, &p), // wl_data_offer.receive -- opcode 1, NOT 0 (0 is accept)
+        &[std::os::fd::AsRawFd::as_raw_fd(&paste_write)],
+    )
+    .expect("send receive()");
+    drop(paste_write); // our copy: sendmsg already dup'd it onto the wire
+
+    // Compositor relays the request: reads receive()'s fd back off `host`.
+    let (_msg, mut fds) = read_one_message_with_fds(host).await;
+    let received_fd = fds.pop().expect("receive() must carry exactly one fd");
+
+    // Compositor hands that fd to the source, mirroring Mutter exactly:
+    // the data flows source-client -> pasting-client, never through the
+    // compositor itself.
+    let mut p = Vec::new();
+    wire::put_str(&mut p, mime_type);
+    wayland_proxy::fdsocket::send_with_fds(
+        std::os::fd::AsRawFd::as_raw_fd(source_host),
+        &wire::build_message(source_host_id, 1, &p), // wl_data_source.send
+        &[std::os::fd::AsRawFd::as_raw_fd(&received_fd)],
+    )
+    .expect("send wl_data_source.send");
+    drop(received_fd);
+
+    // Whatever answers this (a real client's own write, or
+    // attempt_clipboard_splice's cache-backed answer for a reclaimed
+    // synthetic source) eventually closes the real fd, giving EOF here.
+    tokio::task::spawn_blocking(move || {
+        let mut f = std::fs::File::from(paste_read);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut bytes).expect("read pasted bytes");
+        bytes
+    })
+    .await
+    .expect("spawn_blocking join")
+}
+
+/// The other half of a *real* (non-reclaimed) paste: reads the
+/// wl_data_source.send the proxy's tee forwards to a genuine source
+/// client (client_side is that client's own gtk-facing socket) and
+/// writes real content into the substitute fd it hands back -- exactly
+/// what a real copying app's toolkit does. Must run concurrently with
+/// paste_via_compositor (via tokio::join!), not before or after it:
+/// paste_via_compositor's own final read blocks until this write (and
+/// the resulting close) actually happens.
+async fn write_real_source_content(client_side: &mut tokio::net::UnixStream, content: &[u8]) {
+    let (_msg, mut fds) = read_one_message_with_fds(client_side).await;
+    let fd = fds.pop().expect("wl_data_source.send must carry a fd");
+    let mut pipe = std::fs::File::from(fd);
+    std::io::Write::write_all(&mut pipe, content).expect("write real source content");
+}
+
+/// End-to-end proof of the exact scenario a hand-designed integration
+/// test for this would use: two separate real clients (not a fake
+/// compositor standing in for one side, per the earlier, narrower tee/
+/// splice tests). Copy from A, paste into B; crash the shared
+/// compositor; paste the ORIGINAL text into B again (proving the
+/// reclaim survives, not just that a mime type got cached); copy NEW
+/// text from A; paste that into B too (proving normal copy/paste still
+/// works cleanly afterward, and that the reclaimed synthetic source's
+/// `cancelled` handling -- untested until now -- doesn't leave anything
+/// stuck).
+#[tokio::test]
+async fn two_real_clients_copy_paste_survives_a_crash_and_keeps_working_after() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const MIME_TYPE: &str = "text/plain";
+    const ORIGINAL_TEXT: &[u8] = b"original clipboard content, copied before the crash";
+    const NEW_TEXT: &[u8] = b"new clipboard content, copied after recovery";
+
+    let cache = wayland_proxy::clipboard::ClipboardCache::new();
+
+    // --- Client A: connects, binds wl_seat+get_pointer (needed later to
+    // trigger its own reclaim), wl_data_device_manager, and copies
+    // ORIGINAL_TEXT. Separate host socket from B's -- see
+    // run_client_reconnect_scenario's own doc comment for why that's not
+    // a loss of realism here: this test hand-implements every bit of
+    // compositor-side clipboard brokering regardless, so nothing depends
+    // on A and B sharing one literal listener.
+    let a_tmp = std::env::temp_dir().join(format!("wl-proxy-clipboard-2client-a-{}", std::process::id()));
+    std::fs::create_dir_all(&a_tmp).expect("create temp dir");
+    let a_host_path = a_tmp.join("host.sock");
+    let _ = std::fs::remove_file(&a_host_path);
+    let a_listener = tokio::net::UnixListener::bind(&a_host_path).expect("bind A host");
+    let (a_gtk_proxy, mut a_gtk_test) = tokio::net::UnixStream::pair().expect("pair");
+    let a_first_conn = tokio::net::UnixStream::connect(&a_host_path).await.expect("A connect");
+    let (mut a_host1, _) = a_listener.accept().await.expect("accept A host1");
+    {
+        let path = a_host_path.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let _ = wayland_proxy::run_connection(a_gtk_proxy, a_first_conn, path, None, cache).await;
+        });
+    }
+
+    // get_registry(2), bind wl_seat(guest=3)->host3, get_pointer(guest=4)
+    // ->host4, bind wl_data_device_manager(guest=5)->host5,
+    // create_data_source(guest=6)->host6, offer, get_data_device
+    // (guest=7)->host7, set_selection. Host ids are deterministic (the
+    // proxy's allocator starts at 2, increments per new_id in send
+    // order) -- see the earlier clipboard tests' own comments on this.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p)); // get_registry
+    p.clear();
+    wire::put_u32(&mut p, 1);
+    wire::put_str(&mut p, "wl_seat");
+    wire::put_u32(&mut p, 8);
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(2, 0, &p)); // bind wl_seat -> host3
+    p.clear();
+    wire::put_u32(&mut p, 4);
+    out.extend(wire::build_message(3, 0, &p)); // wl_seat.get_pointer -> host4
+    p.clear();
+    wire::put_u32(&mut p, 2);
+    wire::put_str(&mut p, "wl_data_device_manager");
+    wire::put_u32(&mut p, 3);
+    wire::put_u32(&mut p, 5);
+    out.extend(wire::build_message(2, 0, &p)); // bind ddm -> host5
+    p.clear();
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(5, 0, &p)); // create_data_source -> host6
+    p.clear();
+    wire::put_str(&mut p, MIME_TYPE);
+    out.extend(wire::build_message(6, 0, &p)); // offer
+    p.clear();
+    wire::put_u32(&mut p, 7);
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(5, 1, &p)); // get_data_device -> host7
+    p.clear();
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 1);
+    out.extend(wire::build_message(7, 1, &p)); // set_selection
+    a_gtk_test.write_all(&out).await.expect("write A's first-life burst");
+    let _ = read_n_messages(&mut a_host1, 8).await; // sync barrier -- see earlier tests' identical reasoning
+
+    // --- Client B: connects, binds wl_seat + wl_data_device_manager +
+    // get_data_device. No copying -- B only ever pastes.
+    let b_tmp = std::env::temp_dir().join(format!("wl-proxy-clipboard-2client-b-{}", std::process::id()));
+    std::fs::create_dir_all(&b_tmp).expect("create temp dir");
+    let b_host_path = b_tmp.join("host.sock");
+    let _ = std::fs::remove_file(&b_host_path);
+    let b_listener = tokio::net::UnixListener::bind(&b_host_path).expect("bind B host");
+    let (b_gtk_proxy, mut b_gtk_test) = tokio::net::UnixStream::pair().expect("pair");
+    let b_first_conn = tokio::net::UnixStream::connect(&b_host_path).await.expect("B connect");
+    let (mut b_host1, _) = b_listener.accept().await.expect("accept B host1");
+    {
+        let path = b_host_path.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let _ = wayland_proxy::run_connection(b_gtk_proxy, b_first_conn, path, None, cache).await;
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p)); // get_registry -> host2
+    p.clear();
+    wire::put_u32(&mut p, 1);
+    wire::put_str(&mut p, "wl_seat");
+    wire::put_u32(&mut p, 8);
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(2, 0, &p)); // bind wl_seat -> host3
+    p.clear();
+    wire::put_u32(&mut p, 2);
+    wire::put_str(&mut p, "wl_data_device_manager");
+    wire::put_u32(&mut p, 3);
+    wire::put_u32(&mut p, 4);
+    out.extend(wire::build_message(2, 0, &p)); // bind ddm -> host4
+    p.clear();
+    wire::put_u32(&mut p, 5);
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(4, 1, &p)); // get_data_device -> host5
+    b_gtk_test.write_all(&out).await.expect("write B's first-life burst");
+    let _ = read_n_messages(&mut b_host1, 4).await;
+
+    // --- Step 1/2: B pastes what A just copied, pre-crash. A's own
+    // answer must run concurrently -- paste_via_compositor's final read
+    // blocks on it.
+    let (pasted, ()) = tokio::join!(
+        paste_via_compositor(&mut b_host1, &mut b_gtk_test, 5, 900, MIME_TYPE, &mut a_host1, 6),
+        write_real_source_content(&mut a_gtk_test, ORIGINAL_TEXT),
+    );
+    assert_eq!(pasted, ORIGINAL_TEXT, "B must be able to paste what A copied, before any crash");
+
+    // --- Step 3: crash the shared compositor -- both connections lose
+    // their host at once, same as one real Mutter serving both.
+    drop(a_host1);
+    drop(b_host1);
+
+    let (mut a_host2, _) =
+        tokio::time::timeout(Duration::from_secs(3), a_listener.accept()).await.expect("A reconnect").expect("accept A host2");
+    let (mut b_host2, _) =
+        tokio::time::timeout(Duration::from_secs(3), b_listener.accept()).await.expect("B reconnect").expect("accept B host2");
+
+    // A's recovery: internal get_registry(2)+sync(3), then replays
+    // bind(wl_seat) and get_pointer (both Recreatable) -- 2 messages.
+    // Must also advertise wl_data_device_manager here -- not for
+    // recovery's own replay (it's not Recreatable), but because
+    // attempt_clipboard_splice needs its (name, version) cached from
+    // this exact registry re-fetch to bind it fresh later.
+    let msg = read_one_message(&mut a_host2).await;
+    assert_eq!(wire::MessageHeader::parse(&msg).unwrap().opcode, 1, "get_registry");
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 201);
+    wire::put_str(&mut p, "wl_seat");
+    wire::put_u32(&mut p, 8);
+    out.extend(wire::build_message(2, 0, &p));
+    p.clear();
+    wire::put_u32(&mut p, 202);
+    wire::put_str(&mut p, "wl_data_device_manager");
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(2, 0, &p));
+    p.clear();
+    wire::put_u32(&mut p, 0);
+    out.extend(wire::build_message(3, 0, &p)); // sync done
+    a_host2.write_all(&out).await.expect("answer A's registry");
+    let msgs = read_n_messages(&mut a_host2, 2).await;
+    let _a_seat_host2 = u32::from_ne_bytes(msgs[0][msgs[0].len() - 4..].try_into().unwrap());
+    let a_pointer_host2 = u32::from_ne_bytes(msgs[1][8..12].try_into().unwrap());
+
+    // B's recovery: same shape (its own wl_seat is Recreatable too).
+    let msg = read_one_message(&mut b_host2).await;
+    assert_eq!(wire::MessageHeader::parse(&msg).unwrap().opcode, 1, "get_registry");
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 201);
+    wire::put_str(&mut p, "wl_seat");
+    wire::put_u32(&mut p, 8);
+    out.extend(wire::build_message(2, 0, &p));
+    p.clear();
+    wire::put_u32(&mut p, 0);
+    out.extend(wire::build_message(3, 0, &p));
+    b_host2.write_all(&out).await.expect("answer B's registry");
+    let msg = read_one_message(&mut b_host2).await;
+    let header = wire::MessageHeader::parse(&msg).unwrap();
+    assert_eq!((header.sender_id, header.opcode), (2, 0), "bind wl_seat");
+    let _b_seat_host2 = u32::from_ne_bytes(msg[msg.len() - 4..].try_into().unwrap());
+
+    tokio::time::sleep(Duration::from_millis(100)).await; // let both connections fully unfreeze
+
+    // --- Trigger A's reclaim with a real (repurposed) input serial --
+    // same mechanism ADR-0009 verified live, same as the earlier
+    // single-client reclaim test.
+    const RECLAIM_SERIAL: u32 = 4242;
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, RECLAIM_SERIAL);
+    wire::put_u32(&mut p, 0);
+    wire::put_u32(&mut p, 272);
+    wire::put_u32(&mut p, 1);
+    a_host2.write_all(&wire::build_message(a_pointer_host2, 3, &p)).await.expect("write wl_pointer.button");
+
+    // This button event is also a normal, legitimately forwarded event
+    // to A's own client side (a real client would just process it) --
+    // drain it now, or it sits unread in a_gtk_test's buffer and gets
+    // mistaken for the wl_data_source.send a later write_real_source_
+    // content call is actually waiting for (found chasing exactly that
+    // failure while writing this test).
+    let _ = read_one_message(&mut a_gtk_test).await;
+
+    // The splice: bind(ddm), create_data_source, offer, get_data_device,
+    // set_selection.
+    let msgs = read_n_messages(&mut a_host2, 5).await;
+    let header = wire::MessageHeader::parse(&msgs[0]).unwrap();
+    assert_eq!((header.sender_id, header.opcode), (2, 0), "splice: bind wl_data_device_manager");
+    let a_ddm_reclaim_host = u32::from_ne_bytes(msgs[0][msgs[0].len() - 4..].try_into().unwrap());
+    let header = wire::MessageHeader::parse(&msgs[1]).unwrap();
+    assert_eq!((header.sender_id, header.opcode), (a_ddm_reclaim_host, 0), "splice: create_data_source");
+    let a_source_reclaim_host = u32::from_ne_bytes(msgs[1][8..12].try_into().unwrap());
+    let header = wire::MessageHeader::parse(&msgs[4]).unwrap();
+    assert_eq!(header.opcode, 1, "splice: set_selection");
+    let serial_arg = u32::from_ne_bytes(msgs[4][12..16].try_into().unwrap());
+    assert_eq!(serial_arg, RECLAIM_SERIAL);
+
+    // --- B rebinds its own (non-recreatable) ddm + data_device on the
+    // second life -- its wl_seat survived the reconnect (Recreatable),
+    // so it's reused directly (guest id 3, unchanged).
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    wire::put_str(&mut p, "wl_data_device_manager");
+    wire::put_u32(&mut p, 3);
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(2, 0, &p)); // bind ddm (guest=6)
+    p.clear();
+    wire::put_u32(&mut p, 7);
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(6, 1, &p)); // get_data_device (guest=7)
+    b_gtk_test.write_all(&out).await.expect("write B's second-life rebind");
+    let msgs = read_n_messages(&mut b_host2, 2).await;
+    let b_ddm_host2 = u32::from_ne_bytes(msgs[0][msgs[0].len() - 4..].try_into().unwrap());
+    let b_device_host2 = u32::from_ne_bytes(msgs[1][8..12].try_into().unwrap()); // get_data_device's new_id -- first payload field
+    let _ = b_ddm_host2;
+
+    // --- Step 4: B pastes again -- must get the ORIGINAL text back,
+    // served from the cache by the reclaimed synthetic source, not from
+    // any client actually writing it. No concurrent writer needed here
+    // -- attempt_clipboard_splice's own cache-backed answer is what
+    // production code does, unaided.
+    let pasted =
+        paste_via_compositor(&mut b_host2, &mut b_gtk_test, b_device_host2, 900, MIME_TYPE, &mut a_host2, a_source_reclaim_host).await;
+    assert_eq!(pasted, ORIGINAL_TEXT, "B must still be able to paste the ORIGINAL text after the crash, via the reclaim");
+
+    // --- Step 5: A copies NEW_TEXT for real, on its second-life
+    // connection -- a completely fresh wl_data_device_manager/
+    // wl_data_source/wl_data_device, none of which are Recreatable.
+    // Real Mutter would cancel the previous (reclaimed) owner here --
+    // wl_data_source.cancelled takes no arguments.
+    a_host2.write_all(&wire::build_message(a_source_reclaim_host, 2, &[])).await.expect("write cancelled");
+
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    wire::put_str(&mut p, "wl_data_device_manager");
+    wire::put_u32(&mut p, 3);
+    wire::put_u32(&mut p, 8);
+    out.extend(wire::build_message(2, 0, &p)); // bind ddm (guest=8)
+    p.clear();
+    wire::put_u32(&mut p, 9);
+    out.extend(wire::build_message(8, 0, &p)); // create_data_source (guest=9)
+    p.clear();
+    wire::put_str(&mut p, MIME_TYPE);
+    out.extend(wire::build_message(9, 0, &p)); // offer
+    p.clear();
+    wire::put_u32(&mut p, 10);
+    wire::put_u32(&mut p, 4); // A's original wl_seat guest id (Recreatable, unchanged)
+    out.extend(wire::build_message(8, 1, &p)); // get_data_device (guest=10)
+    p.clear();
+    wire::put_u32(&mut p, 9);
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(10, 1, &p)); // set_selection
+    a_gtk_test.write_all(&out).await.expect("write A's second-life real copy");
+    let msgs = read_n_messages(&mut a_host2, 5).await;
+    let header = wire::MessageHeader::parse(&msgs[1]).unwrap();
+    assert_eq!(header.opcode, 0, "create_data_source");
+    let a_source_host2b = u32::from_ne_bytes(msgs[1][8..12].try_into().unwrap());
+
+    // --- Step 6: B pastes once more -- must get NEW_TEXT this time,
+    // written for real by A's own client code, proving ordinary
+    // copy/paste still works cleanly after the whole recovery cycle.
+    let (pasted, ()) = tokio::join!(
+        paste_via_compositor(&mut b_host2, &mut b_gtk_test, b_device_host2, 901, MIME_TYPE, &mut a_host2, a_source_host2b),
+        write_real_source_content(&mut a_gtk_test, NEW_TEXT),
+    );
+    assert_eq!(pasted, NEW_TEXT, "B must be able to paste the NEW text A copied after recovery");
+}
