@@ -2039,15 +2039,19 @@ async fn synthesize_grab_releases(gtk: &mut Conn, objects: &ShadowTable, grabs: 
 /// required for clipboard copy: fires at most once per reconnect, on the
 /// first real input serial this connection observes afterward (see the
 /// call site in relay_ready_messages). Re-establishes the proxy as
-/// clipboard owner using cached bytes from before the crash, by borrowing
-/// that serial for `set_selection` -- confirmed live-viable in ADR-0009's
-/// investigation (a fabricated serial gets cancelled outright; a real one,
-/// even issued for something else, is accepted). The objects created here
-/// (`wl_data_device_manager`/`wl_data_source`/`wl_data_device`) are purely
-/// host-side: allocated via the same host-id counter as everything else
-/// to avoid colliding with real traffic, but deliberately never mapped
-/// into the shadow table -- the real client has no matching objects and
-/// never should.
+/// clipboard owner from cached bytes by borrowing that serial for
+/// `set_selection` -- confirmed live-viable in ADR-0009 (a fabricated
+/// serial gets cancelled outright; a real one, even issued for something
+/// else, is accepted). The objects created here are host-side only,
+/// never mapped into the shadow table -- the real client has no matching
+/// objects and never should.
+///
+/// Each host id is allocated immediately before the write that uses it,
+/// and unallocated on that write's own failure -- see
+/// `ShadowTable::unallocate_host_id`'s doc comment for why: a real
+/// compositor rejects the next legitimate `new_id` outright once a gap
+/// opens, so allocate-then-immediately-send-or-rollback is load-bearing,
+/// not just tidy.
 async fn attempt_clipboard_splice(
     host: &mut Conn,
     objects: &mut ShadowTable,
@@ -2079,47 +2083,49 @@ async fn attempt_clipboard_splice(
     };
 
     let ddm_host_id = objects.allocate_host_id();
-    let source_host_id = objects.allocate_host_id();
-    let device_host_id = objects.allocate_host_id();
-
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, ddm_name);
-    wire::put_str(&mut p, "wl_data_device_manager");
-    wire::put_u32(&mut p, ddm_version);
-    wire::put_u32(&mut p, ddm_host_id);
-    if let Err(e) = host.write_message(&wire::build_message(registry_host_id, 0, &p), &[]).await {
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, ddm_name);
+    wire::put_str(&mut payload, "wl_data_device_manager");
+    wire::put_u32(&mut payload, ddm_version);
+    wire::put_u32(&mut payload, ddm_host_id);
+    if let Err(e) = host.write_message(&wire::build_message(registry_host_id, 0, &payload), &[]).await {
         warn!("clipboard splice: failed to bind wl_data_device_manager: {e}");
+        objects.unallocate_host_id(ddm_host_id);
         return;
     }
 
-    p.clear();
-    wire::put_u32(&mut p, source_host_id);
-    if let Err(e) = host.write_message(&wire::build_message(ddm_host_id, 0, &p), &[]).await {
+    let source_host_id = objects.allocate_host_id();
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, source_host_id);
+    if let Err(e) = host.write_message(&wire::build_message(ddm_host_id, 0, &payload), &[]).await {
         warn!("clipboard splice: failed to create_data_source: {e}");
+        objects.unallocate_host_id(source_host_id);
         return;
     }
 
     for mime_type in &mime_types {
-        p.clear();
-        wire::put_str(&mut p, mime_type);
-        if let Err(e) = host.write_message(&wire::build_message(source_host_id, 0, &p), &[]).await {
+        let mut payload = Vec::new();
+        wire::put_str(&mut payload, mime_type);
+        if let Err(e) = host.write_message(&wire::build_message(source_host_id, 0, &payload), &[]).await {
             warn!("clipboard splice: failed to offer {mime_type}: {e}");
             return;
         }
     }
 
-    p.clear();
-    wire::put_u32(&mut p, device_host_id);
-    wire::put_u32(&mut p, seat_host_id);
-    if let Err(e) = host.write_message(&wire::build_message(ddm_host_id, 1, &p), &[]).await {
+    let device_host_id = objects.allocate_host_id();
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, device_host_id);
+    wire::put_u32(&mut payload, seat_host_id);
+    if let Err(e) = host.write_message(&wire::build_message(ddm_host_id, 1, &payload), &[]).await {
         warn!("clipboard splice: failed to get_data_device: {e}");
+        objects.unallocate_host_id(device_host_id);
         return;
     }
 
-    p.clear();
-    wire::put_u32(&mut p, source_host_id);
-    wire::put_u32(&mut p, serial);
-    if let Err(e) = host.write_message(&wire::build_message(device_host_id, 1, &p), &[]).await {
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, source_host_id);
+    wire::put_u32(&mut payload, serial);
+    if let Err(e) = host.write_message(&wire::build_message(device_host_id, 1, &payload), &[]).await {
         warn!("clipboard splice: failed to set_selection: {e}");
         return;
     }
