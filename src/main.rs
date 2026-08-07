@@ -70,6 +70,11 @@ async fn main() -> Result<()> {
     let mut rebind_signal =
         signal(SignalKind::user_defined1()).context("installing SIGUSR1 handler")?;
 
+    // One cache, shared across every client connection -- required for
+    // clipboard copy to survive the copying client quitting (see
+    // clipboard.rs's own doc comment).
+    let clipboard_cache = wayland_proxy::clipboard::ClipboardCache::new();
+
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -86,6 +91,7 @@ async fn main() -> Result<()> {
                     let span = tracing::info_span!("client", pid = client_pid);
                     info!(parent: &span, "New Wayland client connected!");
                     let target_path = target_socket_path.clone();
+                    let clipboard_cache = clipboard_cache.clone();
                     tokio::spawn(
                         async move {
                             match UnixStream::connect(&target_path).await {
@@ -95,6 +101,7 @@ async fn main() -> Result<()> {
                                         compositor_stream,
                                         target_path,
                                         client_pid,
+                                        clipboard_cache,
                                     )
                                     .await
                                     {
