@@ -1,13 +1,17 @@
 # Wayland Crash Resilience Proxy
 
-> **Status: spike.** Built largely with an AI coding assistant.
-> Live-verified against real compositors (see below), but not yet
-> independently reviewed. Treat accordingly.
+> **Status: spike.** Built largely with an AI coding assistant. Verified
+> live against real compositors (see below). Not independently reviewed.
 
 A crash-resilient Wayland proxy, written in Rust. Sits between a client
-and a compositor, relaying the wire protocol directly. If the
-compositor crashes and restarts, the proxy reconnects and rebuilds
+and a compositor, relaying the wire protocol between them.
+
+If the compositor crashes and restarts, the proxy reconnects and rebuilds
 enough server-side state that the client never notices.
+
+Note: this is not the intended long-term approach — the original PRs
+already established that. It was built partly as a learning exercise,
+and to have something working in the meantime.
 
 ## Status
 
@@ -36,18 +40,18 @@ relaying generically with no reconnect-time recovery:
 
 Everything else a compositor might advertise is relayed generically
 (pass-through, id translation only), not part of the recreation graph —
-see `docs/architecture-notes.md` for the full coverage picture.
+see `docs/architecture-notes.md` for full coverage details.
 
 ### GNOME Shell
-
-Live-verified against a real installed session (not just a container),
-through repeated real crashes, for both renderers above.
 
 > **Caveat:** doesn't work with `gnome-session` — a gnome-shell crash was
 > taking `gnome-session` down with it, dumping you back to the login
 > screen. Instead a separate session (`wl-res-gnome-shell-direct`) launches
 > gnome-shell itself as a direct child, without `gnome-session` in the
 > loop.
+
+Verified by running `pkill -9 gnome-shell` under the supplied session and
+confirming test GTK programs still run afterwards.
 
 ### labwc / sway / kwin
 
@@ -60,7 +64,7 @@ and kwin currently have no installable session — container-only.
 
 ### Other
 
-Both the proxy and its test harness have a proper CLI (`clap` for the
+Both the proxy and its test harness have a CLI (`clap` for the
 proxy, Python/Typer for the harness). The harness is also its own
 installable package, `wayland-headless-harness`, independent of this
 repo — a general-purpose tool for reproducing Wayland client/compositor
