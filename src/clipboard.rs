@@ -13,7 +13,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Matches the OOM cap from the original clipboard-cache proposal this
 /// module implements -- a dragged-in multi-GB file must never be buffered
@@ -43,7 +43,7 @@ impl ClipboardCache {
     }
 
     fn store(&self, mime_type: String, bytes: Vec<u8>) {
-        tracing::info!("clipboard: cached {} bytes ({mime_type})", bytes.len());
+        info!("clipboard: cached {} bytes ({mime_type})", bytes.len());
         self.by_mime_type.lock().unwrap().insert(mime_type, bytes);
     }
 
@@ -61,34 +61,26 @@ impl ClipboardCache {
 /// `run_connection`, threaded through `relay_ready_messages`.
 #[derive(Default)]
 pub struct ReclaimState {
-    /// Set whenever `recover_state_after_reconnect` completes; cleared
-    /// after the first real input serial this connection sees afterward
-    /// is spent trying to reclaim the clipboard -- one attempt per
-    /// reconnect, not a retry loop.
+    /// One attempt per reconnect: set when recovery completes, cleared
+    /// once spent on the next real input serial.
     pub pending: bool,
-    /// (name, version) of `wl_data_device_manager` from the most recent
-    /// registry re-fetch -- needed to bind it fresh for the reclaim
-    /// attempt, since the connection may never have bound it itself.
+    /// `wl_data_device_manager`'s (name, version), refreshed on every
+    /// reconnect -- needed to bind it fresh even if the client never did.
     pub data_device_manager_global: Option<(u32, u32)>,
-    /// Host-space id of our own synthetic `wl_data_source`, once a reclaim
-    /// has actually been attempted. It has no guest-side counterpart at
-    /// all (the real client never sees it), so a later
-    /// `wl_data_source.send` addressed to it needs recognizing here rather
-    /// than falling into the normal guest-id-driven relay, which would
-    /// just see an untranslatable object and drop it. Reset to `None` on
-    /// every reconnect -- a stale id from a previous compositor life could
-    /// otherwise coincide with an unrelated fresh object's id.
+    /// Host id of our synthetic `wl_data_source`, once a reclaim has been
+    /// attempted. Never guest-mapped, so events addressed to it must be
+    /// recognized here, not via the normal guest-id relay. Reset on every
+    /// reconnect -- a stale id could otherwise coincide with an unrelated
+    /// fresh object once host ids restart.
     pub active_source_host_id: Option<u32>,
 }
 
 /// Substitutes `real_fd` (the pipe write end `wl_data_source.send` handed
-/// us, which the client is meant to write clipboard bytes into) with a
-/// fresh pipe of our own, and spawns a task that mirrors everything the
-/// client writes into `real_fd` unchanged while also caching it. Returns
-/// the fd to forward to the client in `real_fd`'s place, or `None` if
-/// anything here failed -- the caller then forwards nothing for this
-/// message's fd argument, same tolerance already applied elsewhere in the
-/// relay for a fd that didn't arrive as expected.
+/// us) with a pipe of our own, and spawns a task that mirrors everything
+/// the client writes into it, unchanged, while also caching it. Returns
+/// the substitute fd to forward in `real_fd`'s place, or `None` on
+/// failure -- same "just don't forward one" tolerance used elsewhere for
+/// a fd that didn't arrive as expected.
 pub fn start_tee(real_fd: OwnedFd, mime_type: String, cache: SharedClipboardCache) -> Option<OwnedFd> {
     let (client_sender, client_receiver) = match tokio::net::unix::pipe::pipe() {
         Ok(pair) => pair,
