@@ -1,9 +1,12 @@
 //! Clipboard content cache, tee'd from `wl_data_source.send` traffic so it
 //! survives a compositor crash or the copying client quitting -- see
 //! docs/adr/adr-0009-clipboard-persistence.md for why this is possible at
-//! all and what it doesn't (yet) do: this module only populates the cache.
-//! Nothing reads it back yet (re-offering it to a reconnected compositor is
-//! separate, not-yet-built follow-up work, per that ADR's Decision).
+//! all. `ReclaimState` and `attempt_clipboard_splice` (src/lib.rs, since
+//! they need `Conn`/wire access) consume the cache: the first real,
+//! compositor-issued input serial a connection sees after a reconnect gets
+//! borrowed to re-establish the proxy as clipboard owner from cached bytes
+//! -- ADR-0009 live-verified that works even though the serial was issued
+//! for something else entirely.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -47,6 +50,35 @@ impl ClipboardCache {
     pub fn get(&self, mime_type: &str) -> Option<Vec<u8>> {
         self.by_mime_type.lock().unwrap().get(mime_type).cloned()
     }
+
+    pub fn cached_mime_types(&self) -> Vec<String> {
+        self.by_mime_type.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+/// Per-connection state for re-offering cached clipboard content after a
+/// reconnect -- see this module's doc comment and ADR-0009. Owned by
+/// `run_connection`, threaded through `relay_ready_messages`.
+#[derive(Default)]
+pub struct ReclaimState {
+    /// Set whenever `recover_state_after_reconnect` completes; cleared
+    /// after the first real input serial this connection sees afterward
+    /// is spent trying to reclaim the clipboard -- one attempt per
+    /// reconnect, not a retry loop.
+    pub pending: bool,
+    /// (name, version) of `wl_data_device_manager` from the most recent
+    /// registry re-fetch -- needed to bind it fresh for the reclaim
+    /// attempt, since the connection may never have bound it itself.
+    pub data_device_manager_global: Option<(u32, u32)>,
+    /// Host-space id of our own synthetic `wl_data_source`, once a reclaim
+    /// has actually been attempted. It has no guest-side counterpart at
+    /// all (the real client never sees it), so a later
+    /// `wl_data_source.send` addressed to it needs recognizing here rather
+    /// than falling into the normal guest-id-driven relay, which would
+    /// just see an untranslatable object and drop it. Reset to `None` on
+    /// every reconnect -- a stale id from a previous compositor life could
+    /// otherwise coincide with an unrelated fresh object's id.
+    pub active_source_host_id: Option<u32>,
 }
 
 /// Substitutes `real_fd` (the pipe write end `wl_data_source.send` handed
