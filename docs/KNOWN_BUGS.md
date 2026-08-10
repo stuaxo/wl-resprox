@@ -68,7 +68,29 @@ mode) — query in the script's own output.
 **Status:** confirmed not us (reproduces with zero proxy involvement).
 Functional impact confirmed live via gdb, 2026-08-10 -- this is not
 just a log warning, it's why a recreated window sometimes won't
-raise/focus when activated.
+raise/focus when activated. The specific *trigger* on our side --
+DING's helper process racing `socket-handoff`'s SIGSTOP-based freeze
+and connecting straight to gnome-shell instead of through the proxy --
+is now closed: see `src/bin/socket-handoff.rs`'s `--freeze-method
+ptrace` (default as of 2026-08-10), which seizes the target and
+catches its `bind()` at the exact syscall-exit boundary instead of
+reacting to a file-creation event after the fact, closing the race at
+the kernel level rather than narrowing it. `sigstop` remains available
+as an explicit fallback. This does NOT fix Mutter's own bug (a
+genuinely stale `MetaWindow*` still corrupts stack layout if it ever
+gets created some other way) -- it just removes the one concrete path
+we'd built into our own startup sequence that reliably produced one.
+
+Confirming this closed the loop wasn't as simple as "swap the freeze
+method" -- live testing on 2026-08-10 with DING re-enabled turned up a
+*second*, unrelated bug in our own new ptrace mechanism (see the
+`WaitStatus::StillAlive` arm's doc comment in `run_ptrace`,
+`src/bin/socket-handoff.rs`: its polling sleep was throttling real
+syscall tracing to ~25/sec, and a real gnome-shell startup needs
+30,000+, so it blew straight through `--timeout-secs` and left
+gnome-shell back in the exact unprotected state this was meant to
+prevent -- now fixed, worth knowing if this ever needs
+re-diagnosing).
 
 **Symptom:** `libmutter-CRITICAL`, `window->stack_position >= 0`. Also
 manifests as a window that never comes to front when activated (panel

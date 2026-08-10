@@ -41,6 +41,16 @@ fn short_test_dir(name: &str) -> PathBuf {
 /// the session wrapper's original plain `while [ ! -S path ]` poll loop
 /// matched a stale file immediately, before gnome-shell's own real bind
 /// ever happened.
+///
+/// Explicitly `--freeze-method=sigstop`: this test's dummy target
+/// (`sleep`) never calls `bind()` itself -- the test creates the "real"
+/// socket from its own process instead, standing in for a target that's
+/// merely *frozen*, not one whose own syscall we need to catch. That
+/// setup only exercises the file-watching semantics this test is
+/// actually about, which apply the same way regardless of freeze
+/// method; see socket_handoff_ptrace.rs for coverage of the ptrace
+/// method's own distinct mechanism (which needs a target that really
+/// does call bind() itself).
 #[test]
 fn ignores_a_preexisting_stale_file_and_picks_up_the_real_one() {
     let dir = short_test_dir("stale");
@@ -61,6 +71,8 @@ fn ignores_a_preexisting_stale_file_and_picks_up_the_real_one() {
             &target_pid.to_string(),
             "--timeout-secs",
             "5",
+            "--freeze-method",
+            "sigstop",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

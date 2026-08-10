@@ -83,7 +83,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # read/write don't carry file descriptors at all, which is exactly the bug
 # that motivated moving off a raw byte pipe originally. Same crate
 # sommelier-rs and waypipe both use for this.
-nix = { version = "0.31.3", features = ["socket", "fs", "uio", "inotify", "signal", "poll"] }
+nix = { version = "0.31.3", features = ["socket", "fs", "uio", "inotify", "signal", "poll", "ptrace"] }
 
 # Desktop notification on crash recovery (org.freedesktop.Notifications),
 # over the session bus. "tokio" feature: runs on our own runtime instead
