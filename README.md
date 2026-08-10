@@ -2,6 +2,9 @@
 
 > **Status: spike.** Built largely with an AI coding assistant. Verified
 > live against real compositors (see below). Not independently reviewed.
+> Partly this is to see how far I can push what seems like a bad idea:
+> much state that's internal to toolkits needs to be wrapped, handled
+> and repaired or supported somehow.   This is not a tool I'd recommend.
 
 A crash-resilient Wayland proxy, written in Rust. Sits between a client
 and a compositor, relaying the wire protocol between them.
