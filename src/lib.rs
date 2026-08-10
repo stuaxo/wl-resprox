@@ -256,7 +256,6 @@ async fn relay_ready_messages(
     objects: &mut ShadowTable,
     graph: &mut RecreationGraph,
     grabs: &mut GrabTracker,
-    pending_configure_acks: &mut std::collections::HashMap<u32, u32>,
     buffer_flow: &mut BufferFlowTracker,
     pending_frames: &mut PendingFrameTracker,
     pending_dmabuf_planes: &mut std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)>,
@@ -696,17 +695,6 @@ async fn relay_ready_messages(
                             Some(guest_deleted_id) => {
                                 objects.remove_guest(guest_deleted_id);
                                 graph.remove(guest_deleted_id);
-                                // A synthesized post-recovery configure this
-                                // id never got around to ack'ing before being
-                                // destroyed -- without this, the entry
-                                // outlives the object and can wrongly match a
-                                // *different* xdg_surface that later reuses
-                                // this same guest id (see the regression test
-                                // for the exact collision: our own synthetic
-                                // serials restart at 1 every reconnect, the
-                                // same range a freshly-crashed compositor's
-                                // own serial counter is in too).
-                                pending_configure_acks.remove(&guest_deleted_id);
                                 msg[wire::HEADER_LEN..wire::HEADER_LEN + 4]
                                     .copy_from_slice(&guest_deleted_id.to_ne_bytes());
                             }
@@ -950,26 +938,6 @@ async fn relay_ready_messages(
                     }
                 } else if matches!(direction, Direction::HostToClient) && interface.name == "wl_callback" && desc.name == "done" {
                     pending_frames.on_done_received(guest_sender_id);
-                }
-
-                // Synthetic xdg_surface.configure events (see
-                // recover_state_after_reconnect) invent a serial the real
-                // compositor never issued, purely to force a client
-                // repaint after recreation. Forwarding the client's
-                // resulting ack_configure to the real compositor gets it
-                // rejected ("wrong configure serial"). Swallow exactly the
-                // one ack matching a pending synthetic serial; anything
-                // else is a real ack for a real configure and forwards as
-                // normal.
-                if matches!(direction, Direction::ClientToHost) && interface.name == "xdg_surface" && desc.name == "ack_configure" {
-                    if let Some(serial_bytes) = msg.get(wire::HEADER_LEN..wire::HEADER_LEN + 4) {
-                        let serial = u32::from_ne_bytes(serial_bytes.try_into().unwrap());
-                        if pending_configure_acks.get(&guest_sender_id) == Some(&serial) {
-                            pending_configure_acks.remove(&guest_sender_id);
-                            src.read_buf.drain(..consumed);
-                            continue 'relay;
-                        }
-                    }
                 }
 
                 // Now that every argument is translated, rewrite the
@@ -1356,7 +1324,6 @@ async fn recover_state_after_reconnect(
     gtk: &mut Conn,
     objects: &mut ShadowTable,
     graph: &RecreationGraph,
-    pending_configure_acks: &mut std::collections::HashMap<u32, u32>,
     buffer_flow: &mut BufferFlowTracker,
     pending_frames: &mut PendingFrameTracker,
     reclaim: &mut clipboard::ReclaimState,
@@ -1438,8 +1405,6 @@ async fn recover_state_after_reconnect(
     }
     objects.map(registry_guest_id, registry_host_id, registry_interface);
     info!("re-fetched registry from reconnected compositor");
-
-    let mut next_configure_serial = 1u32;
 
     for (guest_id, recipe) in graph.iter() {
         match recipe {
@@ -1632,72 +1597,91 @@ async fn recover_state_after_reconnect(
                     }
                 }
 
-                // Synthesize xdg_toplevel.configure(0, 0, []) BEFORE the
-                // xdg_surface.configure below: a bare xdg_surface.configure
-                // alone doesn't reliably signal that client state is
-                // invalid, so a client can ack it and keep using its
-                // existing (now stale-generation) buffers, which then get
-                // silently dropped on the next attach and can trigger a
-                // fatal compositor protocol error that kills the
-                // connection. xdg_toplevel.configure is what real
-                // compositors send on an actual resize/state change,
-                // which a client's own resize-handling reacts to by
-                // reallocating buffers -- width=0/height=0 is the
-                // protocol's "you decide the size" convention (no forced
-                // resize, no visible jump), states=[] since no tracked
-                // state is known to have changed. May not be sufficient
-                // alone for a client already mid-frame with pooled
-                // buffers -- not yet hit live, but a plausible remaining
-                // race.
-                if let Some(toplevel_configure_opcode) = event_opcode(child_interface, "configure") {
-                    let sig = child_interface.events[toplevel_configure_opcode as usize].signature;
-                    let values = vec![
-                        wire::WaylandValue::Int(0),   // width: 0 = no suggested size
-                        wire::WaylandValue::Int(0),   // height: 0 = no suggested size
-                        wire::WaylandValue::Array(Vec::new()), // states: empty array
-                    ];
-                    match wire::encode_arguments(sig, values) {
-                        Ok((toplevel_configure_payload, fds)) => {
-                            if let Err(e) = gtk
-                                .write_message(&wire::build_message(guest_id, toplevel_configure_opcode, &toplevel_configure_payload), &fds)
-                                .await
-                            {
-                                warn!("failed to synthesize xdg_toplevel.configure for {guest_id}: {e}");
-                            }
-                        }
-                        Err(e) => warn!("failed to encode xdg_toplevel.configure for {guest_id}: {e}"),
+                // Force a repaint with a REAL configure/ack handshake
+                // against the host, not an invented one straight to the
+                // client. The previous approach synthesized a fake
+                // xdg_toplevel.configure + xdg_surface.configure directly
+                // to `gtk` with a serial the host never issued, then
+                // swallowed the client's resulting ack_configure rather
+                // than forward it (forwarding it would get rejected as
+                // "wrong configure serial"). That left the host's OWN
+                // protocol state machine never having seen a valid
+                // ack_configure for this surface at all -- Mutter
+                // tolerated a subsequent attach/commit anyway, but
+                // labwc/kwin correctly reject it ("xdg_surface has never
+                // been configured" / "attached a buffer before configure
+                // event"), confirmed live via the container test matrix
+                // 2026-08-10 (see docs/KNOWN_BUGS.md). An empty commit on
+                // the underlying wl_surface is what prompts a compliant
+                // compositor to actually emit its own configure pair;
+                // relaying THAT (real serial, real host round-trip) means
+                // the client's resulting ack_configure is genuine and
+                // needs no special-casing in relay_ready_messages -- it
+                // just flows through normal relay to the host that
+                // issued it.
+                let commit_sent = 'commit: {
+                    let Some(Recreatable::XdgSurface { surface_guest_id, .. }) = graph.recipe_for(*parent_guest_id) else {
+                        warn!("can't force a real configure for xdg_toplevel {guest_id}: {parent_guest_id}'s own recipe is missing or not an XdgSurface");
+                        break 'commit false;
+                    };
+                    let (Some(surface_host_id), Some(surface_interface)) =
+                        (objects.host_id(*surface_guest_id), objects.interface(*surface_guest_id))
+                    else {
+                        warn!("can't force a real configure for xdg_toplevel {guest_id}: surface {surface_guest_id} has no host id");
+                        break 'commit false;
+                    };
+                    let Some(commit_opcode) = request_opcode(surface_interface, "commit") else {
+                        warn!("can't force a real configure for xdg_toplevel {guest_id}: wl_surface has no commit request");
+                        break 'commit false;
+                    };
+                    if let Err(e) = host.write_message(&wire::build_message(surface_host_id, commit_opcode, &[]), &[]).await {
+                        warn!("failed to send initial commit for xdg_toplevel {guest_id}: {e}");
+                        break 'commit false;
                     }
-                } else {
-                    warn!("xdg_toplevel has no configure event -- can't force a buffer-reallocating repaint for {guest_id}");
-                }
+                    true
+                };
 
-                // Force a repaint: synthesize xdg_surface.configure straight
-                // to the client on the PARENT xdg_surface's guest id (gtk
-                // already knows this id, unchanged across the reconnect --
-                // implementation-constraints.md is explicit that this must
-                // happen "immediately after recreation").
-                let Some(configure_opcode) = event_opcode(parent_interface, "configure") else {
-                    warn!("xdg_surface has no configure event -- can't force a repaint for {guest_id}");
-                    continue;
-                };
-                let sig = parent_interface.events[configure_opcode as usize].signature;
-                let (configure_payload, fds) = match wire::encode_arguments(sig, vec![wire::WaylandValue::Uint(next_configure_serial)]) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("failed to encode xdg_surface.configure for {parent_guest_id}: {e}");
-                        continue;
+                if commit_sent {
+                    // Best-effort, matching every other recipe arm's own
+                    // "warn and continue" philosophy: a compositor that
+                    // never responds (or anything else goes wrong here)
+                    // just means this one toplevel doesn't get repainted,
+                    // not that the whole recovery aborts.
+                    let toplevel_configure_opcode = event_opcode(child_interface, "configure");
+                    let surface_configure_opcode = event_opcode(parent_interface, "configure");
+                    let wait = async {
+                        loop {
+                            let (header, msg) = next_message(host).await?;
+                            if header.sender_id == host_id && Some(header.opcode) == toplevel_configure_opcode {
+                                // Relay verbatim aside from the sender id
+                                // (host -> guest) -- none of
+                                // xdg_toplevel.configure's arguments
+                                // (width/height/states) are object ids
+                                // needing translation.
+                                gtk.write_message(&wire::build_message(guest_id, header.opcode, &msg[wire::HEADER_LEN..]), &[])
+                                    .await
+                                    .context("relaying real xdg_toplevel.configure")?;
+                            } else if header.sender_id == parent_host_id && Some(header.opcode) == surface_configure_opcode {
+                                gtk.write_message(&wire::build_message(*parent_guest_id, header.opcode, &msg[wire::HEADER_LEN..]), &[])
+                                    .await
+                                    .context("relaying real xdg_surface.configure")?;
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            // Anything else here belongs to an
+                            // already-recreated object from an earlier
+                            // loop iteration -- best-effort like the rest
+                            // of this function, dropped rather than
+                            // routed through relay_ready_messages from
+                            // inside this wait. Not yet hit live.
+                        }
+                    };
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), wait).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => warn!("failed waiting for the real compositor's configure on xdg_surface {guest_id}: {e}"),
+                        Err(_) => {
+                            warn!("timed out waiting for the real compositor's configure on xdg_surface {guest_id} -- won't force a repaint")
+                        }
                     }
-                };
-                // Recorded so relay_ready_messages can recognize and
-                // swallow the client's resulting ack_configure instead of
-                // forwarding an invented serial to the real compositor.
-                pending_configure_acks.insert(*parent_guest_id, next_configure_serial);
-                next_configure_serial += 1;
-                if let Err(e) = gtk
-                    .write_message(&wire::build_message(*parent_guest_id, configure_opcode, &configure_payload), &fds)
-                    .await
-                {
-                    warn!("failed to synthesize xdg_surface.configure for {parent_guest_id}: {e}");
                 }
             }
             Recreatable::ShmPool { wl_shm_guest_id, fd, size } => {
@@ -2306,7 +2290,6 @@ pub async fn run_connection(
     let mut objects = ShadowTable::new();
     let mut graph = RecreationGraph::new();
     let mut grabs = GrabTracker::new();
-    let mut pending_configure_acks: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut buffer_flow = BufferFlowTracker::new();
     let mut pending_frames = PendingFrameTracker::new();
     let mut pending_dmabuf_planes: std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)> = std::collections::HashMap::new();
@@ -2326,7 +2309,7 @@ pub async fn run_connection(
                     }
                     Ok(_) => {
                         let dst = if frozen { None } else { Some(&mut host) };
-                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, client_pid, &desktop_apps, Direction::ClientToHost).await?;
+                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, client_pid, &desktop_apps, Direction::ClientToHost).await?;
                     }
                     Err(e) => {
                         info!("GTK client disconnected: {e}");
@@ -2341,7 +2324,7 @@ pub async fn run_connection(
                         frozen = true;
                     }
                     Ok(_) => {
-                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, client_pid, &desktop_apps, Direction::HostToClient).await?;
+                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, client_pid, &desktop_apps, Direction::HostToClient).await?;
                     }
                     Err(e) => {
                         info!("compositor connection lost ({e}) -- freezing, GTK client stays connected");
@@ -2360,7 +2343,7 @@ pub async fn run_connection(
                 // stays behind in the old generation, which is exactly what
                 // marks it stale for the wl_buffer.release check below.
                 objects.bump_generation();
-                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut reclaim).await {
+                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut buffer_flow, &mut pending_frames, &mut reclaim).await {
                     Ok(()) => {
                         // Must happen before traffic resumes (frozen =
                         // false, below) -- implementation-constraints.md is

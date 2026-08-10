@@ -1396,8 +1396,19 @@ async fn proxy_reconnects_to_a_restarted_compositor() {
 /// deliberately different across the two lives in
 /// `full_reconnect_recreates_surface_chain_and_synthesizes_configure`
 /// below, to prove nothing assumes global names persist across a
-/// reconnect), then forwards every subsequent complete message it
-/// receives into `sink` until the connection closes.
+/// reconnect), and -- enough to model a real xdg-shell-compliant
+/// compositor, not just a dumb sink -- answers the first `wl_surface.commit`
+/// on a surface that already has an `xdg_toplevel` role assigned with a
+/// real `xdg_toplevel.configure` + `xdg_surface.configure`, using this
+/// life's own serial. Added 2026-08-10 alongside the fix for a real bug
+/// this exact gap in the fake compositor let through: the proxy's own
+/// recovery code used to synthesize a fake configure straight to the
+/// *client* with an invented serial instead of getting a real one from
+/// the host, and this test double's own unconditional silence on
+/// `commit` meant nothing here could ever have caught that (only a real
+/// compositor's own protocol enforcement did, live, via the container
+/// test matrix -- see docs/KNOWN_BUGS.md). Every other request is
+/// forwarded into `sink` as before, until the connection closes.
 async fn serve_fake_compositor_life(
     mut stream: tokio::net::UnixStream,
     globals: &[(&str, u32)],
@@ -1410,6 +1421,21 @@ async fn serve_fake_compositor_life(
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let mut registry_id = None;
+    // Just enough xdg-shell state to answer a commit correctly -- see
+    // this function's own doc comment. `bound_interfaces`: host id ->
+    // interface name, populated from every `wl_registry.bind` seen (not
+    // just wl_compositor/xdg_wm_base) so `create_surface`/
+    // `get_xdg_surface` can be recognized regardless of bind order.
+    // `surfaces`: wl_surface host id -> (its xdg_surface host id, that
+    // xdg_surface's own xdg_toplevel host id once `get_toplevel` is
+    // seen). `configured`: xdg_surface host ids that already got their
+    // one-time initial configure -- real compositors don't re-send it on
+    // every subsequent commit, and tests asserting on an exact reply
+    // count would see extras otherwise.
+    let mut bound_interfaces: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut surfaces: std::collections::HashMap<u32, (u32, Option<u32>)> = std::collections::HashMap::new();
+    let mut configured: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut next_serial = 1u32;
     loop {
         while let Some((msg, consumed)) = wire::take_message(&buf) {
             let header = wire::MessageHeader::parse(msg).expect("valid header");
@@ -1432,6 +1458,70 @@ async fn serve_fake_compositor_life(
                     out.extend(wire::build_message(sync_id, 0, &done_payload));
                     let _ = stream.write_all(&out).await;
                 }
+            } else if Some(header.sender_id) == registry_id && header.opcode == 0 {
+                // bind(name, interface, version, new_id) -- new_id is
+                // after the interface string and version, same layout
+                // recover_state_after_reconnect's own bind decodes.
+                if let Some((iface, next)) = wire::read_str(&payload, 4) {
+                    if let Some(new_id) = wire::read_u32(&payload, next + 4) {
+                        bound_interfaces.insert(new_id, iface);
+                    }
+                }
+                let _ = sink.send((header.sender_id, header.opcode, payload));
+            } else if bound_interfaces.get(&header.sender_id).map(String::as_str) == Some("wl_compositor") && header.opcode == 0 {
+                // create_surface(new_id).
+                if let Some(surface_id) = wire::read_u32(&payload, 0) {
+                    surfaces.insert(surface_id, (0, None)); // xdg_surface id filled in below, not known yet
+                }
+                let _ = sink.send((header.sender_id, header.opcode, payload));
+            } else if bound_interfaces.get(&header.sender_id).map(String::as_str) == Some("xdg_wm_base") && header.opcode == 2 {
+                // get_xdg_surface(new_id, surface).
+                if let (Some(xdg_surface_id), Some(surface_id)) = (wire::read_u32(&payload, 0), wire::read_u32(&payload, 4)) {
+                    if let Some(entry) = surfaces.get_mut(&surface_id) {
+                        entry.0 = xdg_surface_id;
+                    }
+                    bound_interfaces.insert(xdg_surface_id, "xdg_surface".to_string());
+                }
+                let _ = sink.send((header.sender_id, header.opcode, payload));
+            } else if bound_interfaces.get(&header.sender_id).map(String::as_str) == Some("xdg_surface") && header.opcode == 1 {
+                // get_toplevel(new_id) -- record it against whichever
+                // surface owns this xdg_surface.
+                if let Some(toplevel_id) = wire::read_u32(&payload, 0) {
+                    for entry in surfaces.values_mut() {
+                        if entry.0 == header.sender_id {
+                            entry.1 = Some(toplevel_id);
+                        }
+                    }
+                }
+                let _ = sink.send((header.sender_id, header.opcode, payload));
+            } else if let Some(&(xdg_surface_id, Some(toplevel_id))) =
+                surfaces.get(&header.sender_id).filter(|_| header.opcode == 6)
+            {
+                // commit() on a surface with an xdg_toplevel role: the
+                // real trigger a compliant compositor waits for before
+                // ever sending its own configure -- see this function's
+                // own doc comment. One-shot per xdg_surface.
+                if configured.insert(xdg_surface_id) {
+                    let serial = next_serial;
+                    next_serial += 1;
+                    let mut out = Vec::new();
+                    // xdg_toplevel(toplevel_id).configure(width=0,
+                    // height=0, states=[]) -- same "you decide"
+                    // convention the old client-side synthesis used,
+                    // just genuinely sent by the host now, addressed
+                    // from the real toplevel object.
+                    let mut p = Vec::new();
+                    wire::put_u32(&mut p, 0); // width: int, but 0 has the same wire bytes as uint 0
+                    wire::put_u32(&mut p, 0); // height: same
+                    wire::put_u32(&mut p, 0); // states array length 0
+                    out.extend(wire::build_message(toplevel_id, 0, &p));
+                    // xdg_surface(xdg_surface_id).configure(serial).
+                    let mut sp = Vec::new();
+                    wire::put_u32(&mut sp, serial);
+                    out.extend(wire::build_message(xdg_surface_id, 0, &sp));
+                    let _ = stream.write_all(&out).await;
+                }
+                let _ = sink.send((header.sender_id, header.opcode, payload));
             } else {
                 let _ = sink.send((header.sender_id, header.opcode, payload));
             }
@@ -1476,9 +1566,15 @@ async fn serve_fake_compositor_life(
 /// compositor "life", which then crashes. A second life (different global
 /// *names*, proving nothing assumes persistence) accepts the proxy's
 /// reconnect, and this test verifies: the proxy re-fetches the registry,
-/// re-binds both globals, replays the full chain with fresh host ids, and
-/// synthesizes `xdg_surface.configure` to the client on the *original*
-/// (unchanged) guest id.
+/// re-binds both globals, replays the full chain with fresh host ids, sends
+/// an initial commit to prompt a REAL configure from the second life
+/// itself (see `serve_fake_compositor_life`'s own doc comment -- this
+/// models a real xdg-shell-compliant compositor, not just a dumb sink),
+/// relays that real configure pair to the client on its *original*
+/// (unchanged) guest ids, and -- the crux of the 2026-08-10 fix, see
+/// docs/KNOWN_BUGS.md -- forwards the client's resulting `ack_configure`
+/// through to the real compositor rather than swallowing it, since it's
+/// now a genuine serial the host itself issued.
 #[tokio::test]
 async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
@@ -1612,12 +1708,14 @@ async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
         serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
     });
 
-    // Recovery replays exactly 5 requests against the second life, in
+    // Recovery replays exactly 6 requests against the second life, in
     // order: bind(wl_compositor), bind(xdg_wm_base), create_surface,
-    // get_xdg_surface, get_toplevel (get_registry/sync are answered
-    // inline by serve_fake_compositor_life, never reaching the sink).
+    // get_xdg_surface, get_toplevel, then an empty wl_surface.commit --
+    // the real handshake trigger, see recover_state_after_reconnect's own
+    // XdgToplevel arm (get_registry/sync are answered inline by
+    // serve_fake_compositor_life, never reaching the sink).
     let mut observed = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
             .await
             .expect("timed out waiting for a recreation request")
@@ -1672,15 +1770,21 @@ async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
     assert_eq!(observed[4].0, recreated_xdg_surface_host_id);
     assert_eq!(observed[4].1, 1, "get_toplevel opcode");
 
-    // The client should first receive a synthesized xdg_toplevel.configure
-    // on guest id 8 -- its ORIGINAL xdg_toplevel id, unchanged by the
-    // reconnect -- width=0/height=0 (the protocol's "you decide" convention)
-    // and an empty states array, the buffer-reallocation-forcing signal
-    // added 2026-08-03 (see plan-desktop-resilience.md). Then the
-    // synthesized xdg_surface.configure on guest id 7. Both are written
-    // back-to-back with no delay and reliably land in one underlying
-    // read(), so read_n_messages (not two read_one_message calls) is
-    // required here -- see its doc comment.
+    // The initial, empty wl_surface.commit -- what actually prompts a
+    // compliant compositor to send its own configure (see
+    // serve_fake_compositor_life's own doc comment), sent on the freshly
+    // recreated surface.
+    assert_eq!(observed[5].0, recreated_surface_host_id);
+    assert_eq!(observed[5].1, 6, "wl_surface.commit opcode");
+
+    // serve_fake_compositor_life answers that commit with a REAL
+    // xdg_toplevel.configure + xdg_surface.configure. The proxy relays
+    // both, unmodified in substance (only the sender id is rewritten,
+    // host -> guest), to the client on its ORIGINAL guest ids, unchanged
+    // across the reconnect. Both are written back-to-back with no delay
+    // and reliably land in one underlying read(), so read_n_messages (not
+    // two read_one_message calls) is required here -- see its doc
+    // comment.
     let mut synthesized = read_n_messages(&mut gtk_test_side, 2).await.into_iter();
     let toplevel_configure = synthesized.next().unwrap();
     let header = wire::MessageHeader::parse(&toplevel_configure).expect("valid header");
@@ -1695,288 +1799,31 @@ async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
     let header = wire::MessageHeader::parse(&configure).expect("valid header");
     assert_eq!(header.sender_id, 7, "configure should target the client's original xdg_surface guest id");
     assert_eq!(header.opcode, 0, "xdg_surface.configure event opcode");
-    let synthetic_serial = wire::read_u32(&configure[wire::HEADER_LEN..], 0).expect("configure serial");
+    let real_serial = wire::read_u32(&configure[wire::HEADER_LEN..], 0).expect("configure serial");
 
-    // The client acks it exactly as a real client would -- this is where
-    // labwc rejected the invented serial live ("wrong configure serial"),
-    // see the 2026-07-30 entry in docs/debugging-notes.md. The proxy must
-    // swallow this ack rather than forward it to the second life, which
-    // never issued that serial itself.
+    // The client acks it exactly as a real client would -- and unlike the
+    // old invented-serial design, this ack carries a REAL serial the
+    // second life itself issued, so it must reach the real compositor,
+    // not get swallowed. The old approach never forwarded this ack at
+    // all, which is exactly what left labwc/kwin's own protocol state
+    // machine never having seen a valid ack_configure for this surface --
+    // see docs/KNOWN_BUGS.md and the 2026-08-10 fix commit.
     let mut ack_payload = Vec::new();
-    wire::put_u32(&mut ack_payload, synthetic_serial);
+    wire::put_u32(&mut ack_payload, real_serial);
     gtk_test_side
         .write_all(&wire::build_message(7, 4, &ack_payload))
         .await
         .expect("write ack_configure");
 
-    // Proof of swallowing: a real request sent right after must be the
-    // very next thing the second life observes -- if the ack had been
-    // forwarded, it would show up first. wl_display.sync is answered
-    // inline by serve_fake_compositor_life rather than reaching the sink
-    // (see its own get_registry/sync special-casing), so use another
-    // create_surface instead, which the sink does observe.
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 50);
-    gtk_test_side.write_all(&wire::build_message(4, 0, &p)).await.expect("write create_surface"); // wl_compositor(4).create_surface -> 50
-
-    let (sender, opcode, _payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+    let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
         .await
-        .expect("timed out waiting for the post-ack create_surface")
+        .expect("timed out waiting for the ack_configure to reach the real compositor")
         .expect("sink closed early");
-    assert_eq!(
-        sender, recreated_compositor_host_id,
-        "ack_configure must not reach the second life -- the create_surface should be next"
-    );
-    assert_eq!(opcode, 0, "create_surface opcode");
+    assert_eq!(sender, recreated_xdg_surface_host_id, "ack_configure must reach the real xdg_surface on the second life");
+    assert_eq!(opcode, 4, "ack_configure opcode");
+    assert_eq!(wire::read_u32(&payload, 0), Some(real_serial), "the forwarded ack must carry the real serial, unmodified");
 
     host_listener_task.abort();
-}
-
-/// Regression test for a stale-bookkeeping bug found 2026-08-08:
-/// `pending_configure_acks` (guest xdg_surface id -> our own invented
-/// post-recovery serial, see `full_reconnect_recreates_surface_chain_and_synthesizes_configure`
-/// above) was cleared from `objects`/`graph` on `wl_display.delete_id` but
-/// never from `pending_configure_acks` itself. If a toplevel is destroyed
-/// before ever ack'ing a synthesized post-recovery configure, and a *new*
-/// xdg_surface later reuses that same now-free guest id (libwayland-client
-/// reuses freed low ids), a real `ack_configure` for the new object could
-/// numerically collide with the stale leftover serial and get wrongly
-/// swallowed instead of forwarded to the real compositor, which is
-/// legitimately waiting on it. Drives the second life's host connection
-/// directly (no `serve_fake_compositor_life` background task) since this
-/// test, unlike the ones using that helper, needs to inject a host-issued
-/// `delete_id` mid-scenario, not just observe replayed requests.
-#[tokio::test]
-async fn pending_configure_ack_is_forgotten_when_its_surface_is_deleted_before_acking() {
-    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-    use tokio::io::AsyncWriteExt;
-    use wayland_proxy::wire;
-
-    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6), ("xdg_wm_base", 6)];
-
-    let tmp_dir =
-        std::env::temp_dir().join(format!("wayland-proxy-stale-configure-ack-test-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
-    let host_socket_path = tmp_dir.join("host.sock");
-    let _ = std::fs::remove_file(&host_socket_path);
-    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
-
-    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
-    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path)
-        .await
-        .expect("initial host connect");
-    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
-
-    let host_socket_path_for_proxy = host_socket_path.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
-                .await
-        {
-            eprintln!("run_connection ended with error: {e:?}");
-        }
-    });
-
-    let (first_sink, _first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
-    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
-
-    // First life: get_registry(2), sync(3), bind wl_compositor(4)/xdg_wm_base(5),
-    // create_surface->6, get_xdg_surface->7, get_toplevel->8 -- identical
-    // setup to full_reconnect_recreates_surface_chain_and_synthesizes_configure.
-    let mut out = Vec::new();
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 2);
-    out.extend(wire::build_message(1, 1, &p)); // get_registry
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 3);
-    out.extend(wire::build_message(1, 0, &p)); // sync
-    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
-
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    let mut wl_compositor_name = None;
-    let mut xdg_wm_base_name = None;
-    'collect: loop {
-        use tokio::io::AsyncReadExt;
-        let n = tokio::time::timeout(Duration::from_secs(3), gtk_test_side.read(&mut tmp))
-            .await
-            .expect("timed out collecting globals")
-            .expect("read error");
-        assert_ne!(n, 0);
-        buf.extend_from_slice(&tmp[..n]);
-        while let Some((msg, consumed)) = wire::take_message(&buf) {
-            let header = wire::MessageHeader::parse(msg).unwrap();
-            let payload = &msg[wire::HEADER_LEN..];
-            if header.sender_id == 2 && header.opcode == 0 {
-                if let (Some(name), Some((iface, _))) = (wire::read_u32(payload, 0), wire::read_str(payload, 4)) {
-                    match iface.as_str() {
-                        "wl_compositor" => wl_compositor_name = Some(name),
-                        "xdg_wm_base" => xdg_wm_base_name = Some(name),
-                        _ => {}
-                    }
-                }
-            } else if header.sender_id == 3 && header.opcode == 0 {
-                let consumed_len = consumed;
-                buf.drain(..consumed_len);
-                break 'collect;
-            }
-            let consumed_len = consumed;
-            buf.drain(..consumed_len);
-        }
-    }
-    let wl_compositor_name = wl_compositor_name.expect("wl_compositor should have been advertised");
-    let xdg_wm_base_name = xdg_wm_base_name.expect("xdg_wm_base should have been advertised");
-
-    let mut out = Vec::new();
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, wl_compositor_name);
-    wire::put_str(&mut p, "wl_compositor");
-    wire::put_u32(&mut p, 6);
-    wire::put_u32(&mut p, 4);
-    out.extend(wire::build_message(2, 0, &p)); // bind -> wl_compositor(4)
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, xdg_wm_base_name);
-    wire::put_str(&mut p, "xdg_wm_base");
-    wire::put_u32(&mut p, 6);
-    wire::put_u32(&mut p, 5);
-    out.extend(wire::build_message(2, 0, &p)); // bind -> xdg_wm_base(5)
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 6);
-    out.extend(wire::build_message(4, 0, &p)); // create_surface -> wl_surface(6)
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 7);
-    wire::put_u32(&mut p, 6);
-    out.extend(wire::build_message(5, 2, &p)); // get_xdg_surface(surface=6) -> xdg_surface(7)
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 8);
-    out.extend(wire::build_message(7, 1, &p)); // get_toplevel -> xdg_toplevel(8)
-    gtk_test_side.write_all(&out).await.expect("write bind+create chain");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Crash. Second life is driven directly (not via serve_fake_compositor_life)
-    // so the test can write a host-issued delete_id into it partway through.
-    first_life_task.abort();
-    let (mut second_host_accepted, _) = tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
-        .await
-        .expect("proxy should reconnect within 3s")
-        .expect("accept second host conn");
-
-    // The proxy's own internal registry re-fetch: get_registry(new_id),
-    // sync(new_id) -- same auto-answer logic as serve_fake_compositor_life,
-    // inlined here since this test needs direct write access afterward.
-    let registry_and_sync = read_n_messages(&mut second_host_accepted, 2).await;
-    let registry_header = wire::MessageHeader::parse(&registry_and_sync[0]).expect("valid header");
-    assert_eq!(registry_header.opcode, 1, "get_registry opcode");
-    let registry_id = wire::read_u32(&registry_and_sync[0][wire::HEADER_LEN..], 0).expect("registry new_id");
-    let sync_header = wire::MessageHeader::parse(&registry_and_sync[1]).expect("valid header");
-    assert_eq!(sync_header.opcode, 0, "sync opcode");
-    let sync_id = wire::read_u32(&registry_and_sync[1][wire::HEADER_LEN..], 0).expect("sync new_id");
-
-    let mut out = Vec::new();
-    for (i, (iface, version)) in GLOBALS.iter().enumerate() {
-        let mut p = Vec::new();
-        wire::put_u32(&mut p, 101 + i as u32);
-        wire::put_str(&mut p, iface);
-        wire::put_u32(&mut p, *version);
-        out.extend(wire::build_message(registry_id, 0, &p));
-    }
-    let mut done_payload = Vec::new();
-    wire::put_u32(&mut done_payload, 0);
-    out.extend(wire::build_message(sync_id, 0, &done_payload));
-    second_host_accepted.write_all(&out).await.expect("write globals+done");
-
-    // Recovery replays the same 5 requests as
-    // full_reconnect_recreates_surface_chain_and_synthesizes_configure:
-    // bind(wl_compositor), bind(xdg_wm_base), create_surface, get_xdg_surface,
-    // get_toplevel.
-    let replay = read_n_messages(&mut second_host_accepted, 5).await;
-    let recreated_xdg_surface_host_id = wire::read_u32(&replay[3][wire::HEADER_LEN..], 0).unwrap();
-
-    // Synthesized xdg_toplevel.configure + xdg_surface.configure, same
-    // pair as full_reconnect_recreates_surface_chain_and_synthesizes_configure
-    // -- the client never acks the second one, unlike that test.
-    let synthesized = read_n_messages(&mut gtk_test_side, 2).await;
-    let configure = &synthesized[1];
-    let header = wire::MessageHeader::parse(configure).expect("valid header");
-    assert_eq!(header.sender_id, 7, "configure should target the original xdg_surface guest id");
-    let synthetic_serial = wire::read_u32(&configure[wire::HEADER_LEN..], 0).expect("configure serial");
-    assert_eq!(
-        synthetic_serial, 1,
-        "next_configure_serial starts at 1 every reconnect -- exactly the collision-prone value this test relies on"
-    );
-
-    // The client destroys its xdg_surface(7) without ever ack'ing the
-    // synthesized configure above -- e.g. the window was closed before it
-    // got a chance to repaint. xdg_surface.destroy is opcode 0.
-    gtk_test_side.write_all(&wire::build_message(7, 0, &[])).await.expect("write xdg_surface.destroy");
-    let destroy = read_one_message(&mut second_host_accepted).await;
-    let destroy_header = wire::MessageHeader::parse(&destroy).expect("valid header");
-    assert_eq!(destroy_header.sender_id, recreated_xdg_surface_host_id);
-    assert_eq!(destroy_header.opcode, 0, "xdg_surface.destroy opcode");
-
-    // The real compositor confirms the destroy the way it always does --
-    // this is the event the delete_id handler must use to forget the now-
-    // stale pending_configure_acks(7 -> 1) entry too, not just the Shadow
-    // Table/RecreationGraph entries it already forgot.
-    let mut delete_id_payload = Vec::new();
-    wire::put_u32(&mut delete_id_payload, recreated_xdg_surface_host_id);
-    second_host_accepted
-        .write_all(&wire::build_message(1, 1, &delete_id_payload))
-        .await
-        .expect("write delete_id");
-    let delete_id_on_client = read_one_message(&mut gtk_test_side).await;
-    let delete_id_header = wire::MessageHeader::parse(&delete_id_on_client).expect("valid header");
-    assert_eq!(delete_id_header.sender_id, 1, "delete_id is always sent from wl_display");
-    assert_eq!(delete_id_header.opcode, 1, "delete_id event opcode");
-    assert_eq!(
-        wire::read_u32(&delete_id_on_client[wire::HEADER_LEN..], 0),
-        Some(7),
-        "should free the client's own original guest id 7"
-    );
-
-    // The client creates a *new* xdg_surface, reusing guest id 7 -- exactly
-    // what libwayland-client's own id allocator does with a freed low id.
-    // Reuses the still-live wl_surface(6); nothing in this test needs a
-    // fresh one.
-    let mut p = Vec::new();
-    wire::put_u32(&mut p, 7);
-    wire::put_u32(&mut p, 6);
-    gtk_test_side
-        .write_all(&wire::build_message(5, 2, &p)) // xdg_wm_base(5).get_xdg_surface(surface=6) -> xdg_surface(7)
-        .await
-        .expect("write get_xdg_surface");
-    let new_get_xdg_surface = read_one_message(&mut second_host_accepted).await;
-    let new_get_xdg_surface_header = wire::MessageHeader::parse(&new_get_xdg_surface).expect("valid header");
-    assert_eq!(new_get_xdg_surface_header.opcode, 2, "get_xdg_surface opcode");
-    let new_xdg_surface_host_id = wire::read_u32(&new_get_xdg_surface[wire::HEADER_LEN..], 0).unwrap();
-    assert_ne!(
-        new_xdg_surface_host_id, recreated_xdg_surface_host_id,
-        "the new xdg_surface must get its own fresh host id, even though it reuses the old guest id"
-    );
-
-    // The client acks a *real* configure for this new object with serial 1
-    // -- numerically identical to the stale synthetic serial the destroyed
-    // xdg_surface(7) never got around to ack'ing. Without the fix, this
-    // gets wrongly matched against the leftover pending_configure_acks(7)
-    // entry and silently swallowed instead of forwarded; the real
-    // compositor would then be left waiting forever for an ack it's
-    // legitimately owed.
-    let mut ack_payload = Vec::new();
-    wire::put_u32(&mut ack_payload, 1);
-    gtk_test_side
-        .write_all(&wire::build_message(7, 4, &ack_payload)) // xdg_surface(7).ack_configure(1)
-        .await
-        .expect("write ack_configure");
-    let forwarded_ack = read_one_message(&mut second_host_accepted).await;
-    let forwarded_ack_header = wire::MessageHeader::parse(&forwarded_ack).expect("valid header");
-    assert_eq!(
-        forwarded_ack_header.sender_id, new_xdg_surface_host_id,
-        "a real ack_configure for the *new* xdg_surface must reach the real compositor, not be \
-         swallowed as if it were answering the destroyed xdg_surface's stale synthetic configure"
-    );
-    assert_eq!(forwarded_ack_header.opcode, 4, "ack_configure opcode");
-    assert_eq!(wire::read_u32(&forwarded_ack[wire::HEADER_LEN..], 0), Some(1));
 }
 
 /// implementation-constraints.md's "Buffer Lifetimes" rule: a
@@ -2303,18 +2150,21 @@ async fn stale_wl_buffer_attach_is_dropped_not_forwarded_after_reconnect() {
         serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
     });
 
-    // Recovery replays exactly 5 requests to recreate wl_compositor,
-    // xdg_wm_base, wl_surface, xdg_surface, xdg_toplevel -- wl_buffer is
+    // Recovery replays exactly 6 requests to recreate wl_compositor,
+    // xdg_wm_base, wl_surface, xdg_surface, xdg_toplevel, then an empty
+    // wl_surface.commit (the real configure handshake trigger, see
+    // recover_state_after_reconnect's own XdgToplevel arm) -- wl_buffer is
     // deliberately NOT part of the recreation graph (see recreation.rs),
-    // so no 6th replay for it.
-    for _ in 0..5 {
+    // so no replay for it.
+    for _ in 0..6 {
         tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
             .await
             .expect("timed out waiting for a recreation request")
             .expect("sink closed early");
     }
 
-    // Drain the synthesized xdg_toplevel.configure (guest id 8) then ack
+    // Drain the real xdg_toplevel.configure (guest id 8, relayed from
+    // serve_fake_compositor_life's own reply to the commit above) then ack
     // the xdg_surface.configure (guest id 7), same sequence as
     // full_reconnect_recreates_surface_chain_and_synthesizes_configure --
     // this must happen before the stale attach below to prove the attach
@@ -2329,13 +2179,23 @@ async fn stale_wl_buffer_attach_is_dropped_not_forwarded_after_reconnect() {
     let configure = synthesized.next().unwrap();
     let header = wire::MessageHeader::parse(&configure).expect("valid header");
     assert_eq!(header.sender_id, 7, "configure should target the original xdg_surface guest id");
-    let synthetic_serial = wire::read_u32(&configure[wire::HEADER_LEN..], 0).expect("configure serial");
+    let real_serial = wire::read_u32(&configure[wire::HEADER_LEN..], 0).expect("configure serial");
     let mut ack_payload = Vec::new();
-    wire::put_u32(&mut ack_payload, synthetic_serial);
+    wire::put_u32(&mut ack_payload, real_serial);
     gtk_test_side
         .write_all(&wire::build_message(7, 4, &ack_payload))
         .await
         .expect("write ack_configure");
+
+    // The ack above is now a real one the second life issued, so it DOES
+    // reach the host (unlike the old invented-serial design) -- drain it
+    // before the stale-attach check below, or it'd be mistaken for
+    // "something unexpected arrived after the attach" the same way the
+    // undrained commit was.
+    tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+        .await
+        .expect("timed out waiting for the ack_configure to reach the real compositor")
+        .expect("sink closed early");
 
     // The actual scenario: attach the STALE (pre-reconnect) buffer guest id
     // (9) to the freshly-recreated surface (guest id 6, unchanged by the
@@ -2902,12 +2762,14 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
         serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
     });
 
-    // Recovery replays exactly 8 requests, in the order the client
+    // Recovery replays exactly 9 requests, in the order the client
     // originally issued them: bind(wl_compositor), bind(xdg_wm_base),
-    // bind(wl_shm), create_surface, get_xdg_surface, get_toplevel,
-    // create_pool, create_buffer.
+    // bind(wl_shm), create_surface, get_xdg_surface, get_toplevel, an
+    // empty wl_surface.commit (the real configure handshake trigger, see
+    // recover_state_after_reconnect's own XdgToplevel arm), create_pool,
+    // create_buffer.
     let mut observed = Vec::new();
-    for i in 0..8 {
+    for i in 0..9 {
         let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for recreation request #{i}, got so far: {observed:?}"))
@@ -2924,25 +2786,30 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
     assert_eq!(iface, "wl_shm", "third bind should be wl_shm, matching the client's own bind order");
     let recreated_shm_host_id = bind_new_id(&observed[2].2);
 
+    // The initial, empty wl_surface.commit -- see
+    // full_reconnect_recreates_surface_chain_and_synthesizes_configure's
+    // own assertion on this same message for the full explanation.
+    assert_eq!(observed[6].1, 6, "wl_surface.commit opcode");
+
     // create_pool: sent to the freshly re-bound wl_shm (not any earlier
     // object), carrying the ORIGINAL size (4096) -- not something derived
     // from the new compositor, which never advertised a size at all.
-    assert_eq!(observed[6].0, recreated_shm_host_id, "create_pool should target wl_shm's freshly recreated host id");
-    assert_eq!(observed[6].1, 0, "create_pool opcode");
-    let recreated_pool_host_id = wire::read_u32(&observed[6].2, 0).unwrap();
-    let replayed_size = wire::read_u32(&observed[6].2, 4).unwrap();
+    assert_eq!(observed[7].0, recreated_shm_host_id, "create_pool should target wl_shm's freshly recreated host id");
+    assert_eq!(observed[7].1, 0, "create_pool opcode");
+    let recreated_pool_host_id = wire::read_u32(&observed[7].2, 0).unwrap();
+    let replayed_size = wire::read_u32(&observed[7].2, 4).unwrap();
     assert_eq!(replayed_size, 4096, "replayed create_pool should carry the pool's originally-recorded size");
 
     // create_buffer: sent to the freshly recreated pool, referencing its
     // NEW host id -- not the pool's stale first-life one -- and carrying
     // the buffer's originally-recorded offset/width/height/stride/format.
-    assert_eq!(observed[7].0, recreated_pool_host_id, "create_buffer should target the pool's freshly recreated host id");
-    assert_eq!(observed[7].1, 0, "create_buffer opcode");
-    assert_eq!(wire::read_u32(&observed[7].2, 4), Some(0), "offset");
-    assert_eq!(wire::read_u32(&observed[7].2, 8), Some(64), "width");
-    assert_eq!(wire::read_u32(&observed[7].2, 12), Some(64), "height");
-    assert_eq!(wire::read_u32(&observed[7].2, 16), Some(256), "stride");
-    assert_eq!(wire::read_u32(&observed[7].2, 20), Some(0), "format");
+    assert_eq!(observed[8].0, recreated_pool_host_id, "create_buffer should target the pool's freshly recreated host id");
+    assert_eq!(observed[8].1, 0, "create_buffer opcode");
+    assert_eq!(wire::read_u32(&observed[8].2, 4), Some(0), "offset");
+    assert_eq!(wire::read_u32(&observed[8].2, 8), Some(64), "width");
+    assert_eq!(wire::read_u32(&observed[8].2, 12), Some(64), "height");
+    assert_eq!(wire::read_u32(&observed[8].2, 16), Some(256), "stride");
+    assert_eq!(wire::read_u32(&observed[8].2, 20), Some(0), "format");
 
     host_listener_task.abort();
 }
