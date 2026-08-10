@@ -674,6 +674,17 @@ async fn relay_ready_messages(
                             Some(guest_deleted_id) => {
                                 objects.remove_guest(guest_deleted_id);
                                 graph.remove(guest_deleted_id);
+                                // A synthesized post-recovery configure this
+                                // id never got around to ack'ing before being
+                                // destroyed -- without this, the entry
+                                // outlives the object and can wrongly match a
+                                // *different* xdg_surface that later reuses
+                                // this same guest id (see the regression test
+                                // for the exact collision: our own synthetic
+                                // serials restart at 1 every reconnect, the
+                                // same range a freshly-crashed compositor's
+                                // own serial counter is in too).
+                                pending_configure_acks.remove(&guest_deleted_id);
                                 msg[wire::HEADER_LEN..wire::HEADER_LEN + 4]
                                     .copy_from_slice(&guest_deleted_id.to_ne_bytes());
                             }
