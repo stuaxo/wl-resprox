@@ -32,15 +32,38 @@ fn short_test_dir(name: &str) -> PathBuf {
 /// process right now -- the real precondition every test here needs,
 /// checked directly rather than just reading ptrace_scope (which doesn't
 /// account for CAP_SYS_PTRACE also satisfying the requirement).
+///
+/// Found live 2026-08-10, the hard way: an earlier version of this spawned
+/// `dummy` as a plain direct child of the test process and tried to seize
+/// THAT. Yama's restricted mode (ptrace_scope=1, the normal default --
+/// this machine's own value once the earlier debugging session's
+/// deliberate relaxation to 0 was correctly reverted) always permits
+/// tracing your own direct children regardless of scope, so that check
+/// reported "available" unconditionally -- passing even when the real
+/// scenario this whole file exists to test (socket-handoff, a wholly
+/// unrelated process, seizing gnome-shell, a stranger's child) was
+/// genuinely blocked, and the tests below failed outright with EPERM
+/// instead of skipping. Fixed by spawning the dummy detached (backgrounded
+/// by a shell that immediately exits), so it's reparented away to init and
+/// is a true non-descendant by the time we try to seize it -- an accurate
+/// stand-in for the real target relationship, not merely "any ptrace call
+/// at all works".
 fn ptrace_seize_available() -> bool {
-    let Ok(mut dummy) = Command::new("sleep").arg("5").stdout(Stdio::null()).spawn() else { return false };
-    let pid = nix::unistd::Pid::from_raw(dummy.id() as i32);
+    let Ok(output) = Command::new("sh")
+        .args(["-c", "setsid sleep 5 </dev/null >/dev/null 2>&1 & echo $!"])
+        .output()
+    else {
+        return false;
+    };
+    let Ok(dummy_pid) = String::from_utf8_lossy(&output.stdout).trim().parse::<i32>() else {
+        return false;
+    };
+    let pid = nix::unistd::Pid::from_raw(dummy_pid);
     let available = nix::sys::ptrace::seize(pid, nix::sys::ptrace::Options::empty()).is_ok();
     if available {
         let _ = nix::sys::ptrace::detach(pid, None);
     }
-    let _ = dummy.kill();
-    let _ = dummy.wait();
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
     available
 }
 

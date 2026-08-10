@@ -104,6 +104,15 @@ fn ignores_a_preexisting_stale_file_and_picks_up_the_real_one() {
 /// ever creating the watched file (e.g. gnome-shell crashing during its
 /// own startup, before wl_display_add_socket), socket-handoff must fail
 /// promptly -- not hang until --timeout-secs, and not report success.
+///
+/// Explicitly `--freeze-method=sigstop`, same reasoning as
+/// `ignores_a_preexisting_stale_file_and_picks_up_the_real_one` above:
+/// this test is about the shared liveness-check contract, not the
+/// ptrace mechanism specifically, and leaving it on the (now-default)
+/// ptrace method meant it silently depended on `ptrace_scope` being
+/// relaxed -- found live 2026-08-10 when it started failing with EPERM
+/// the moment `ptrace_scope` was correctly reverted back to its normal
+/// value, which would have broken this in CI and any fresh clone too.
 #[test]
 fn exits_promptly_and_nonzero_if_the_target_dies_first() {
     let dir = short_test_dir("dies-first");
@@ -129,6 +138,8 @@ fn exits_promptly_and_nonzero_if_the_target_dies_first() {
             &target_pid.to_string(),
             "--timeout-secs",
             "10",
+            "--freeze-method",
+            "sigstop",
         ])
         .output()
         .expect("run socket-handoff");
