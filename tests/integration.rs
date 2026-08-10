@@ -347,7 +347,7 @@ async fn proxy_survives_rapid_bind_burst_from_a_real_client() {
             .await
             .expect("proxy connect to host");
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_stream, compositor_stream, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new()).await
+            wayland_proxy::run_connection(gtk_stream, compositor_stream, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[]))).await
         {
             eprintln!("run_connection ended with error: {e:?}");
         }
@@ -482,7 +482,7 @@ async fn shadow_table_translates_new_id_and_delete_id_round_trip() {
         // Never used -- this test never triggers a freeze/reconnect --
         // but run_connection needs a path unconditionally.
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
-        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, wayland_proxy::clipboard::ClipboardCache::new()).await {
+        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[]))).await {
             eprintln!("run_connection ended with error: {e:?}");
         }
     });
@@ -522,6 +522,170 @@ async fn shadow_table_translates_new_id_and_delete_id_round_trip() {
     );
 }
 
+/// Proves the PID-based app_id correction (desktop_apps.rs, see
+/// docs/KNOWN_BUGS.md's PID-collision entry) actually rewrites the wire
+/// message reaching the compositor, not just RecreationGraph's own
+/// bookkeeping: a client sending an app_id that matches nothing
+/// installed, but whose real PID's own binary does, should have the
+/// *corrected* id forwarded -- gnome-shell's own resolution needs the
+/// right string on the wire, not a proxy-internal record of what it
+/// "should" have been.
+#[tokio::test]
+async fn set_app_id_is_corrected_using_the_clients_real_pid() {
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("wl_compositor", 6), ("xdg_wm_base", 6)];
+
+    // A .desktop file whose Exec= matches THIS test binary's own real
+    // executable -- std::process::id() is a genuine, live pid (this
+    // process), so /proc/<pid>/exe resolves for real, exactly the
+    // lookup desktop_apps::binary_name_for_pid does for a real client.
+    let exe_name = std::env::current_exe()
+        .expect("current_exe")
+        .file_name()
+        .expect("exe file name")
+        .to_str()
+        .expect("exe name is utf8")
+        .to_string();
+    let scratch_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-app-id-correction-test-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+    std::fs::write(
+        scratch_dir.join("org.example.RealApp.desktop"),
+        format!("[Desktop Entry]\nName=Real App\nExec={exe_name}\nType=Application\n"),
+    )
+    .expect("write desktop file");
+    let desktop_apps = std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(
+        std::slice::from_ref(&scratch_dir),
+    ));
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-app-id-correction-host-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let host_conn = tokio::net::UnixStream::connect(&host_socket_path).await.expect("host connect");
+    let (host_accepted, _) = host_listener.accept().await.expect("accept host conn");
+
+    tokio::spawn(async move {
+        if let Err(e) = wayland_proxy::run_connection(
+            gtk_proxy_side,
+            host_conn,
+            host_socket_path,
+            Some(std::process::id() as i32),
+            wayland_proxy::clipboard::ClipboardCache::new(),
+            desktop_apps,
+        )
+        .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(serve_fake_compositor_life(host_accepted, GLOBALS, 1, sink));
+
+    // Same bind+create chain as full_reconnect_recreates_surface_chain_and_synthesizes_configure.
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p)); // get_registry
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p)); // sync
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let mut wl_compositor_name = None;
+    let mut xdg_wm_base_name = None;
+    'collect: loop {
+        use tokio::io::AsyncReadExt;
+        let n = tokio::time::timeout(Duration::from_secs(3), gtk_test_side.read(&mut tmp))
+            .await
+            .expect("timed out collecting globals")
+            .expect("read error");
+        assert_ne!(n, 0);
+        buf.extend_from_slice(&tmp[..n]);
+        while let Some((msg, consumed)) = wire::take_message(&buf) {
+            let header = wire::MessageHeader::parse(msg).unwrap();
+            let payload = &msg[wire::HEADER_LEN..];
+            if header.sender_id == 2 && header.opcode == 0 {
+                if let (Some(name), Some((iface, _))) = (wire::read_u32(payload, 0), wire::read_str(payload, 4)) {
+                    match iface.as_str() {
+                        "wl_compositor" => wl_compositor_name = Some(name),
+                        "xdg_wm_base" => xdg_wm_base_name = Some(name),
+                        _ => {}
+                    }
+                }
+            } else if header.sender_id == 3 && header.opcode == 0 {
+                buf.drain(..consumed);
+                break 'collect;
+            }
+            buf.drain(..consumed);
+        }
+    }
+    let wl_compositor_name = wl_compositor_name.expect("wl_compositor advertised");
+    let xdg_wm_base_name = xdg_wm_base_name.expect("xdg_wm_base advertised");
+
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, wl_compositor_name);
+    wire::put_str(&mut p, "wl_compositor");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 4);
+    out.extend(wire::build_message(2, 0, &p)); // bind -> wl_compositor(4)
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, xdg_wm_base_name);
+    wire::put_str(&mut p, "xdg_wm_base");
+    wire::put_u32(&mut p, 6);
+    wire::put_u32(&mut p, 5);
+    out.extend(wire::build_message(2, 0, &p)); // bind -> xdg_wm_base(5)
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(4, 0, &p)); // create_surface -> wl_surface(6)
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 7);
+    wire::put_u32(&mut p, 6);
+    out.extend(wire::build_message(5, 2, &p)); // get_xdg_surface(surface=6) -> xdg_surface(7)
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 8);
+    out.extend(wire::build_message(7, 1, &p)); // get_toplevel -> xdg_toplevel(8)
+    gtk_test_side.write_all(&out).await.expect("write bind+create chain");
+
+    // Drain the 5 setup messages the sink observes (bind x2, create_surface,
+    // get_xdg_surface, get_toplevel) before the one this test cares about.
+    for _ in 0..5 {
+        tokio::time::timeout(Duration::from_secs(3), sink_rx.recv())
+            .await
+            .expect("timed out waiting for setup message")
+            .expect("sink closed early");
+    }
+
+    // The actual test: an app_id that matches nothing installed.
+    let mut p = Vec::new();
+    wire::put_str(&mut p, "some-mismatched-app-id");
+    gtk_test_side.write_all(&wire::build_message(8, 3, &p)).await.expect("write set_app_id"); // xdg_toplevel(8).set_app_id
+
+    let (_sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), sink_rx.recv())
+        .await
+        .expect("timed out waiting for set_app_id")
+        .expect("sink closed early");
+    assert_eq!(opcode, 3, "set_app_id opcode");
+    let (forwarded_app_id, _) = wire::read_str(&payload, 0).expect("app_id string");
+    assert_eq!(
+        forwarded_app_id, "org.example.RealApp",
+        "the compositor should see the corrected app_id (resolved from this test's own real pid), \
+         not the client's original mismatched string"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+}
+
 /// Found live 2026-08-03 via WAYLAND_DEBUG=1 against a real tilix (see
 /// plan-desktop-resilience.md): `recover_state_after_reconnect` allocates
 /// host id 3 for its own internal `wl_display.sync` (used only to detect
@@ -547,7 +711,7 @@ async fn delete_id_for_an_untracked_host_id_is_dropped_not_forwarded() {
 
     tokio::spawn(async move {
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
-        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, wayland_proxy::clipboard::ClipboardCache::new()).await {
+        if let Err(e) = wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[]))).await {
             eprintln!("run_connection ended with error: {e:?}");
         }
     });
@@ -610,7 +774,7 @@ async fn reconnect_rebinds_globals_at_the_clients_originally_requested_version()
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -747,7 +911,7 @@ async fn create_pool_on_a_stale_wl_shm_does_not_leave_a_phantom_mapping() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -872,7 +1036,7 @@ async fn frame_request_during_the_recovery_window_gets_a_synthesized_done() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1047,7 +1211,7 @@ async fn proxy_reconnects_to_a_restarted_compositor() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1192,7 +1356,7 @@ async fn full_reconnect_recreates_surface_chain_and_synthesizes_configure() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1459,7 +1623,7 @@ async fn pending_configure_ack_is_forgotten_when_its_surface_is_deleted_before_a
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1707,7 +1871,7 @@ async fn stale_wl_buffer_release_is_dropped_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -1881,7 +2045,7 @@ async fn stale_wl_buffer_attach_is_dropped_not_forwarded_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2088,7 +2252,7 @@ async fn stale_wl_buffer_destroy_synthesizes_delete_id_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2206,7 +2370,7 @@ async fn grab_state_is_released_before_traffic_resumes_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2451,7 +2615,7 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2677,7 +2841,7 @@ async fn in_flight_buffer_gets_a_synthesized_release_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2861,7 +3025,7 @@ async fn frame_forwarded_before_a_crash_gets_a_synthesized_done_after_reconnect(
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -2985,7 +3149,7 @@ async fn dmabuf_buffer_recipe_replays_correctly_after_reconnect() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -3202,7 +3366,7 @@ async fn dropped_new_id_message_does_not_burn_a_host_id() {
     let host_socket_path_for_proxy = host_socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new())
+            wayland_proxy::run_connection(gtk_proxy_side, first_host_conn, host_socket_path_for_proxy, None, wayland_proxy::clipboard::ClipboardCache::new(), std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])))
                 .await
         {
             eprintln!("run_connection ended with error: {e:?}");
@@ -3352,8 +3516,15 @@ async fn wl_data_source_send_is_teed_into_the_clipboard_cache() {
     tokio::spawn(async move {
         let unused_path = std::path::PathBuf::from("/nonexistent/unused-in-this-test");
         if let Err(e) =
-            wayland_proxy::run_connection(gtk_proxy_side, host_proxy_side, unused_path, None, cache_for_proxy)
-                .await
+            wayland_proxy::run_connection(
+                gtk_proxy_side,
+                host_proxy_side,
+                unused_path,
+                None,
+                cache_for_proxy,
+                std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])),
+            )
+            .await
         {
             eprintln!("run_connection ended with error: {e:?}");
         }
@@ -3486,6 +3657,7 @@ async fn clipboard_is_reclaimed_on_first_real_serial_after_reconnect() {
             host_socket_path_for_proxy,
             None,
             cache_for_proxy,
+            std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])),
         )
         .await
         {
@@ -3756,6 +3928,7 @@ async fn run_client_reconnect_scenario(label: &'static str, title: &str, app_id:
             host_socket_path_for_proxy,
             None,
             wayland_proxy::clipboard::ClipboardCache::new(),
+            std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])),
         )
         .await
         {
@@ -4090,7 +4263,15 @@ async fn two_real_clients_copy_paste_survives_a_crash_and_keeps_working_after() 
         let path = a_host_path.clone();
         let cache = cache.clone();
         tokio::spawn(async move {
-            let _ = wayland_proxy::run_connection(a_gtk_proxy, a_first_conn, path, None, cache).await;
+            let _ = wayland_proxy::run_connection(
+                a_gtk_proxy,
+                a_first_conn,
+                path,
+                None,
+                cache,
+                std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])),
+            )
+            .await;
         });
     }
 
@@ -4150,7 +4331,15 @@ async fn two_real_clients_copy_paste_survives_a_crash_and_keeps_working_after() 
         let path = b_host_path.clone();
         let cache = cache.clone();
         tokio::spawn(async move {
-            let _ = wayland_proxy::run_connection(b_gtk_proxy, b_first_conn, path, None, cache).await;
+            let _ = wayland_proxy::run_connection(
+                b_gtk_proxy,
+                b_first_conn,
+                path,
+                None,
+                cache,
+                std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])),
+            )
+            .await;
         });
     }
 
