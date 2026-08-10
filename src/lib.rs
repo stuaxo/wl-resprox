@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use wayland_backend::protocol::{ArgumentType, Interface, MessageDesc};
 
 pub mod buffer_flow;
+pub mod clipboard;
 pub mod fdsocket;
 pub mod grab_state;
 pub mod interfaces;
@@ -258,6 +259,8 @@ async fn relay_ready_messages(
     buffer_flow: &mut BufferFlowTracker,
     pending_frames: &mut PendingFrameTracker,
     pending_dmabuf_planes: &mut std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)>,
+    clipboard_cache: &clipboard::SharedClipboardCache,
+    reclaim: &mut clipboard::ReclaimState,
     direction: Direction,
 ) -> Result<()> {
     'relay: loop {
@@ -266,6 +269,18 @@ async fn relay_ready_messages(
         };
         let mut msg = src.read_buf[..consumed].to_vec();
         let header = wire::MessageHeader::parse(&msg).expect("take_message already validated this");
+
+        // required for clipboard copy: our own synthetic wl_data_source
+        // (see attempt_clipboard_splice) has no guest-side counterpart at
+        // all, so the normal guest-id-driven resolution just below would
+        // see it as an untranslatable object and drop it -- intercept its
+        // events here, before that, using our own bookkeeping instead of
+        // the shadow table.
+        if matches!(direction, Direction::HostToClient) && Some(header.sender_id) == reclaim.active_source_host_id {
+            handle_synthetic_clipboard_event(src, &msg, header.opcode, clipboard_cache, reclaim).await;
+            src.read_buf.drain(..consumed);
+            continue 'relay;
+        }
 
         // The wire's sender_id is in the *sender's own* address space:
         // already a guest id for a client request, but a host id for a
@@ -726,6 +741,32 @@ async fn relay_ready_messages(
                     }
                 }
 
+                // required for clipboard copy: the first real,
+                // compositor-issued input serial this connection sees
+                // after a reconnect gets borrowed to re-establish the
+                // proxy as clipboard owner from cached bytes -- see
+                // attempt_clipboard_splice and docs/adr/adr-0009-
+                // clipboard-persistence.md, which live-verified a
+                // fabricated serial gets rejected but a real one, even
+                // issued for something unrelated like this, is accepted.
+                if reclaim.pending
+                    && matches!(direction, Direction::HostToClient)
+                    && matches!(
+                        (interface.name, desc.name),
+                        ("wl_pointer", "enter")
+                            | ("wl_pointer", "leave")
+                            | ("wl_pointer", "button")
+                            | ("wl_keyboard", "enter")
+                            | ("wl_keyboard", "leave")
+                            | ("wl_keyboard", "key")
+                            | ("wl_touch", "down")
+                    )
+                {
+                    if let Some(serial) = wire::read_u32(&msg[wire::HEADER_LEN..], 0) {
+                        attempt_clipboard_splice(src, objects, reclaim, clipboard_cache, serial).await;
+                    }
+                }
+
                 // wl_shm_pool.resize(size) doesn't create a new object (no
                 // new_id), so it never goes through the new_id recipe-
                 // capture block above -- but a pool tracked by the
@@ -1000,6 +1041,27 @@ async fn relay_ready_messages(
                     }
                 }
 
+                // required for clipboard copy: wl_data_source.send's fd is
+                // the pipe the client writes the copied bytes into: swap
+                // it for a pipe of our own and tee the bytes into a cache
+                // as they go by, so a later crash or the client quitting
+                // doesn't lose them (see docs/adr/adr-0009-clipboard-
+                // persistence.md). Real fd still gets every byte, just
+                // relayed through us instead of handed straight to the
+                // client.
+                if matches!(direction, Direction::HostToClient) && interface.name == "wl_data_source" && desc.name == "send" {
+                    if let Some(mime_type) = wire::read_str(&msg[wire::HEADER_LEN..], 0).map(|(s, _)| s) {
+                        if clipboard::is_cacheable_mime(&mime_type) {
+                            if let Some(real_fd) = fds.pop() {
+                                match clipboard::start_tee(real_fd, mime_type, clipboard_cache.clone()) {
+                                    Some(client_facing_fd) => fds.push(client_facing_fd),
+                                    None => warn!("clipboard tee setup failed -- not forwarding a substitute fd"),
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(dst) = dst.as_deref_mut() {
                     let raw_fds: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
                     tracing::debug!(
@@ -1195,6 +1257,7 @@ async fn synthesize_frame_done(dst: &mut Conn, objects: &ShadowTable, callback_g
 /// connection (some windows redrawing, others not) is strictly better than
 /// none, and matches how the rest of this codebase treats an unrecoverable
 /// single message (drop and continue, not tear down the connection).
+#[allow(clippy::too_many_arguments)] // each param is its own narrowly-scoped tracker -- see relay_ready_messages' own identical allow for why bundling wouldn't help
 async fn recover_state_after_reconnect(
     host: &mut Conn,
     gtk: &mut Conn,
@@ -1203,7 +1266,13 @@ async fn recover_state_after_reconnect(
     pending_configure_acks: &mut std::collections::HashMap<u32, u32>,
     buffer_flow: &mut BufferFlowTracker,
     pending_frames: &mut PendingFrameTracker,
+    reclaim: &mut clipboard::ReclaimState,
 ) -> Result<()> {
+    // A stale host id from the previous compositor life could otherwise
+    // coincide with an unrelated fresh object once ids restart -- see
+    // ReclaimState::active_source_host_id's own doc comment.
+    reclaim.active_source_host_id = None;
+
     let Some(registry_guest_id) = objects.find_guest_id_by_interface_name("wl_registry") else {
         info!("no wl_registry tracked yet -- nothing to recover");
         return Ok(());
@@ -1237,6 +1306,10 @@ async fn recover_state_after_reconnect(
     // See Recreatable::Viewport.
     let mut wp_viewporter_global: Option<(u32, u32)> = None;
     let mut wp_fractional_scale_manager_v1_global: Option<(u32, u32)> = None;
+    // Not part of the recreation graph -- required for clipboard copy
+    // instead: attempt_clipboard_splice needs this to bind a fresh
+    // wl_data_device_manager for the reclaim attempt.
+    let mut wl_data_device_manager_global: Option<(u32, u32)> = None;
     'collect: loop {
         // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention),
         // which the `?` below does NOT catch since it's not an `Err`.
@@ -1266,6 +1339,7 @@ async fn recover_state_after_reconnect(
                                 "wl_seat" => wl_seat_global = Some((name, version)),
                                 "wp_viewporter" => wp_viewporter_global = Some((name, version)),
                                 "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global = Some((name, version)),
+                                "wl_data_device_manager" => wl_data_device_manager_global = Some((name, version)),
                                 _ => {}
                             }
                         }
@@ -1890,6 +1964,12 @@ async fn recover_state_after_reconnect(
         info!("synthesized wl_callback.done for frame callback {callback_guest_id} left over from the crash");
     }
 
+    // required for clipboard copy: enables attempt_clipboard_splice on the
+    // next real input serial this connection sees. Unconditional -- the
+    // splice itself no-ops cheaply if the cache turns out to be empty.
+    reclaim.data_device_manager_global = wl_data_device_manager_global;
+    reclaim.pending = true;
+
     Ok(())
 }
 
@@ -1956,6 +2036,156 @@ async fn synthesize_grab_releases(gtk: &mut Conn, objects: &ShadowTable, grabs: 
     Ok(())
 }
 
+/// required for clipboard copy: fires at most once per reconnect, on the
+/// first real input serial this connection observes afterward (see the
+/// call site in relay_ready_messages). Re-establishes the proxy as
+/// clipboard owner from cached bytes by borrowing that serial for
+/// `set_selection` -- confirmed live-viable in ADR-0009 (a fabricated
+/// serial gets cancelled outright; a real one, even issued for something
+/// else, is accepted). The objects created here are host-side only,
+/// never mapped into the shadow table -- the real client has no matching
+/// objects and never should.
+///
+/// Each host id is allocated immediately before the write that uses it,
+/// and unallocated on that write's own failure -- see
+/// `ShadowTable::unallocate_host_id`'s doc comment for why: a real
+/// compositor rejects the next legitimate `new_id` outright once a gap
+/// opens, so allocate-then-immediately-send-or-rollback is load-bearing,
+/// not just tidy.
+async fn attempt_clipboard_splice(
+    host: &mut Conn,
+    objects: &mut ShadowTable,
+    reclaim: &mut clipboard::ReclaimState,
+    cache: &clipboard::SharedClipboardCache,
+    serial: u32,
+) {
+    reclaim.pending = false; // one attempt per reconnect, succeed or not
+
+    let mime_types = cache.cached_mime_types();
+    if mime_types.is_empty() {
+        return; // nothing cached worth reclaiming
+    }
+    let Some((ddm_name, ddm_version)) = reclaim.data_device_manager_global else {
+        warn!("clipboard splice: compositor never advertised wl_data_device_manager -- can't reclaim");
+        return;
+    };
+    let (Some(registry_guest_id), Some(seat_guest_id)) = (
+        objects.find_guest_id_by_interface_name("wl_registry"),
+        objects.find_guest_id_by_interface_name("wl_seat"),
+    ) else {
+        warn!("clipboard splice: no wl_registry/wl_seat tracked -- can't reclaim");
+        return;
+    };
+    let (Some(registry_host_id), Some(seat_host_id)) =
+        (objects.host_id(registry_guest_id), objects.host_id(seat_guest_id))
+    else {
+        return;
+    };
+
+    let ddm_host_id = objects.allocate_host_id();
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, ddm_name);
+    wire::put_str(&mut payload, "wl_data_device_manager");
+    wire::put_u32(&mut payload, ddm_version);
+    wire::put_u32(&mut payload, ddm_host_id);
+    if let Err(e) = host.write_message(&wire::build_message(registry_host_id, 0, &payload), &[]).await {
+        warn!("clipboard splice: failed to bind wl_data_device_manager: {e}");
+        objects.unallocate_host_id(ddm_host_id);
+        return;
+    }
+
+    let source_host_id = objects.allocate_host_id();
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, source_host_id);
+    if let Err(e) = host.write_message(&wire::build_message(ddm_host_id, 0, &payload), &[]).await {
+        warn!("clipboard splice: failed to create_data_source: {e}");
+        objects.unallocate_host_id(source_host_id);
+        return;
+    }
+
+    for mime_type in &mime_types {
+        let mut payload = Vec::new();
+        wire::put_str(&mut payload, mime_type);
+        if let Err(e) = host.write_message(&wire::build_message(source_host_id, 0, &payload), &[]).await {
+            warn!("clipboard splice: failed to offer {mime_type}: {e}");
+            return;
+        }
+    }
+
+    let device_host_id = objects.allocate_host_id();
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, device_host_id);
+    wire::put_u32(&mut payload, seat_host_id);
+    if let Err(e) = host.write_message(&wire::build_message(ddm_host_id, 1, &payload), &[]).await {
+        warn!("clipboard splice: failed to get_data_device: {e}");
+        objects.unallocate_host_id(device_host_id);
+        return;
+    }
+
+    let mut payload = Vec::new();
+    wire::put_u32(&mut payload, source_host_id);
+    wire::put_u32(&mut payload, serial);
+    if let Err(e) = host.write_message(&wire::build_message(device_host_id, 1, &payload), &[]).await {
+        warn!("clipboard splice: failed to set_selection: {e}");
+        return;
+    }
+
+    info!("clipboard: attempting to reclaim {} cached mime type(s) using serial {serial}", mime_types.len());
+    reclaim.active_source_host_id = Some(source_host_id);
+}
+
+/// required for clipboard copy: handles an event addressed to our own
+/// synthetic clipboard data source (see attempt_clipboard_splice) --
+/// intercepted before the normal guest-id-driven relay even runs, since
+/// this object has no guest-side counterpart to resolve against.
+async fn handle_synthetic_clipboard_event(
+    src: &mut Conn,
+    msg: &[u8],
+    opcode: u16,
+    cache: &clipboard::SharedClipboardCache,
+    reclaim: &mut clipboard::ReclaimState,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    match opcode {
+        1 => {
+            // wl_data_source.send(mime_type, fd) -- Mutter's own
+            // eager-fetch (or a real paste elsewhere) asking for the
+            // content we claimed to offer.
+            let payload = &msg[wire::HEADER_LEN..];
+            let mime_type = wire::read_str(payload, 0).map(|(s, _)| s);
+            let Some(fd) = src.read_fds.pop_front() else {
+                warn!("clipboard splice: send() with no fd -- dropping");
+                return;
+            };
+            let Some(mime_type) = mime_type else { return };
+            let Some(bytes) = cache.get(&mime_type) else {
+                warn!("clipboard splice: send() for uncached mime {mime_type:?}");
+                return;
+            };
+            match tokio::net::unix::pipe::Sender::from_owned_fd(fd) {
+                Ok(mut sender) => {
+                    // Detached: writing the cached bytes has no bearing on
+                    // whether relaying real traffic is safe to continue.
+                    tokio::spawn(async move {
+                        if let Err(e) = sender.write_all(&bytes).await {
+                            warn!("clipboard splice: failed writing cached {mime_type} bytes: {e}");
+                        }
+                    });
+                }
+                Err(e) => warn!("clipboard splice: send()'s fd wasn't a writable pipe: {e}"),
+            }
+        }
+        2 => {
+            // cancelled -- superseded by a real copy elsewhere, expected
+            // and not an error; nothing further will arrive for this id.
+            info!("clipboard splice: reclaimed selection was superseded");
+            reclaim.active_source_host_id = None;
+        }
+        _ => {} // target/dnd_drop_performed/dnd_finished/action: DnD-only, irrelevant here
+    }
+}
+
 /// Drives one proxied connection to completion: relays messages in both
 /// directions until the GTK client disconnects. If the compositor
 /// connection drops instead, the connection freezes: the GTK-facing side
@@ -1972,6 +2202,12 @@ pub async fn run_connection(
     compositor_stream: UnixStream,
     compositor_socket_path: std::path::PathBuf,
     client_pid: Option<i32>,
+    // Process-wide, shared across every client's own run_connection --
+    // required for clipboard copy to survive the copying client quitting,
+    // not just a compositor crash while it's still running (see
+    // docs/adr/adr-0009-clipboard-persistence.md). A per-connection cache
+    // would die with this task, defeating that.
+    clipboard_cache: clipboard::SharedClipboardCache,
 ) -> Result<()> {
     let mut gtk = Conn::new(gtk_stream);
     let mut host = Conn::new(compositor_stream);
@@ -1985,6 +2221,7 @@ pub async fn run_connection(
     let mut buffer_flow = BufferFlowTracker::new();
     let mut pending_frames = PendingFrameTracker::new();
     let mut pending_dmabuf_planes: std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)> = std::collections::HashMap::new();
+    let mut reclaim = clipboard::ReclaimState::default();
 
     let mut frozen = false;
 
@@ -2000,7 +2237,7 @@ pub async fn run_connection(
                     }
                     Ok(_) => {
                         let dst = if frozen { None } else { Some(&mut host) };
-                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, Direction::ClientToHost).await?;
+                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, Direction::ClientToHost).await?;
                     }
                     Err(e) => {
                         info!("GTK client disconnected: {e}");
@@ -2015,7 +2252,7 @@ pub async fn run_connection(
                         frozen = true;
                     }
                     Ok(_) => {
-                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, Direction::HostToClient).await?;
+                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, Direction::HostToClient).await?;
                     }
                     Err(e) => {
                         info!("compositor connection lost ({e}) -- freezing, GTK client stays connected");
@@ -2034,7 +2271,7 @@ pub async fn run_connection(
                 // stays behind in the old generation, which is exactly what
                 // marks it stale for the wl_buffer.release check below.
                 objects.bump_generation();
-                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames).await {
+                match recover_state_after_reconnect(&mut host, &mut gtk, &mut objects, &graph, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut reclaim).await {
                     Ok(()) => {
                         // Must happen before traffic resumes (frozen =
                         // false, below) -- implementation-constraints.md is
