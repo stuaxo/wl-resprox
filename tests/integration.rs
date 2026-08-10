@@ -868,6 +868,153 @@ async fn reconnect_rebinds_globals_at_the_clients_originally_requested_version()
     host_listener_task.abort();
 }
 
+/// Found live 2026-08-10: a panel/dash click on an already-open window
+/// (`xdg_activation_v1.activate` on the client's *original* activation
+/// object) silently did nothing after a crash/reconnect -- the window
+/// never raised. Root cause: `xdg_activation_v1`'s own `wl_registry.bind`
+/// wasn't in the narrow set of globals `recover_state_after_reconnect`
+/// re-binds, so the client's pre-crash guest id for it was permanently
+/// stale from that point on -- any later request against it (a fresh
+/// `get_activation_token`, needed for every subsequent activate) hit the
+/// same "sender has no translation on the other side -- dropping" path
+/// as any other untracked stale id, silently eaten instead of reaching
+/// the new compositor. Proves the fix: xdg_activation_v1 is now
+/// re-bound like wl_compositor/xdg_wm_base/etc, and a request against
+/// the client's original guest id afterward actually reaches the host.
+#[tokio::test]
+async fn xdg_activation_v1_survives_a_reconnect() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    use tokio::io::AsyncWriteExt;
+    use wayland_proxy::wire;
+
+    const GLOBALS: &[(&str, u32)] = &[("xdg_activation_v1", 1)];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("wayland-proxy-xdg-activation-reconnect-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let host_socket_path = tmp_dir.join("host.sock");
+    let _ = std::fs::remove_file(&host_socket_path);
+    let host_listener = tokio::net::UnixListener::bind(&host_socket_path).expect("bind host");
+
+    let (gtk_proxy_side, mut gtk_test_side) = tokio::net::UnixStream::pair().expect("pair");
+    let first_host_conn = tokio::net::UnixStream::connect(&host_socket_path).await.expect("initial host connect");
+    let (first_host_accepted, _) = host_listener.accept().await.expect("accept first host conn");
+
+    let host_socket_path_for_proxy = host_socket_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = wayland_proxy::run_connection(
+            gtk_proxy_side,
+            first_host_conn,
+            host_socket_path_for_proxy,
+            None,
+            wayland_proxy::clipboard::ClipboardCache::new(),
+            std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build_from_dirs(&[])),
+        )
+        .await
+        {
+            eprintln!("run_connection ended with error: {e:?}");
+        }
+    });
+
+    let (first_sink, _first_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_life_task = tokio::spawn(serve_fake_compositor_life(first_host_accepted, GLOBALS, 1, first_sink));
+
+    let mut out = Vec::new();
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 2);
+    out.extend(wire::build_message(1, 1, &p)); // get_registry
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 3);
+    out.extend(wire::build_message(1, 0, &p)); // sync
+    gtk_test_side.write_all(&out).await.expect("write get_registry+sync");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let mut xdg_activation_name = None;
+    'collect: loop {
+        use tokio::io::AsyncReadExt;
+        let n = tokio::time::timeout(Duration::from_secs(3), gtk_test_side.read(&mut tmp))
+            .await
+            .expect("timed out collecting globals")
+            .expect("read error");
+        assert_ne!(n, 0);
+        buf.extend_from_slice(&tmp[..n]);
+        while let Some((msg, consumed)) = wire::take_message(&buf) {
+            let header = wire::MessageHeader::parse(msg).unwrap();
+            let payload = &msg[wire::HEADER_LEN..];
+            if header.sender_id == 2 && header.opcode == 0 {
+                if let (Some(name), Some((iface, _))) = (wire::read_u32(payload, 0), wire::read_str(payload, 4)) {
+                    if iface == "xdg_activation_v1" {
+                        xdg_activation_name = Some(name);
+                    }
+                }
+            } else if header.sender_id == 3 && header.opcode == 0 {
+                buf.drain(..consumed);
+                break 'collect;
+            }
+            buf.drain(..consumed);
+        }
+    }
+    let xdg_activation_name = xdg_activation_name.expect("xdg_activation_v1 should have been advertised");
+
+    // wl_registry(2).bind -> xdg_activation_v1(guest=4).
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, xdg_activation_name);
+    wire::put_str(&mut p, "xdg_activation_v1");
+    wire::put_u32(&mut p, 1);
+    wire::put_u32(&mut p, 4);
+    gtk_test_side.write_all(&wire::build_message(2, 0, &p)).await.expect("write bind");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Crash and reconnect.
+    first_life_task.abort();
+    let (second_sink, mut second_sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    let host_listener_task = tokio::spawn(async move {
+        let (second_host_accepted, _) = tokio::time::timeout(Duration::from_secs(3), host_listener.accept())
+            .await
+            .expect("proxy should reconnect within 3s")
+            .expect("accept second host conn");
+        serve_fake_compositor_life(second_host_accepted, GLOBALS, 101, second_sink).await;
+    });
+
+    // Recovery must replay the bind -- this alone would have passed even
+    // before the fix (Recreatable::Global capture is what's missing, not
+    // registry re-fetching), so it's necessary but not sufficient proof.
+    let (_sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+        .await
+        .expect("timed out waiting for the recreated bind")
+        .expect("sink closed early");
+    assert_eq!(opcode, 0, "bind opcode");
+    assert_eq!(wire::read_str(&payload, 4).unwrap().0, "xdg_activation_v1");
+    let (_, next) = wire::read_str(&payload, 4).unwrap();
+    let rebound_host_id = wire::read_u32(&payload, next + 4).expect("new_id");
+
+    // The actual proof: a request against the client's ORIGINAL guest id
+    // (4, unchanged by the reconnect) must reach the new compositor, not
+    // get dropped as "sender has no translation on the other side" --
+    // exactly the request a panel/dash click's activate() depends on
+    // (get_activation_token always precedes activate).
+    let mut p = Vec::new();
+    wire::put_u32(&mut p, 10);
+    gtk_test_side
+        .write_all(&wire::build_message(4, 1, &p)) // xdg_activation_v1(4).get_activation_token -> 10
+        .await
+        .expect("write get_activation_token");
+
+    let (sender, opcode, _payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+        .await
+        .expect("timed out waiting for get_activation_token -- it was dropped as untranslatable")
+        .expect("sink closed early");
+    assert_eq!(
+        sender, rebound_host_id,
+        "get_activation_token must reach the new compositor via the freshly rebound host id"
+    );
+    assert_eq!(opcode, 1, "get_activation_token opcode");
+
+    host_listener_task.abort();
+}
+
 /// Found live 2026-08-03 immediately after fixing the wl_abort/version bug
 /// above (see plan-desktop-resilience.md): a real tilix then hit a
 /// *different* fatal disconnect -- `wl_shm.create_pool sender has no

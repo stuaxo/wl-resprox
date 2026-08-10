@@ -441,7 +441,26 @@ async fn relay_ready_messages(
                                             || child_iface.name == "zwp_linux_dmabuf_v1"
                                             || child_iface.name == "wl_seat"
                                             || child_iface.name == "wp_viewporter"
-                                            || child_iface.name == "wp_fractional_scale_manager_v1" =>
+                                            || child_iface.name == "wp_fractional_scale_manager_v1"
+                                            // required so a panel/dash click
+                                            // (xdg_activation_v1.activate on
+                                            // an already-open window) still
+                                            // works after a reconnect --
+                                            // without this, the client's
+                                            // original bind is stale forever
+                                            // and every future get_activation
+                                            // _token/activate on it is
+                                            // silently dropped as
+                                            // untranslatable (see
+                                            // docs/KNOWN_BUGS.md). No child
+                                            // state to re-derive beyond the
+                                            // bind itself: xdg_activation_
+                                            // token_v1 is one-shot (created,
+                                            // used, discarded within a single
+                                            // request burst), never held
+                                            // across a reconnect the way
+                                            // wl_seat's devices are.
+                                            || child_iface.name == "xdg_activation_v1" =>
                                     {
                                         // The version the CLIENT itself
                                         // requested, not child_iface.version
@@ -1355,6 +1374,11 @@ async fn recover_state_after_reconnect(
     // See Recreatable::Viewport.
     let mut wp_viewporter_global: Option<(u32, u32)> = None;
     let mut wp_fractional_scale_manager_v1_global: Option<(u32, u32)> = None;
+    // See the "xdg_activation_v1" arm of Recreatable::Global's capture in
+    // relay_ready_messages -- a panel/dash click's activate() needs this
+    // re-bound onto the client's original guest id, or it's permanently
+    // stale after the very first reconnect.
+    let mut xdg_activation_v1_global: Option<(u32, u32)> = None;
     // Not part of the recreation graph -- required for clipboard copy
     // instead: attempt_clipboard_splice needs this to bind a fresh
     // wl_data_device_manager for the reclaim attempt.
@@ -1388,6 +1412,7 @@ async fn recover_state_after_reconnect(
                                 "wl_seat" => wl_seat_global = Some((name, version)),
                                 "wp_viewporter" => wp_viewporter_global = Some((name, version)),
                                 "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global = Some((name, version)),
+                                "xdg_activation_v1" => xdg_activation_v1_global = Some((name, version)),
                                 "wl_data_device_manager" => wl_data_device_manager_global = Some((name, version)),
                                 _ => {}
                             }
@@ -1417,6 +1442,7 @@ async fn recover_state_after_reconnect(
                     "wl_seat" => wl_seat_global,
                     "wp_viewporter" => wp_viewporter_global,
                     "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global,
+                    "xdg_activation_v1" => xdg_activation_v1_global,
                     other => {
                         warn!("recreation graph tracked an unexpected global {other} -- skipping");
                         None
