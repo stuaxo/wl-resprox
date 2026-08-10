@@ -54,6 +54,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 # for exactly the class of bug the container test matrix exists to catch
 # (see docs/KNOWN_BUGS.md and the 2026-08-10 dmabuf-recreation
 # investigation).
+#
+# python3-pyside6.qt{core,gui,widgets,opengl,openglwidgets} (2026-08-10):
+# same reasoning again, one toolkit over -- scripts/qt/basic_shm.py and
+# dmabuf_gl.py, Qt's own qtwayland EGL/dmabuf integration being a
+# genuinely different code path than GTK's own, not just the same thing
+# under a different name (see scripts/qt/common.py's own doc comment).
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
     libgtk-4-dev \
@@ -63,6 +69,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     python3-gi \
     gir1.2-gtk-3.0 \
     gir1.2-gtk-4.0 \
+    python3-pyside6.qtcore \
+    python3-pyside6.qtgui \
+    python3-pyside6.qtwidgets \
+    python3-pyside6.qtopengl \
+    python3-pyside6.qtopenglwidgets \
     libwayland-dev \
     wayland-utils \
     dbus \

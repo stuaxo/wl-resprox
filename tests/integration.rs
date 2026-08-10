@@ -2766,16 +2766,43 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
     // originally issued them: bind(wl_compositor), bind(xdg_wm_base),
     // bind(wl_shm), create_surface, get_xdg_surface, get_toplevel, an
     // empty wl_surface.commit (the real configure handshake trigger, see
-    // recover_state_after_reconnect's own XdgToplevel arm), create_pool,
-    // create_buffer.
+    // recover_state_after_reconnect's own XdgToplevel arm) -- then, only
+    // once the client below has ack'd, create_pool and create_buffer.
     let mut observed = Vec::new();
-    for i in 0..9 {
+    for i in 0..7 {
         let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for recreation request #{i}, got so far: {observed:?}"))
             .expect("sink closed early");
         observed.push((sender, opcode, payload));
     }
+
+    // The commit above prompts a real configure pair, which recovery now
+    // waits to see genuinely ack'd (see recover_state_after_reconnect's
+    // own XdgToplevel arm) before continuing on to create_pool/
+    // create_buffer below -- without this, recovery blocks for its own
+    // 5s timeout and the remaining two requests never arrive. Guest ids
+    // per this test's own scheme: xdg_toplevel=8, xdg_surface=7.
+    let synthesized = read_n_messages(&mut gtk_test_side, 2).await;
+    let configure = &synthesized[1];
+    let configure_header = wire::MessageHeader::parse(configure).expect("valid header");
+    assert_eq!(configure_header.sender_id, 7, "configure should target the client's original xdg_surface guest id");
+    let real_serial = wire::read_u32(&configure[wire::HEADER_LEN..], 0).expect("configure serial");
+    let mut ack_payload = Vec::new();
+    wire::put_u32(&mut ack_payload, real_serial);
+    gtk_test_side.write_all(&wire::build_message(7, 4, &ack_payload)).await.expect("write ack_configure");
+
+    // recover_state_after_reconnect forwards this ack straight to the
+    // real (fake) compositor before continuing on, so it shows up in the
+    // sink too, ahead of create_pool/create_buffer -- not just those two.
+    for i in 7..10 {
+        let (sender, opcode, payload) = tokio::time::timeout(Duration::from_secs(3), second_sink_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for recreation request #{i}, got so far: {observed:?}"))
+            .expect("sink closed early");
+        observed.push((sender, opcode, payload));
+    }
+    assert_eq!(observed[7].1, 4, "ack_configure opcode, forwarded to the real compositor");
 
     fn bind_new_id(payload: &[u8]) -> u32 {
         let (_, next) = wire::read_str(payload, 4).expect("interface string");
@@ -2794,22 +2821,22 @@ async fn wl_shm_pool_and_buffer_recipes_replay_correctly_after_reconnect() {
     // create_pool: sent to the freshly re-bound wl_shm (not any earlier
     // object), carrying the ORIGINAL size (4096) -- not something derived
     // from the new compositor, which never advertised a size at all.
-    assert_eq!(observed[7].0, recreated_shm_host_id, "create_pool should target wl_shm's freshly recreated host id");
-    assert_eq!(observed[7].1, 0, "create_pool opcode");
-    let recreated_pool_host_id = wire::read_u32(&observed[7].2, 0).unwrap();
-    let replayed_size = wire::read_u32(&observed[7].2, 4).unwrap();
+    assert_eq!(observed[8].0, recreated_shm_host_id, "create_pool should target wl_shm's freshly recreated host id");
+    assert_eq!(observed[8].1, 0, "create_pool opcode");
+    let recreated_pool_host_id = wire::read_u32(&observed[8].2, 0).unwrap();
+    let replayed_size = wire::read_u32(&observed[8].2, 4).unwrap();
     assert_eq!(replayed_size, 4096, "replayed create_pool should carry the pool's originally-recorded size");
 
     // create_buffer: sent to the freshly recreated pool, referencing its
     // NEW host id -- not the pool's stale first-life one -- and carrying
     // the buffer's originally-recorded offset/width/height/stride/format.
-    assert_eq!(observed[8].0, recreated_pool_host_id, "create_buffer should target the pool's freshly recreated host id");
-    assert_eq!(observed[8].1, 0, "create_buffer opcode");
-    assert_eq!(wire::read_u32(&observed[8].2, 4), Some(0), "offset");
-    assert_eq!(wire::read_u32(&observed[8].2, 8), Some(64), "width");
-    assert_eq!(wire::read_u32(&observed[8].2, 12), Some(64), "height");
-    assert_eq!(wire::read_u32(&observed[8].2, 16), Some(256), "stride");
-    assert_eq!(wire::read_u32(&observed[8].2, 20), Some(0), "format");
+    assert_eq!(observed[9].0, recreated_pool_host_id, "create_buffer should target the pool's freshly recreated host id");
+    assert_eq!(observed[9].1, 0, "create_buffer opcode");
+    assert_eq!(wire::read_u32(&observed[9].2, 4), Some(0), "offset");
+    assert_eq!(wire::read_u32(&observed[9].2, 8), Some(64), "width");
+    assert_eq!(wire::read_u32(&observed[9].2, 12), Some(64), "height");
+    assert_eq!(wire::read_u32(&observed[9].2, 16), Some(256), "stride");
+    assert_eq!(wire::read_u32(&observed[9].2, 20), Some(0), "format");
 
     host_listener_task.abort();
 }

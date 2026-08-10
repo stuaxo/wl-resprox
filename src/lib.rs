@@ -1676,7 +1676,74 @@ async fn recover_state_after_reconnect(
                         }
                     };
                     match tokio::time::timeout(std::time::Duration::from_secs(5), wait).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            // Also wait for the CLIENT's real ack_configure
+                            // and forward it to host directly (relaying
+                            // isn't running yet -- `frozen` is still true
+                            // at this point in recover_state_after_reconnect,
+                            // so nothing else reads from `gtk` until this
+                            // function returns). Found live 2026-08-10 via
+                            // a Qt/Mesa client and the container test
+                            // matrix: Mesa's own EGL integration runs a
+                            // SEPARATE internal event queue from the app's
+                            // main one, and reacted to this function's own
+                            // synthesized wl_buffer.release (below, after
+                            // this whole loop) by immediately reallocating,
+                            // attaching, and committing a new buffer --
+                            // before the app's own main queue had even
+                            // dispatched this xdg_surface's configure,
+                            // let alone acked it. The wire-level order we
+                            // send things in was already correct (configure
+                            // before release); the race was entirely in
+                            // Mesa's own queue-dispatch timing, which we
+                            // can't observe or control from here. Waiting
+                            // for a REAL ack_configure sidesteps that
+                            // entirely: it can only ever arrive after the
+                            // client's own app-level logic has genuinely
+                            // processed configure, so gating the later
+                            // release/frame-done synthesis on having seen
+                            // it (naturally achieved just by doing this
+                            // wait before this arm returns, since that
+                            // synthesis runs only after the whole graph
+                            // loop below completes) means Mesa's reactive
+                            // redraw-on-release can no longer race ahead
+                            // of a configure it hasn't seen -- by
+                            // construction, not by timing luck. GTK
+                            // clients never hit this (see
+                            // scripts/qt/common.py's own doc comment on
+                            // why Qt needed its own test client to catch
+                            // it at all), but the fix applies uniformly,
+                            // not just to Qt.
+                            let ack_configure_opcode = request_opcode(parent_interface, "ack_configure");
+                            let wait_ack = async {
+                                loop {
+                                    let (header, msg) = next_message(gtk).await?;
+                                    if header.sender_id == *parent_guest_id && Some(header.opcode) == ack_configure_opcode {
+                                        host.write_message(&wire::build_message(parent_host_id, header.opcode, &msg[wire::HEADER_LEN..]), &[])
+                                            .await
+                                            .context("forwarding real ack_configure")?;
+                                        return Ok::<(), anyhow::Error>(());
+                                    }
+                                    // Same accepted risk as the host-side
+                                    // wait above, just on the client side
+                                    // this time: anything else the client
+                                    // sends before acking is dropped, not
+                                    // queued for relay_ready_messages to
+                                    // pick up once it resumes. Not yet
+                                    // hit live -- real clients ack
+                                    // promptly once they've received both
+                                    // configure events.
+                                }
+                            };
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), wait_ack).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => warn!("failed waiting for the client's real ack_configure on xdg_surface {guest_id}: {e}"),
+                                Err(_) => warn!(
+                                    "timed out waiting for the client's real ack_configure on xdg_surface {guest_id} -- \
+                                     any deferred buffer-release/frame-done synthesis below may still race it"
+                                ),
+                            }
+                        }
                         Ok(Err(e)) => warn!("failed waiting for the real compositor's configure on xdg_surface {guest_id}: {e}"),
                         Err(_) => {
                             warn!("timed out waiting for the real compositor's configure on xdg_surface {guest_id} -- won't force a repaint")
