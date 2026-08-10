@@ -92,6 +92,17 @@ PROXY_UNIT=wayland-proxy-gnome-shell-direct.service
 
 echo "$(date -Iseconds) wrapper starting"
 
+# Synchronous, before anything else: the background refresher below
+# doesn't fire its first update until its own initial `sleep 3` elapses,
+# and the socket-handoff/systemctl start cycle below completes well
+# inside that window on a fresh boot -- confirmed live 2026-08-07, the
+# unit's ExecCondition= (which checks XDG_SESSION_DESKTOP against
+# systemd --user's OWN stored environment, not any process's real
+# environ) was still failing at that point, leaving the whole session
+# with no crash protection until the next manual restart. This call
+# must complete before the first `systemctl --user start` below.
+dbus-update-activation-environment --systemd XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct XDG_CURRENT_DESKTOP=wl-res-gnome-shell-direct:ubuntu:GNOME
+
 # Periodically re-assert XDG_SESSION_DESKTOP/XDG_CURRENT_DESKTOP in the
 # background, for this whole script's lifetime -- same defensive pattern
 # as the labwc wrapper (found there that Xwayland's own lazy, delayed
@@ -122,6 +133,8 @@ echo "$(date -Iseconds) wrapper starting"
         dbus-update-activation-environment --systemd XDG_SESSION_DESKTOP=wl-res-gnome-shell-direct XDG_CURRENT_DESKTOP=wl-res-gnome-shell-direct:ubuntu:GNOME 2>/dev/null
     done
 ) &
+# (the loop above starts with a sleep deliberately -- the synchronous
+# call right before it already covers t=0)
 
 while :; do
     gnome-shell --mode=ubuntu --wayland-display="$PUBLIC_DISPLAY" &
