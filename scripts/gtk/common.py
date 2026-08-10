@@ -29,8 +29,22 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
+# WL_TEST_LOG_LEVEL: unset/invalid falls back to INFO (this module's own
+# long-standing default). Added because the default (every startup fact,
+# every window map/unmap, one line/sec of frame ticks, every stall
+# transition) is more than wanted for some uses -- e.g. driving one of
+# these from a container-matrix run, where only the STALLED/RECOVERED/
+# GIVING UP lines (all logged at WARNING) actually matter and the rest is
+# just noise in already-long CI-style logs. `WL_TEST_LOG_LEVEL=WARNING`
+# keeps exactly those; DEBUG/INFO/ERROR/CRITICAL all work too, same names
+# logging's own basicConfig(level=...) accepts.
+_level_name = os.environ.get("WL_TEST_LOG_LEVEL", "INFO").upper()
+_level = getattr(logging, _level_name, None)
+if not isinstance(_level, int):
+    _level = logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_level,
     # %(name)s -- the label run() is given -- so two of these running in
     # the same terminal (the common way to compare SHM vs. dmabuf
     # side by side) can still be told apart line by line.

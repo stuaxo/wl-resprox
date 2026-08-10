@@ -47,6 +47,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # which a headless container doesn't have -- gtk3_popup.py auto-triggers
 # its own menu from a real focus-in event instead (see its own doc
 # comment), which needs GTK's Python bindings to script.
+#
+# gir1.2-gtk-4.0 (2026-08-10): same reasoning, for scripts/gtk/basic_shm.py
+# and dmabuf_gl.py (gi.require_version("Gtk", "4.0")) -- self-logging
+# SHM/dmabuf test clients, preferred over gtk4-demo's own opaque behavior
+# for exactly the class of bug the container test matrix exists to catch
+# (see docs/KNOWN_BUGS.md and the 2026-08-10 dmabuf-recreation
+# investigation).
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
     libgtk-4-dev \
@@ -55,6 +62,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     gtk-3-examples \
     python3-gi \
     gir1.2-gtk-3.0 \
+    gir1.2-gtk-4.0 \
     libwayland-dev \
     wayland-utils \
     dbus \
