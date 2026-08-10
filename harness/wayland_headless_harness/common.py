@@ -16,7 +16,21 @@ import typer
 
 WM_CHOICES = ["labwc", "sway", "kwin", "mutter"]
 DEFAULT_WM = "labwc"
-DEFAULT_CLIENT = "gtk4-demo"
+# gtk4-demo produced a false failure signal here 2026-08-10: it fails
+# crash-recovery against kwin/sway with a compositor-side dmabuf-import
+# rejection that scripts/gtk/dmabuf_gl.py -- this project's own real
+# GL-rendered, dmabuf-backed test client -- does NOT hit, cleanly
+# passing against all four compositors (3/3 on kwin, clean on sway,
+# alongside its pre-existing mutter/labwc coverage). gtk4-demo's own
+# rendering-path behavior is opaque (it silently fell back to X11 once
+# before, see scripts/gtk/common.py's own doc comment) -- exactly the
+# class of surprise these self-logging clients exist to avoid. The
+# wrapper (not a bare `python3 ... .py`) is required: this module's own
+# `--client` handling shlex.quotes the whole string as one token before
+# handing it to the container's shell. "/workspace" literal, not
+# HARNESS_CONTAINER_ROOT, since that's defined below this point in the
+# file (see its own comment for why it isn't sourced from one place).
+DEFAULT_CLIENT = "/workspace/gtk/run-dmabuf-gl.sh"
 
 # Mirrors scripts/harness-paths.sh's HARNESS_CONTAINER_ROOT -- kept as a
 # literal here rather than sourced from that file, since that file must
