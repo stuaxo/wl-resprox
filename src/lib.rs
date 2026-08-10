@@ -4,7 +4,7 @@
 //! needing a container, GPU, or real compositor for a deterministic,
 //! known-good reproduction of a given wire exchange.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
@@ -1309,6 +1309,31 @@ async fn synthesize_frame_done(dst: &mut Conn, objects: &ShadowTable, callback_g
     }
 }
 
+/// Reads and returns the next complete message off `conn`, filling from
+/// the socket only when the buffer doesn't already hold one (so a batch
+/// of messages that arrived together is drained one at a time without
+/// redundant reads), and draining it from `conn.read_buf` before
+/// returning. Errs on a clean EOF -- `fill()` returns `Ok(0)` on close,
+/// matching `read()`'s own convention, which a bare `?` would silently
+/// treat as "no bytes this time, try again" rather than "gone" (found
+/// live: left unchecked, that's a silent 100%-CPU busy loop, not a hang,
+/// since `fill()` keeps returning `Ok(0)` immediately forever once the
+/// peer is gone). Callers needing a specific, more actionable error
+/// message than this generic one should wrap the call in `.context(...)`.
+async fn next_message(conn: &mut Conn) -> Result<(wire::MessageHeader, Vec<u8>)> {
+    loop {
+        if let Some((_msg, consumed)) = wire::take_message(&conn.read_buf) {
+            let msg = conn.read_buf[..consumed].to_vec();
+            let header = wire::MessageHeader::parse(&msg).expect("take_message already validated this");
+            conn.read_buf.drain(..consumed);
+            return Ok((header, msg));
+        }
+        if conn.fill().await? == 0 {
+            return Err(anyhow::anyhow!("connection closed while waiting for the next message"));
+        }
+    }
+}
+
 /// Runs once after a successful reconnect, before relaying resumes:
 /// implementation-constraints.md's full "On Server Reconnect" section,
 /// short of grab/buffer bookkeeping (separate, orthogonal work). Acts as
@@ -1383,47 +1408,32 @@ async fn recover_state_after_reconnect(
     // instead: attempt_clipboard_splice needs this to bind a fresh
     // wl_data_device_manager for the reclaim attempt.
     let mut wl_data_device_manager_global: Option<(u32, u32)> = None;
-    'collect: loop {
-        // `fill()` returns `Ok(0)` on EOF (matching `read()`'s convention),
-        // which the `?` below does NOT catch since it's not an `Err`.
-        // Left unchecked, a compositor that closes the connection right
-        // after rejecting `get_registry` turns this into a silent,
-        // 100%-CPU busy loop: `fill()` keeps returning `Ok(0)` immediately
-        // forever, never `WouldBlock`, so nothing here ever stops calling
-        // it again.
-        if host.fill().await? == 0 {
-            return Err(anyhow::anyhow!(
-                "compositor closed the connection while fetching its registry (probably rejected get_registry -- possibly a new_id it didn't expect)"
-            ));
-        }
-        while let Some((_msg, consumed)) = wire::take_message(&host.read_buf) {
-            let msg = host.read_buf[..consumed].to_vec();
-            let header = wire::MessageHeader::parse(&msg).expect("take_message already validated this");
-            let payload = &msg[wire::HEADER_LEN..];
-            if header.sender_id == registry_host_id && header.opcode == 0 {
-                if let Some(name) = wire::read_u32(payload, 0) {
-                    if let Some((iface_name, next)) = wire::read_str(payload, 4) {
-                        if let Some(version) = wire::read_u32(payload, next) {
-                            match iface_name.as_str() {
-                                "wl_compositor" => wl_compositor_global = Some((name, version)),
-                                "xdg_wm_base" => xdg_wm_base_global = Some((name, version)),
-                                "wl_shm" => wl_shm_global = Some((name, version)),
-                                "zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1_global = Some((name, version)),
-                                "wl_seat" => wl_seat_global = Some((name, version)),
-                                "wp_viewporter" => wp_viewporter_global = Some((name, version)),
-                                "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global = Some((name, version)),
-                                "xdg_activation_v1" => xdg_activation_v1_global = Some((name, version)),
-                                "wl_data_device_manager" => wl_data_device_manager_global = Some((name, version)),
-                                _ => {}
-                            }
+    loop {
+        let (header, msg) = next_message(host).await.context(
+            "compositor closed the connection while fetching its registry (probably rejected get_registry -- possibly a new_id it didn't expect)",
+        )?;
+        let payload = &msg[wire::HEADER_LEN..];
+        if header.sender_id == registry_host_id && header.opcode == 0 {
+            if let Some(name) = wire::read_u32(payload, 0) {
+                if let Some((iface_name, next)) = wire::read_str(payload, 4) {
+                    if let Some(version) = wire::read_u32(payload, next) {
+                        match iface_name.as_str() {
+                            "wl_compositor" => wl_compositor_global = Some((name, version)),
+                            "xdg_wm_base" => xdg_wm_base_global = Some((name, version)),
+                            "wl_shm" => wl_shm_global = Some((name, version)),
+                            "zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1_global = Some((name, version)),
+                            "wl_seat" => wl_seat_global = Some((name, version)),
+                            "wp_viewporter" => wp_viewporter_global = Some((name, version)),
+                            "wp_fractional_scale_manager_v1" => wp_fractional_scale_manager_v1_global = Some((name, version)),
+                            "xdg_activation_v1" => xdg_activation_v1_global = Some((name, version)),
+                            "wl_data_device_manager" => wl_data_device_manager_global = Some((name, version)),
+                            _ => {}
                         }
                     }
                 }
-            } else if header.sender_id == sync_host_id && header.opcode == 0 {
-                host.read_buf.drain(..consumed);
-                break 'collect;
             }
-            host.read_buf.drain(..consumed);
+        } else if header.sender_id == sync_host_id && header.opcode == 0 {
+            break;
         }
     }
     objects.map(registry_guest_id, registry_host_id, registry_interface);
