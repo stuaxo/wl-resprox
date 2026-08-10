@@ -66,17 +66,85 @@ mode) — query in the script's own output.
 ## Mutter: `meta_window_set_stack_position_no_sync` assertion
 
 **Status:** confirmed not us (reproduces with zero proxy involvement).
+Functional impact confirmed live via gdb, 2026-08-10 -- this is not
+just a log warning, it's why a recreated window sometimes won't
+raise/focus when activated. The specific *trigger* on our side --
+DING's helper process racing `socket-handoff`'s SIGSTOP-based freeze
+and connecting straight to gnome-shell instead of through the proxy --
+is now closed: see `src/bin/socket-handoff.rs`'s `--freeze-method
+ptrace` (default as of 2026-08-10), which seizes the target and
+catches its `bind()` at the exact syscall-exit boundary instead of
+reacting to a file-creation event after the fact, closing the race at
+the kernel level rather than narrowing it. `sigstop` remains available
+as an explicit fallback. This does NOT fix Mutter's own bug (a
+genuinely stale `MetaWindow*` still corrupts stack layout if it ever
+gets created some other way) -- it just removes the one concrete path
+we'd built into our own startup sequence that reliably produced one.
 
-**Symptom:** `libmutter-CRITICAL`, `window->stack_position >= 0`, from
-`Meta.Window.raise()` called by GNOME Shell's own JS.
+Confirming this closed the loop wasn't as simple as "swap the freeze
+method" -- live testing on 2026-08-10 with DING re-enabled turned up a
+*second*, unrelated bug in our own new ptrace mechanism (see the
+`WaitStatus::StillAlive` arm's doc comment in `run_ptrace`,
+`src/bin/socket-handoff.rs`: its polling sleep was throttling real
+syscall tracing to ~25/sec, and a real gnome-shell startup needs
+30,000+, so it blew straight through `--timeout-secs` and left
+gnome-shell back in the exact unprotected state this was meant to
+prevent -- now fixed, worth knowing if this ever needs
+re-diagnosing).
 
-**Evidence:** reproduces on ordinary gnome-shell startup, no proxy or
-dmabuf recreation involved — see
-`docs/adr/adr-0008-live-validate-dmabuf-recreation.md`'s "Ruled out"
-section.
+**Symptom:** `libmutter-CRITICAL`, `window->stack_position >= 0`. Also
+manifests as a window that never comes to front when activated (panel
+click, `Meta.Window.activate()`) -- focus falls through to something
+else (observed: the desktop-icons layer) instead.
 
-**Reproduction script:** none — original trigger found through
-exploratory testing, not yet a scripted recipe.
+**Mechanism, confirmed against Mutter 50.1's actual source**
+(`src/core/stack.c`): `meta_stack_remove()` sets `window->stack_position
+= -1` permanently when a window is torn down. The assertion
+(`g_return_if_fail (window->stack_position >= 0)` inside
+`meta_window_set_stack_position_no_sync`) fires when something later
+tries to reposition a window already in that removed state -- a stale
+`MetaWindow*` still referenced somewhere, touched again during a full
+stack re-layout pass (which *any* window activation triggers, over
+every tracked window, not just the one being activated).
+
+**Live-identified the actual stale window**, without needing Mutter's
+own (fully stripped, no debug symbols available) binary: breakpointed
+`g_return_if_fail_warning` (always-exported core GLib, receives the
+failing function name and expression as plain string args -- no Mutter
+symbols needed), inspected callee-saved registers at that frame for
+plausible GObject-shaped pointers, then called the real, exported
+`meta_window_get_description()` on each via gdb directly. Result: the
+same stack re-layout pass touches both `"W0 (Mozilla Firefox)"` (the
+window actually being activated) and `"W4 (Desktop Icons 1)"` (DING's
+own window) together. Working theory: a stale, orphaned DING window
+object from an earlier gnome-shell restart earlier in the same
+session, never cleaned out of some internal Mutter list, gets touched
+by every subsequent activation's re-layout pass -- not necessarily
+specific to Firefox, Settings, or any one app.
+
+**Reproduction:** needs `sudo sysctl kernel.yama.ptrace_scope=0`
+(revert to `1` after) to attach gdb to a same-user, non-child process.
+No script yet -- was done as an interactive gdb session:
+
+```
+break g_return_if_fail_warning
+commands
+silent
+printf "func=%s expr=%s\n", (char*)$rsi, (char*)$rdx
+continue
+end
+continue
+```
+
+Trigger with any `Meta.Window.activate()` call (Looking Glass `Eval`,
+unsafe mode: `window.activate(global.get_current_time())`) on a window
+that's survived at least one prior gnome-shell restart in the session.
+On a hit, callee-saved registers (`rbx`/`r12`-`r15`) are candidates for
+the `window` argument (caller-saved registers like `rdi` are already
+overwritten by the time execution reaches `g_return_if_fail_warning`);
+`x/2xg <candidate>` to check for a GObject-shaped header before calling
+anything, then `call (const char*) meta_window_get_description((void*)<candidate>)`
+to identify it by name.
 
 ## Mutter: fractional-scaling `GLib-GObject-CRITICAL` (`scale-x`/`scale-y` = "inf")
 
