@@ -15,6 +15,7 @@ use wayland_backend::protocol::{ArgumentType, Interface, MessageDesc};
 
 pub mod buffer_flow;
 pub mod clipboard;
+pub mod desktop_apps;
 pub mod fdsocket;
 pub mod grab_state;
 pub mod interfaces;
@@ -261,6 +262,8 @@ async fn relay_ready_messages(
     pending_dmabuf_planes: &mut std::collections::HashMap<u32, (u32, Vec<DmabufPlane>)>,
     clipboard_cache: &clipboard::SharedClipboardCache,
     reclaim: &mut clipboard::ReclaimState,
+    client_pid: Option<i32>,
+    desktop_apps: &desktop_apps::DesktopAppIndex,
     direction: Direction,
 ) -> Result<()> {
     'relay: loop {
@@ -806,6 +809,41 @@ async fn relay_ready_messages(
                     }
                 } else if matches!(direction, Direction::ClientToHost) && interface.name == "xdg_toplevel" && desc.name == "set_app_id" {
                     if let Some((app_id, _)) = wire::read_str(&msg[wire::HEADER_LEN..], 0) {
+                        // required to fix icon/grouping mismatches: an
+                        // app_id gnome-shell can't match to any installed
+                        // .desktop file falls through to its own
+                        // PID-based app match before it ever tries
+                        // xdg_activation_v1 -- and since every client
+                        // through this proxy shares the proxy's own PID
+                        // (SO_PEERCRED), that PID match always misfires
+                        // against some unrelated running app (see
+                        // docs/KNOWN_BUGS.md). We have the client's real
+                        // PID (peer_cred on our own accept()ed socket,
+                        // never collapsed); resolve the .desktop file it
+                        // actually corresponds to and send THAT instead,
+                        // so gnome-shell's own first-choice lookup
+                        // succeeds and the broken PID step is never
+                        // reached. Left untouched if app_id already
+                        // matches an installed .desktop file (the normal
+                        // case), or if no better answer can be found.
+                        let corrected = if desktop_apps.has_id(&app_id) {
+                            None
+                        } else {
+                            client_pid
+                                .and_then(desktop_apps::binary_name_for_pid)
+                                .and_then(|binary| desktop_apps.resolve_by_binary(&binary))
+                                .filter(|&resolved| resolved != app_id)
+                                .map(str::to_string)
+                        };
+                        let app_id = if let Some(corrected) = corrected {
+                            info!("correcting unresolvable app_id {app_id:?} -> {corrected:?} (see docs/KNOWN_BUGS.md)");
+                            let mut payload = Vec::new();
+                            wire::put_str(&mut payload, &corrected);
+                            msg = wire::build_message(header.sender_id, header.opcode, &payload);
+                            corrected
+                        } else {
+                            app_id
+                        };
                         graph.update_toplevel_app_id(guest_sender_id, app_id);
                     }
                 }
@@ -2219,6 +2257,10 @@ pub async fn run_connection(
     // docs/adr/adr-0009-clipboard-persistence.md). A per-connection cache
     // would die with this task, defeating that.
     clipboard_cache: clipboard::SharedClipboardCache,
+    // Process-wide, built once at startup (real filesystem scan, not
+    // worth repeating per connection) -- see desktop_apps.rs and
+    // relay_ready_messages's xdg_toplevel.set_app_id handling.
+    desktop_apps: std::sync::Arc<desktop_apps::DesktopAppIndex>,
 ) -> Result<()> {
     let mut gtk = Conn::new(gtk_stream);
     let mut host = Conn::new(compositor_stream);
@@ -2248,7 +2290,7 @@ pub async fn run_connection(
                     }
                     Ok(_) => {
                         let dst = if frozen { None } else { Some(&mut host) };
-                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, Direction::ClientToHost).await?;
+                        relay_ready_messages(&mut gtk, dst, &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, client_pid, &desktop_apps, Direction::ClientToHost).await?;
                     }
                     Err(e) => {
                         info!("GTK client disconnected: {e}");
@@ -2263,7 +2305,7 @@ pub async fn run_connection(
                         frozen = true;
                     }
                     Ok(_) => {
-                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, Direction::HostToClient).await?;
+                        relay_ready_messages(&mut host, Some(&mut gtk), &mut objects, &mut graph, &mut grabs, &mut pending_configure_acks, &mut buffer_flow, &mut pending_frames, &mut pending_dmabuf_planes, &clipboard_cache, &mut reclaim, client_pid, &desktop_apps, Direction::HostToClient).await?;
                     }
                     Err(e) => {
                         info!("compositor connection lost ({e}) -- freezing, GTK client stays connected");

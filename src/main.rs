@@ -75,6 +75,10 @@ async fn main() -> Result<()> {
     // clipboard.rs's own doc comment).
     let clipboard_cache = wayland_proxy::clipboard::ClipboardCache::new();
 
+    // Built once (real filesystem scan of installed .desktop files,
+    // not worth repeating per connection) -- see desktop_apps.rs.
+    let desktop_apps = std::sync::Arc::new(wayland_proxy::desktop_apps::DesktopAppIndex::build());
+
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -92,6 +96,7 @@ async fn main() -> Result<()> {
                     info!(parent: &span, "New Wayland client connected!");
                     let target_path = target_socket_path.clone();
                     let clipboard_cache = clipboard_cache.clone();
+                    let desktop_apps = desktop_apps.clone();
                     tokio::spawn(
                         async move {
                             match UnixStream::connect(&target_path).await {
@@ -102,6 +107,7 @@ async fn main() -> Result<()> {
                                         target_path,
                                         client_pid,
                                         clipboard_cache,
+                                        desktop_apps,
                                     )
                                     .await
                                     {
