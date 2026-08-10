@@ -103,6 +103,8 @@ install/remove hooks, so that's a manual step for now).
 - `docs/adr/` — accepted architecture decisions
 - `docs/implementation-constraints.md` — binding spec for crash recovery
 - `docs/debugging-notes.md` — investigation log for bugs found live
+- `docs/KNOWN_BUGS.md` — real bugs found live that turned out not to be
+  this project's (GNOME Shell/Mutter/GDM); reproductions in `known_bugs/scripts/`
 
 ## Development
 
