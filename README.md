@@ -30,13 +30,14 @@ real GL context via PyOpenGL) -- the Qt clients caught a real recovery
 bug GTK's own rendering path never triggered (Mesa's EGL integration
 racing ahead of a just-sent `xdg_surface.configure`, fixed by waiting
 for the client's real `ack_configure` before continuing). Verified
-against labwc, kwin, and sway; kwin still has one known, pre-existing
-protocol-coverage gap unrelated to crash recovery itself
-(`zwp_text_input_manager_v2`, see `src/interfaces.rs`). The SDL2
-clients additionally hit a startup-time, non-proxy issue against
-headless mutter -- SDL_Init() itself fails there while GTK/Qt run fine
-against the same container, see `scripts/sdl2/common.py`'s own doc
-comment.
+against labwc, kwin, sway, and mutter; kwin still has one known,
+pre-existing protocol-coverage gap unrelated to crash recovery itself
+(`zwp_text_input_manager_v2`, see `src/interfaces.rs`). Getting the SDL2
+clients running against headless mutter needed two non-proxy fixes of
+its own -- gnome-shell advertising zero `wl_output` globals by default,
+and a libdecor/GTK icon-loader crash once one exists -- see
+`scripts/sdl2/common.py`'s and `scripts/compositor-launch.sh`'s own doc
+comments.
 
 Wayland extensions the proxy actively recreates/tracks state for, vs.
 relaying generically with no reconnect-time recovery:

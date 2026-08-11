@@ -100,7 +100,26 @@ launch_compositor() {
             DBUS_SYSTEM_BUS_ADDRESS="$(head -1 <<< "$system_out")"
             export DBUS_SYSTEM_BUS_ADDRESS
             run_track "dbus-system${suffix}" "$(tail -1 <<< "$system_out")"
-            gnome-shell --headless --no-x11 > "$log" 2>&1 &
+            # --virtual-monitor: found live 2026-08-11 investigating why
+            # scripts/sdl2's clients failed SDL_Init() ("video driver did
+            # not add any displays") against mutter specifically, while
+            # every other container/toolkit combination worked. Root
+            # cause (confirmed via wayland-info): bare `--headless
+            # --no-x11`, when a real DRM render node is present (as it is
+            # in this container, passed through for GPU-accelerated
+            # rendering), advertises ZERO wl_output globals -- headless
+            # mode's "no monitors" is meant literally, unlike
+            # labwc/sway/kwin's virtual/headless backends, which each
+            # still create one fake output. GTK/Qt tolerate a
+            # zero-output compositor fine (window placement isn't
+            # output-bound at creation time); SDL2's video driver hard-
+            # requires at least one enumerable display before
+            # SDL_Init() can succeed at all. `--virtual-monitor` is
+            # gnome-shell's own supported flag for exactly this (see
+            # `gnome-shell --help`) -- adds one real wl_output with no
+            # other behavior change, so this is strictly additive for
+            # every other client already tested against mutter.
+            gnome-shell --headless --no-x11 --virtual-monitor 1280x720 > "$log" 2>&1 &
             ;;
         *)
             echo "ERROR: no launch case for compositor '$wm' -- add one to scripts/compositor-launch.sh" >&2
