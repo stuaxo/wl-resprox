@@ -18,19 +18,25 @@ and to have something working in the meantime.
 
 ## Status
 
-### GTK4 / Qt6 recovery
+### GTK4 / Qt6 / SDL2 recovery
 
 Proxy core and crash recovery: done, including cross-compositor
 recovery (e.g. labwc crashes, sway takes over the same socket), both
-GTK4 renderers (cairo/`wl_shm` and GL/dmabuf), and both Qt6/PySide6
+GTK4 renderers (cairo/`wl_shm` and GL/dmabuf), both Qt6/PySide6
 renderers (`scripts/qt/basic_shm.py`, raster/`wl_shm`, and
-`dmabuf_gl.py`, a real GL context) -- the Qt clients caught a real
-recovery bug GTK's own rendering path never triggered (Mesa's EGL
-integration racing ahead of a just-sent `xdg_surface.configure`, fixed
-by waiting for the client's real `ack_configure` before continuing).
-Verified against labwc and sway; kwin still has one known,
-pre-existing protocol-coverage gap unrelated to crash recovery itself
-(`zwp_text_input_manager_v2`, see `src/interfaces.rs`).
+`dmabuf_gl.py`, a real GL context), and both SDL2 renderers
+(`scripts/sdl2/basic_shm.py`, software/`wl_shm`, and `dmabuf_gl.py`, a
+real GL context via PyOpenGL) -- the Qt clients caught a real recovery
+bug GTK's own rendering path never triggered (Mesa's EGL integration
+racing ahead of a just-sent `xdg_surface.configure`, fixed by waiting
+for the client's real `ack_configure` before continuing). Verified
+against labwc, kwin, and sway; kwin still has one known, pre-existing
+protocol-coverage gap unrelated to crash recovery itself
+(`zwp_text_input_manager_v2`, see `src/interfaces.rs`). The SDL2
+clients additionally hit a startup-time, non-proxy issue against
+headless mutter -- SDL_Init() itself fails there while GTK/Qt run fine
+against the same container, see `scripts/sdl2/common.py`'s own doc
+comment.
 
 Wayland extensions the proxy actively recreates/tracks state for, vs.
 relaying generically with no reconnect-time recovery:
