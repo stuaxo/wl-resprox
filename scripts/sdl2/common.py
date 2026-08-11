@@ -24,19 +24,37 @@ below is the direct SDL equivalent of TestWindow's timer/tick-callback
 setup in the other two clients, just as one plain loop instead of several
 independent timers.
 
-Known limitation, confirmed live 2026-08-11, NOT a proxy bug: both
-scripts here fail at SDL_Init() itself ("video driver did not add any
-displays") against the container test harness's headless mutter/
-gnome-shell, while scripts/gtk/dmabuf_gl.py and the Qt clients both run
-against that same container without issue -- confirmed by running the
-GTK client against the identical mutter container immediately afterward.
-SDL2's own Wayland video driver is evidently stricter about what it needs
-from wl_output than GTK's or Qt's own backends are, and headless mutter
-apparently doesn't satisfy it (this reproduced with zero proxy/wayland-
-proxy involvement -- the failure is in SDL_Init, before any Wayland
-object beyond the initial registry roundtrip exists). Clean on labwc,
-kwin, and sway (both real-compositor-crash and container-matrix runs) --
-only mutter is affected.
+Two mutter-specific issues found live 2026-08-11 and root-caused, NEITHER
+a proxy bug:
+
+1. SDL_Init() itself used to fail ("video driver did not add any
+   displays") against the container harness's headless mutter/gnome-
+   shell, while GTK's and Qt's own clients ran fine against the same
+   container -- confirmed via wayland-info that bare `--headless --no-x11`
+   advertises ZERO wl_output globals when a real DRM render node is
+   present (unlike labwc/sway/kwin's virtual backends, which each still
+   create one fake output). GTK/Qt tolerate a zero-output compositor;
+   SDL2's video driver hard-requires at least one enumerable display.
+   Fixed at the source: scripts/compositor-launch.sh now passes gnome-
+   shell's own `--virtual-monitor` flag, which adds a real wl_output --
+   see that file's own comment.
+
+2. With a real output finally present, window mapping started reaching a
+   SECOND, previously-dormant crash: SDL2's Wayland backend uses libdecor
+   for client-side decorations, and libdecor auto-selects its GTK-
+   rendered plugin (`libdecor-0-plugin-1-gtk`) when available -- which
+   segfaults this container's process trying to load a window-icon
+   fallback through a broken sandboxed SVG loader (bwrap/glycin-svg).
+   GTK/Qt clients never hit this because they use their own native
+   decoration path, not libdecor's fallback. Confirmed via
+   SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR=0 (disables libdecor outright,
+   these test clients have no need for real window chrome) resolving it
+   cleanly -- set below, before SDL_Init(), same "explicit beats an
+   opaque toolkit default" reasoning as GSK_RENDERER/QSurfaceFormat in
+   the other two clients' own common.py.
+
+Both fixes are additive/opt-out only -- neither changes behavior for any
+already-passing labwc/kwin/sway/GTK/Qt combination.
 """
 
 import ctypes
@@ -45,7 +63,13 @@ import os
 import sys
 import time
 
-import sdl2
+# Must be set before SDL_Init() -- see this module's own doc comment,
+# point 2, for why. setdefault, not a bare assignment: lets anyone who
+# actually wants to exercise the libdecor path deliberately still set
+# SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR=1 themselves before running.
+os.environ.setdefault("SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR", "0")
+
+import sdl2  # noqa: E402
 
 # WL_TEST_LOG_LEVEL: same knob as scripts/gtk/common.py's and
 # scripts/qt/common.py's own, same reasoning -- see scripts/gtk/common.py's
