@@ -60,6 +60,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # dmabuf_gl.py, Qt's own qtwayland EGL/dmabuf integration being a
 # genuinely different code path than GTK's own, not just the same thing
 # under a different name (see scripts/qt/common.py's own doc comment).
+#
+# python3-sdl2, python3-opengl (2026-08-11): same reasoning again, a third
+# toolkit over -- scripts/sdl2/basic_shm.py and dmabuf_gl.py. Both are
+# proper Ubuntu apt packages, same clean-install pattern as python3-gi and
+# python3-pyside6.* above (see scripts/sdl2/common.py's own doc comment
+# for why SDL2 rather than SDL3). python3-opengl (PyOpenGL) is only used
+# by dmabuf_gl.py, to issue real GL draw calls against the context SDL
+# creates -- pysdl2 itself has no GL call bindings of its own.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     sudo \
     libgtk-4-dev \
@@ -74,6 +82,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     python3-pyside6.qtwidgets \
     python3-pyside6.qtopengl \
     python3-pyside6.qtopenglwidgets \
+    python3-sdl2 \
+    python3-opengl \
     libwayland-dev \
     wayland-utils \
     dbus \
