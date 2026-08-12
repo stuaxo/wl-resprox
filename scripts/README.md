@@ -19,7 +19,60 @@ builds `wayland-proxy` (`cargo deb`) if this is checked out alongside
 a specific `.deb` instead (doesn't have to be `wayland-proxy`, or built
 from any particular checkout).
 
-**Two ways to use this:**
+## Testing wayland-proxy: which tier do I want?
+
+Two ways to check crash recovery, pick based on what's available to you:
+
+- **Live session, real desktop** (below) -- fastest if you're on this
+  machine directly and already have a proxy-fronted session installed.
+  No containers, no VNC.
+- **Headless containers** ("Running it", further down) -- works over
+  SSH, no live desktop session or GPU-attached display required,
+  verifies against real labwc/sway/kwin/mutter, reproducible. The bulk
+  of this document is this tier.
+
+## Live-session manual testing
+
+**Pick the right session at login** (GDM's gear icon, bottom right of
+the password field): **"GNOME (crash-resilient, direct -- bypasses
+gnome-session)"** (`wl-res-gnome-shell-direct`). There's a similarly-
+named decoy, "GNOME (crash-resilient, via wayland-proxy)"
+(`wl-res-gnome-shell`) -- don't pick that one for crash testing, it
+routes through `gnome-session`, which tears the whole session down on a
+gnome-shell crash instead of recovering (see
+`docs/adr/adr-0004-gnome-session-bypass.md` for why). A `labwc`
+equivalent (`wl-res-labwc`) also exists, as a simpler non-GNOME
+comparison point.
+
+Not showing up at the login screen yet? `sudo cp
+packaging/wayland-sessions/*.desktop /usr/share/wayland-sessions/`.
+
+Once logged in, from a terminal:
+```bash
+python3 scripts/gtk/basic_shm.py &      # or dmabuf_gl.py, or the Qt6/SDL2 equivalents
+pkill -9 gnome-shell                    # pkill -9 -x labwc for the labwc session
+```
+gnome-shell (or labwc) restarts within a few seconds; the test client
+should still be alive and rendering afterward, with no sign it noticed
+the crash.
+
+**Faster and less error-prone:** `live-crash-test.sh` runs the same
+check and prints one compact pass/fail summary instead of raw logs:
+```bash
+scripts/live-crash-test.sh python3 scripts/gtk/dmabuf_gl.py
+```
+Env vars (`WAYLAND_DISPLAY`, `COMPOSITOR_MATCH`, `SETTLE_SECONDS`,
+`RECOVERY_TIMEOUT`, `KEEP_CLIENT_RUNNING`) default to match the
+`wl-res-gnome-shell-direct` session -- see the script's own header
+comment to point it at `wl-res-labwc` or a different client instead.
+Full raw logs are always left on disk regardless of the outcome; the
+printed summary is deliberately lossy.
+
+---
+
+The rest of this document covers the headless container harness.
+
+**Two ways to use it:**
 - **In place, from a git checkout** (this document's own instructions
   below) -- `./harness/wayland-headless-harness <command>`, run directly.
 - **Installed as a package** (`packaging/build-harness-deb.sh` builds
@@ -28,56 +81,6 @@ from any particular checkout).
   a relative path into the checkout. Identical command surface either
   way (Python/Typer); see `wayland-headless-harness --help` for the
   full command list, or any subcommand's own `--help`.
-
-## Project layout
-
-```
-.
-├── docs/
-│   ├── plan/             # phase-by-phase build history, one file per plan
-│   └── ...                # design notes, ADRs, debugging log
-├── harness/              # the CLI + all host-side orchestration (Python/Typer)
-│   ├── wayland-headless-harness   # entry point -- run directly from a
-│   │                     # checkout, or staged to /usr/bin/ when installed
-│   └── wayland_headless_harness/
-│       ├── cli.py        # top-level Typer app (env/session/test/diagnose)
-│       ├── common.py     # shared: WM validation, podman wrappers, path resolution
-│       └── commands/     # env.py, session.py, testing.py, diagnose.py
-└── scripts/              # container-side only -- stays Bash, runs INSIDE
-    │                      # the disposable WM containers; none of the four
-    │                      # Containerfiles install python3
-    ├── containers/      # one subdir per WM: Containerfile + compositor config
-    │   ├── base/        # shared FROM for the four below: common apt
-    │   │                # packages + removing Ubuntu's default `ubuntu`
-    │   │                # user -- group/user creation stays per-WM
-    │   ├── labwc/
-    │   ├── sway/
-    │   ├── kwin/
-    │   └── mutter/
-    ├── entrypoint.sh    # runs INSIDE the container — starts the nested
-    │                    # compositor named by $COMPOSITOR
-    ├── test-crash.sh    # automated crash/reconnect check (see step 4 below)
-    ├── run-registry.sh  # sourced by entrypoint.sh/test-crash.sh: tracks
-    │                    # each run's pids/containers/sockets in one place
-    ├── compositor-launch.sh # sourced by test-crash.sh/entrypoint.sh/`test swap`:
-    │                    # one implementation of each WM's headless-launch quirks
-    ├── socket-wait.sh   # sourced by test-crash.sh/`test swap`:
-    │                    # "did a new compositor socket appear" detection
-    ├── harness-paths.sh # sourced by diagnose.sh: the shared container-mount-point
-    │                    # constant (mirrored as a Python constant in common.py)
-    └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest --
-                         # unmodified; `diagnose` in harness/ is a thin wrapper
-                         # around this exact script
-
-debian/control              # package metadata for wayland-headless-harness
-packaging/
-├── build-harness-deb.sh    # builds the .deb from harness/ + the surviving scripts/*.sh
-└── wayland-proxy.service   # systemd --user unit, packaged with wayland-proxy itself
-```
-
-Every subcommand that targets one compositor takes a `--wm=<name>` flag
-(default `labwc`, also settable via `WAYLAND_HARNESS_WM`) selecting
-which `containers/<name>/` to build/run against.
 
 ## Host prerequisites
 
@@ -194,6 +197,62 @@ regenerated each run) and prints where the full logs landed.
 ```
 Not needed after step 5 -- `test smoke`/`test matrix` already tear down
 after themselves, pass or fail.
+
+## Project layout
+
+Reference for finding your way around the harness's own code -- not
+needed just to run it (see "Running it" above for that).
+
+```
+.
+├── docs/
+│   ├── plan/             # phase-by-phase build history, one file per plan
+│   └── ...                # design notes, ADRs, debugging log
+├── harness/              # the CLI + all host-side orchestration (Python/Typer)
+│   ├── wayland-headless-harness   # entry point -- run directly from a
+│   │                     # checkout, or staged to /usr/bin/ when installed
+│   └── wayland_headless_harness/
+│       ├── cli.py        # top-level Typer app (env/session/test/diagnose)
+│       ├── common.py     # shared: WM validation, podman wrappers, path resolution
+│       └── commands/     # env.py, session.py, testing.py, diagnose.py
+└── scripts/              # container-side only -- stays Bash, runs INSIDE
+    │                      # the disposable WM containers; none of the four
+    │                      # Containerfiles install python3
+    ├── containers/      # one subdir per WM: Containerfile + compositor config
+    │   ├── base/        # shared FROM for the four below: common apt
+    │   │                # packages + removing Ubuntu's default `ubuntu`
+    │   │                # user -- group/user creation stays per-WM
+    │   ├── labwc/
+    │   ├── sway/
+    │   ├── kwin/
+    │   └── mutter/
+    ├── entrypoint.sh    # runs INSIDE the container — starts the nested
+    │                    # compositor named by $COMPOSITOR
+    ├── test-crash.sh    # automated crash/reconnect check (see step 4 above)
+    ├── run-registry.sh  # sourced by entrypoint.sh/test-crash.sh: tracks
+    │                    # each run's pids/containers/sockets in one place
+    ├── compositor-launch.sh # sourced by test-crash.sh/entrypoint.sh/`test swap`:
+    │                    # one implementation of each WM's headless-launch quirks
+    ├── socket-wait.sh   # sourced by test-crash.sh/`test swap`:
+    │                    # "did a new compositor socket appear" detection
+    ├── harness-paths.sh # sourced by diagnose.sh: the shared container-mount-point
+    │                    # constant (mirrored as a Python constant in common.py)
+    ├── live-crash-test.sh # live-session check (see "Live-session manual
+    │                    # testing" above) -- the only script here that
+    │                    # targets a real desktop session, not a container
+    └── diagnose.sh      # dumps compositor/Wayland/wayvnc state, host + guest --
+                         # unmodified; `diagnose` in harness/ is a thin wrapper
+                         # around this exact script
+
+debian/control              # package metadata for wayland-headless-harness
+packaging/
+├── build-harness-deb.sh    # builds the .deb from harness/ + the surviving scripts/*.sh
+└── wayland-proxy.service   # systemd --user unit, packaged with wayland-proxy itself
+```
+
+Every subcommand that targets one compositor takes a `--wm=<name>` flag
+(default `labwc`, also settable via `WAYLAND_HARNESS_WM`) selecting
+which `containers/<name>/` to build/run against.
 
 ## Troubleshooting
 
