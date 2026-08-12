@@ -126,8 +126,9 @@ install/remove hooks, so that's a manual step for now).
 
 ## Development
 
-See `scripts/README.md`: building the test containers, running against
-a nested compositor, watching over VNC.
+See `scripts/README.md`: manually testing crash recovery on a live
+session, building the test containers, running against a nested
+compositor, watching over VNC.
 
 Enable the pre-commit hook once per clone:
 ```bash
